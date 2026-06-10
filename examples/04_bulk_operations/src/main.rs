@@ -13,7 +13,7 @@ use clove1db::{
 // 1. ENTITY
 // ═══════════════════════════════════════════════════════════
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Device {
     id: String,
     name: String,
@@ -80,6 +80,7 @@ impl OutputDto<Device> for DeviceResponse {
 
 fn main() -> Result<()> {
     let base_dir = PathBuf::from("./examples_data/04_bulk_operations");
+    let _ = std::fs::remove_dir_all(&base_dir);
 
     // ── 1. Build Storage with Backup (Required for restore_bulk) ──
     println!("━━━ Building Storage ━━━");

@@ -46,12 +46,12 @@ pub enum ClError {
     MigrationError(String),
 
     #[error(
-        "Version {version} (schema {schema_at_version}) is not restorable; current schema is {current_schema} (migration {migration_id})"
+        "Version {version} ({schema_at_version}) is not restorable; current is {current_schema_version} (migration {migration_id})"
     )]
     NotRestorable {
         version: u64,
         schema_at_version: String,
-        current_schema: String,
+        current_schema_version: String,
         migration_id: String,
     },
 
@@ -67,6 +67,44 @@ pub enum ClError {
         schema: String,
         migration_id: String,
     },
+
+    #[error("layout mismatch on table '{table}': registered hash '{registered}' but chain has version {chain_version}")]
+    LayoutMismatch {
+        table: String,
+        registered: String,
+        chain_version: u32,
+    },
+
+    #[error("legacy migration format at '{path}' — re-seed or remove old migration directory")]
+    LegacyMigrationFormat { path: String },
+
+    #[error("target table '{table}' on db '{db}' already has {existing_keys} keys")]
+    TargetTableOccupied {
+        db: String,
+        table: String,
+        existing_keys: usize,
+    },
+
+    #[error("external import requires field mapping or decoder for table '{table}'")]
+    ExternalMappingRequired { table: String },
+
+    #[error("incompatible overwrite on table '{table}' key '{key}'")]
+    IncompatibleOverwrite { table: String, key: String },
+
+    #[error("table mismatch: expected {expected:?}, found {found:?}")]
+    TableMismatch {
+        expected: Vec<String>,
+        found: Vec<String>,
+    },
+
+    #[error("backup normalize failed: {reason}")]
+    BackupNormalizeFailed { reason: String },
+
+    #[error("not a clove1db database: {path}")]
+    NotCloveDatabase { path: String },
+
+    #[error("upgrade incomplete for database '{db_name}'")]
+    UpgradeIncomplete { db_name: String },
 }
 
 impl From<std::io::Error> for ClError {

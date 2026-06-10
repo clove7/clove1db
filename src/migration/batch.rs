@@ -49,7 +49,7 @@ mod tests {
     use crate::entity::Entity;
     use std::path::PathBuf;
 
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
     struct Item {
         id: String,
         v: u32,
@@ -69,7 +69,6 @@ mod tests {
             .add_database(
                 DatabaseConfig::new("t", "items")
                     .dir_path(dir.clone())
-                    .schema_name("Item")
                     .register::<Item>("items"),
             )
             .build()

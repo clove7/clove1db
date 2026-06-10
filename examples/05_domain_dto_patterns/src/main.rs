@@ -12,7 +12,7 @@ use clove1db::{
 // SCENARIO 1: Security & Hiding Data (User Account)
 // ═══════════════════════════════════════════════════════════
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct UserAccount {
     id: String,
     username: String,
@@ -73,7 +73,7 @@ impl OutputDto<UserAccount> for UserPublicProfile {
 // SCENARIO 2: Business Logic & Calculations (E-commerce Order)
 // ═══════════════════════════════════════════════════════════
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Order {
     id: String,
     item_name: String,
@@ -139,7 +139,7 @@ impl OutputDto<Order> for OrderReceipt {
 // SCENARIO 3: Custom ID & Upsert (System Settings)
 // ═══════════════════════════════════════════════════════════
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct SystemSetting {
     key: String, // use key as ID instead of UUID
     value: String,
@@ -192,6 +192,7 @@ impl OutputDto<SystemSetting> for SettingResponse {
 
 fn main() -> Result<()> {
     let base_dir = PathBuf::from("./examples_data/05_domain_dto_patterns");
+    let _ = std::fs::remove_dir_all(&base_dir);
 
     let storage = Storage::builder(StorageConfig::default())
         .add_database(

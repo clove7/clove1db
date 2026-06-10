@@ -1,6 +1,6 @@
 [package]
 name = "clove1db"
-version = "0.0.49"
+version = "0.0.56"
 edition = "2024"
 license = "MIT"
 authors = ["clove7"]
@@ -9,6 +9,9 @@ repository = "https://github.com/clove7/clove1db"
 keywords = ["database", "embedded", "storage", "cache", "backup"]
 categories = ["database", "caching", "data-structures"]
 readme = "README.md"
+exclude = [
+    "examples/**",
+]
 
 
 [dependencies]

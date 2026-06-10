@@ -15,6 +15,25 @@ pub fn read_external_table(path: &Path, spec: &RedbTableSpec) -> Result<Vec<(Str
     }
 }
 
+fn read_u64_string_json_table(
+    read_txn: &redb::ReadTransaction,
+    spec: &RedbTableSpec,
+) -> Result<Vec<(String, Vec<u8>)>> {
+    let table: TableDefinition<u64, String> = TableDefinition::new(&spec.source_table);
+    let table_ref = read_txn.open_table(table).map_err(|_| {
+        ClError::MigrationError(format!("external table '{}' not found", spec.source_table))
+    })?;
+
+    let mut out = Vec::new();
+    for entry in table_ref.iter()? {
+        let (k, v) = entry?;
+        let text = v.value();
+        serde_json::from_str::<serde_json::Value>(&text)?;
+        out.push((k.value().to_string(), text.as_bytes().to_vec()));
+    }
+    Ok(out)
+}
+
 fn read_utf8_table(
     read_txn: &redb::ReadTransaction,
     spec: &RedbTableSpec,
@@ -37,6 +56,10 @@ fn read_u64_table(
     read_txn: &redb::ReadTransaction,
     spec: &RedbTableSpec,
 ) -> Result<Vec<(String, Vec<u8>)>> {
+    if spec.value_decoder == ValueDecoder::JsonString {
+        return read_u64_string_json_table(read_txn, spec);
+    }
+
     let table: TableDefinition<u64, &[u8]> = TableDefinition::new(&spec.source_table);
     let table_ref = read_txn.open_table(table).map_err(|_| {
         ClError::MigrationError(format!("external table '{}' not found", spec.source_table))
@@ -54,7 +77,7 @@ fn read_u64_table(
 fn decode_value(bytes: &[u8], decoder: ValueDecoder) -> Result<Vec<u8>> {
     match decoder {
         ValueDecoder::RawPassthrough => Ok(bytes.to_vec()),
-        ValueDecoder::JsonValidate => {
+        ValueDecoder::JsonValidate | ValueDecoder::JsonString => {
             serde_json::from_slice::<serde_json::Value>(bytes)?;
             Ok(bytes.to_vec())
         }

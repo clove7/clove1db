@@ -10,7 +10,7 @@ use clove1db::{
 
 // ── Product schema generations ───────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProductV1 {
     pub id: String,
     pub name: String,
@@ -22,7 +22,7 @@ impl Entity for ProductV1 {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProductV2 {
     pub id: String,
     pub name: String,
@@ -36,7 +36,7 @@ impl Entity for ProductV2 {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProductV3 {
     pub id: String,
     pub name: String,
@@ -190,6 +190,35 @@ impl SchemaDecoder for ProductV1ToV2Decoder {
             name: v1.name.clone(),
             sku: format!("SKU-{}", slug(&v1.name)),
             price_cents: 9_900,
+        };
+        Ok(serde_json::to_vec(&v2)?)
+    }
+}
+
+/// Maps external vendor_catalog JSON → ProductV2 entity bytes for clove1db.
+pub struct ExternalCatalogToProductV2Decoder;
+
+#[derive(Debug, Deserialize)]
+struct ExternalCatalogRow {
+    id: String,
+    title: String,
+    price_usd: f64,
+    vendor_code: String,
+}
+
+impl SchemaDecoder for ExternalCatalogToProductV2Decoder {
+    fn decode_to_json(&self, bytes: &[u8]) -> Result<Value> {
+        Ok(serde_json::from_slice(bytes)?)
+    }
+
+    fn migrate_bytes(&self, bytes: &[u8]) -> Result<Vec<u8>> {
+        let row: ExternalCatalogRow = serde_json::from_slice(bytes)?;
+        let price_cents = (row.price_usd * 100.0).round() as u64;
+        let v2 = ProductV2 {
+            id: row.id,
+            name: row.title,
+            sku: row.vendor_code,
+            price_cents,
         };
         Ok(serde_json::to_vec(&v2)?)
     }

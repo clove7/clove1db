@@ -4,8 +4,11 @@ use crate::{
         view::{BackupRecordView, HistoryDisplayMode, RecordData},
         BackupManager, BackupOperation, BackupRecord,
     },
-    migration::chain::MigrationChain,
+    metadata::types::META_TABLE,
+    migration::chain::DbMigrationIndex,
+    migration::layout::FieldLayout,
     migration::decoder::SchemaDecoderRegistry,
+    metadata::store::{read_meta, write_meta},
     migration::types::MigrationManifest,
     units::{ClError, Result},
 };
@@ -48,15 +51,15 @@ pub struct DatabaseManager {
     // Has cache
     has_cache: bool,
 
-    // Migration chain
-    migration_chain: Arc<RwLock<MigrationChain>>,
+    // Per-table migration index
+    migration_index: Arc<RwLock<DbMigrationIndex>>,
 
     // Shared decoder registry for history resolution
     decoder_registry: Arc<SchemaDecoderRegistry>,
 }
 
 impl DatabaseManager {
-    pub fn new(
+    pub fn open(
         dir_path: &PathBuf,
         backup_dir_path: Option<&PathBuf>,
         dir_name: &str,
@@ -66,7 +69,7 @@ impl DatabaseManager {
         cache_ttl_seconds: u64,
         cache_idle_seconds: u64,
         has_cache: bool,
-        initial_schema: &str,
+        table_layouts: std::collections::HashMap<String, FieldLayout>,
         decoder_registry: Arc<SchemaDecoderRegistry>,
     ) -> Result<Self> {
         let dir = dir_path.join(dir_name);
@@ -102,6 +105,9 @@ impl DatabaseManager {
 
         let write_txn = db.begin_write()?;
         {
+            let meta_table: TableDefinition<&str, &[u8]> = TableDefinition::new(META_TABLE);
+            write_txn.open_table(meta_table)?;
+
             for table in &tables {
                 {
                     let table_definition: TableDefinition<&str, &[u8]> =
@@ -129,11 +135,13 @@ impl DatabaseManager {
             year: now.year() as u32,
         };
 
-        let migration_chain = Arc::new(RwLock::new(MigrationChain::load(
-            &dir_local.dir,
-            db_name,
-            initial_schema,
-        )?));
+        let mut migration_index =
+            DbMigrationIndex::load(&dir_local.dir, db_name, &tables)?;
+        for (table, layout) in &table_layouts {
+            migration_index.ensure_table(table, layout)?;
+        }
+
+        let migration_index = Arc::new(RwLock::new(migration_index));
 
         Ok(Self {
             memory_cache,
@@ -144,15 +152,68 @@ impl DatabaseManager {
             db_name: db_name.to_string(),
             tables_names: tables,
             has_cache,
-            migration_chain,
+            migration_index,
             decoder_registry,
         })
     }
 
-    pub fn migration_chain(&self) -> Result<std::sync::RwLockReadGuard<'_, MigrationChain>> {
-        self.migration_chain
+    #[deprecated(note = "use DatabaseManager::open")]
+    pub fn new(
+        dir_path: &PathBuf,
+        backup_dir_path: Option<&PathBuf>,
+        dir_name: &str,
+        db_name: &str,
+        tables: Vec<String>,
+        cache_max_capacity: u64,
+        cache_ttl_seconds: u64,
+        cache_idle_seconds: u64,
+        has_cache: bool,
+        table_layouts: std::collections::HashMap<String, FieldLayout>,
+        decoder_registry: Arc<SchemaDecoderRegistry>,
+    ) -> Result<Self> {
+        Self::open(
+            dir_path,
+            backup_dir_path,
+            dir_name,
+            db_name,
+            tables,
+            cache_max_capacity,
+            cache_ttl_seconds,
+            cache_idle_seconds,
+            has_cache,
+            table_layouts,
+            decoder_registry,
+        )
+    }
+
+    pub fn migration_index(&self) -> Result<std::sync::RwLockReadGuard<'_, DbMigrationIndex>> {
+        self.migration_index
             .read()
-            .map_err(|_| ClError::MigrationError("migration chain lock poisoned".into()))
+            .map_err(|_| ClError::MigrationError("migration index lock poisoned".into()))
+    }
+
+
+    pub fn count_keys(&self, table: &str) -> Result<usize> {
+        Ok(self.list_entries(table)?.len())
+    }
+
+    pub fn table_layout(&self, table: &str) -> Result<FieldLayout> {
+        let guard = self.migration_index()?;
+        let chain = guard.table_chain(table)?;
+        let version = chain.current_version();
+        let path = crate::migration::types::layout_path(&chain.dir, version);
+        if path.exists() {
+            let data = fs::read_to_string(path)?;
+            return Ok(serde_json::from_str(&data)?);
+        }
+        Ok(FieldLayout::from_json_value(&serde_json::json!({})))
+    }
+
+    pub fn rewrite_backup_table(&self, from_table: &str, to_table: &str) -> Result<()> {
+        let Some(ref bm) = self.backup_manager else {
+            return Ok(());
+        };
+        bm.rewrite_table_name(from_table, to_table)
     }
 
     pub fn decoder_registry(&self) -> &SchemaDecoderRegistry {
@@ -161,14 +222,27 @@ impl DatabaseManager {
 
     pub fn append_migration(
         &self,
+        table: &str,
         manifest: MigrationManifest,
         snapshot: Option<&[(String, Vec<u8>)]>,
+        new_layout: Option<&FieldLayout>,
     ) -> Result<()> {
-        let mut chain = self
-            .migration_chain
+        let mut index = self
+            .migration_index
             .write()
-            .map_err(|_| ClError::MigrationError("migration chain lock poisoned".into()))?;
-        chain.append(manifest, snapshot)?;
+            .map_err(|_| ClError::MigrationError("migration index lock poisoned".into()))?;
+        index.append_manifest(table, manifest, snapshot, new_layout)?;
+
+        if let Ok(Some(mut meta)) = read_meta(&self.db) {
+            if let Some(tm) = meta.tables.iter_mut().find(|t| t.name == table) {
+                tm.schema_version = index.table_chain(table)?.current_version();
+                if let Some(layout) = new_layout {
+                    tm.layout_hash = layout.layout_hash.clone();
+                }
+            }
+            meta.framework_version = env!("CARGO_PKG_VERSION").to_string();
+            write_meta(&self.db, &meta)?;
+        }
         Ok(())
     }
 
@@ -384,8 +458,10 @@ impl DatabaseManager {
             .as_ref()
             .ok_or_else(|| ClError::NotFound("backup not configured".into()))?;
 
-        if let Ok(chain) = self.migration_chain() {
-            BackupManager::assert_restorable(Some(&chain), version)?;
+        if let Ok(index) = self.migration_index() {
+            if let Ok(chain) = index.table_chain(table_name) {
+                BackupManager::assert_restorable(chain, version)?;
+            }
         }
 
         // Read the specified record directly
@@ -558,9 +634,11 @@ impl DatabaseManager {
             bulk.entries
         };
 
-        if let Ok(chain) = self.migration_chain() {
-            for entry in &bulk_entries {
-                BackupManager::assert_restorable(Some(&chain), entry.version)?;
+        if let Ok(index) = self.migration_index() {
+            if let Ok(chain) = index.table_chain(table_name) {
+                for entry in &bulk_entries {
+                    BackupManager::assert_restorable(chain, entry.version)?;
+                }
             }
         }
 
@@ -760,10 +838,10 @@ impl<T: DeserializeOwned + Serialize + Clone> Repository<T> {
         record: BackupRecord,
         mode: HistoryDisplayMode,
     ) -> Result<BackupRecordRepository<T>> {
-        let chain = self.database_manager.migration_chain().ok();
+        let index = self.database_manager.migration_index().ok();
         let view = BackupManager::resolve_record(
             &record,
-            chain.as_deref().map(|g| &*g),
+            index.as_deref().map(|g| &*g),
             self.database_manager.decoder_registry(),
             mode,
         );
@@ -788,7 +866,7 @@ impl<T: DeserializeOwned + Serialize + Clone> Repository<T> {
         mode: HistoryDisplayMode,
     ) -> Result<Vec<BackupRecordRepository<T>>> {
         let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(self.table);
-        let chain = self.database_manager.migration_chain().ok();
+        let index = self.database_manager.migration_index().ok();
         let registry = self.database_manager.decoder_registry();
 
         let history = self
@@ -798,7 +876,7 @@ impl<T: DeserializeOwned + Serialize + Clone> Repository<T> {
             .map(|record| {
                 let view = BackupManager::resolve_record(
                     &record,
-                    chain.as_deref().map(|g| &*g),
+                    index.as_deref().map(|g| &*g),
                     registry,
                     mode,
                 );

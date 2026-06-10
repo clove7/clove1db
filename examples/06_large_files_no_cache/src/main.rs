@@ -12,7 +12,7 @@ use clove1db::{
 // 1. ENTITY (Binary Storage)
 // ═══════════════════════════════════════════════════════════
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct FileRecord {
     id: String,
     filename: String,
@@ -112,6 +112,7 @@ impl OutputDto<FileRecord> for FileDownloadResponse {
 
 fn main() -> Result<()> {
     let base_dir = PathBuf::from("./examples_data/06_large_files");
+    let _ = std::fs::remove_dir_all(&base_dir);
 
     // ── 1. Build Storage (Optimized for Large Files) ───────
     println!("━━━ Building Storage for Attachments ━━━");

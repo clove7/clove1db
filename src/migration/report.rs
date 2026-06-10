@@ -1,12 +1,12 @@
 use serde::{Deserialize, Serialize};
 
-use crate::migration::types::KeyConflictPolicy;
+use crate::migration::types::TargetConflictPolicy;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConflictEntry {
     pub table: String,
     pub key: String,
-    pub policy: KeyConflictPolicy,
+    pub policy: TargetConflictPolicy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

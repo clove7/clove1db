@@ -1,8 +1,9 @@
 // backup.rs
+// Backup values are normalized to canonical BackupRecord JSON during Storage::build().
 pub mod view;
 
 use crate::backup::view::{BackupRecordView, HistoryDisplayMode, RecordData};
-use crate::migration::chain::MigrationChain;
+use crate::migration::chain::DbMigrationIndex;
 use crate::migration::decoder::SchemaDecoderRegistry;
 use crate::units::ClError;
 use crate::units::Result;
@@ -416,21 +417,61 @@ impl BackupManager {
         Ok(bulk_id)
     }
 
+    pub fn rewrite_table_name(&self, from_table: &str, to_table: &str) -> Result<()> {
+        let read_txn = self.db.begin_read()?;
+        let mut records: Vec<(String, BackupRecord)> = Vec::new();
+        {
+            let data_table: TableDefinition<&str, &[u8]> = TableDefinition::new(from_table);
+            if let Ok(table_ref) = read_txn.open_table(data_table) {
+                for entry in table_ref.iter()? {
+                    let (k, v) = entry?;
+                    if let Ok(record) = serde_json::from_slice::<BackupRecord>(v.value()) {
+                        records.push((k.value().to_string(), record));
+                    }
+                }
+            }
+        }
+        drop(read_txn);
+
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        let write_txn = self.db.begin_write()?;
+        {
+            let from_def: TableDefinition<&str, &[u8]> = TableDefinition::new(from_table);
+            let to_def: TableDefinition<&str, &[u8]> = TableDefinition::new(to_table);
+            let mut from_tbl = write_txn.open_table(from_def)?;
+            let mut to_tbl = write_txn.open_table(to_def)?;
+            for (key, mut record) in records {
+                record.table = to_table.to_string();
+                let bytes = serde_json::to_vec(&record)?;
+                to_tbl.insert(key.as_str(), bytes.as_slice())?;
+                from_tbl.remove(key.as_str())?;
+            }
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
     pub fn resolve_record(
         raw: &BackupRecord,
-        chain: Option<&MigrationChain>,
+        index: Option<&DbMigrationIndex>,
         registry: &SchemaDecoderRegistry,
         mode: HistoryDisplayMode,
     ) -> BackupRecordView {
-        let schema_at_version = chain
-            .map(|c| c.schema_for_version(raw.version).to_string())
-            .unwrap_or_else(|| "current".to_string());
+        let table_chain = index.and_then(|i| i.tables.get(&raw.table));
+        let schema_at_version = table_chain
+            .map(|c| format!("{}@{}", c.schema_id(), c.schema_version_for_backup(raw.version)))
+            .unwrap_or_else(|| format!("{}@current", raw.table));
 
-        let migration_id = chain
+        let migration_id = table_chain
             .and_then(|c| c.migration_id_for_version(raw.version))
             .map(|s| s.to_string());
 
-        let restorable = chain.map(|c| c.is_restorable(raw.version)).unwrap_or(true);
+        let restorable = table_chain
+            .map(|c| c.is_restorable(raw.version))
+            .unwrap_or(true);
         let decode_path_single = vec![schema_at_version.clone()];
 
         if raw.data.is_none() || matches!(raw.operation, BackupOperation::Delete) {
@@ -454,7 +495,7 @@ impl BackupManager {
 
         let bytes = raw.data.as_ref().unwrap();
 
-        match chain {
+        match table_chain {
             Some(c) => match c.decode_to_json(bytes, raw.version, mode, registry) {
                 Ok((json, decode_path)) => {
                     let data = if restorable {
@@ -533,22 +574,25 @@ impl BackupManager {
         }
     }
 
-    pub fn assert_restorable(
-        chain: Option<&MigrationChain>,
-        version: u64,
-    ) -> Result<()> {
-        if let Some(c) = chain {
-            if !c.is_restorable(version) {
-                return Err(ClError::NotRestorable {
-                    version,
-                    schema_at_version: c.schema_for_version(version).to_string(),
-                    current_schema: c.current_schema().to_string(),
-                    migration_id: c
-                        .migration_id_for_version(version)
-                        .unwrap_or("unknown")
-                        .to_string(),
-                });
-            }
+    pub fn assert_restorable(chain: &crate::migration::chain::TableMigrationChain, version: u64) -> Result<()> {
+        if !chain.is_restorable(version) {
+            return Err(ClError::NotRestorable {
+                version,
+                schema_at_version: format!(
+                    "{}@{}",
+                    chain.schema_id(),
+                    chain.schema_version_for_backup(version)
+                ),
+                current_schema_version: format!(
+                    "{}@{}",
+                    chain.schema_id(),
+                    chain.current_version()
+                ),
+                migration_id: chain
+                    .migration_id_for_version(version)
+                    .unwrap_or("unknown")
+                    .to_string(),
+            });
         }
         Ok(())
     }

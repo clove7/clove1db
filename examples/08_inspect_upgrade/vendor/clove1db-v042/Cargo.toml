@@ -1,0 +1,19 @@
+[package]
+name = "clove1db-v042"
+version = "0.0.42"
+edition = "2024"
+license = "MIT"
+description = "Frozen clove1db 0.0.42 library snapshot for example_08_inspect_upgrade only."
+publish = false
+
+# Source: git rev 61e9b48f489061e77ce1aad80276a550cd6d659a
+
+[dependencies]
+chrono = "0.4.44"
+itertools = "0.14.0"
+moka = { version = "0.12.15", features = ["sync"] }
+redb = "4.1.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+thiserror = "2.0.18"
+uuid = { version = "1.23.1", features = ["v4"] }

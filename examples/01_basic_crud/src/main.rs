@@ -12,7 +12,7 @@ use clove1db::{
 // 1. ENTITY
 // ═══════════════════════════════════════════════════════════
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct User {
     id: String,
     name: String,
@@ -84,6 +84,7 @@ impl OutputDto<User> for UserResponse {
 
 fn main() -> Result<()> {
     let base_dir = PathBuf::from("./examples_data/01_basic_crud");
+    let _ = std::fs::remove_dir_all(&base_dir);
 
     // ── 1. Build Storage ───────────────────────────────────
     println!("━━━ Building Storage ━━━");

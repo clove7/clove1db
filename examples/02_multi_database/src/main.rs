@@ -12,7 +12,7 @@ use clove1db::{
 // 1. ENTITIES (spread across different databases)
 // ═══════════════════════════════════════════════════════════
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct User {
     id: String,
     username: String,
@@ -24,7 +24,7 @@ impl Entity for User {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Product {
     id: String,
     title: String,
@@ -127,6 +127,7 @@ impl OutputDto<Product> for ProductResponse {
 
 fn main() -> Result<()> {
     let base_dir = PathBuf::from("./examples_data/02_multi_database");
+    let _ = std::fs::remove_dir_all(&base_dir);
 
     // ── 1. Build Multi-Database Storage ────────────────────
     println!("━━━ Building Multi-Database Storage ━━━");
@@ -144,12 +145,6 @@ fn main() -> Result<()> {
                 .dir_path(base_dir.clone())
                 .cache(5_000, 600, 120) // custom cache settings
                 .register::<Product>("products"),
-        )
-        // Database 3: no cache (e.g. large files)
-        .add_database(
-            DatabaseConfig::new("attachments_db", "attachments")
-                .dir_path(base_dir.clone())
-                .has_cache(false),
         )
         .build()?;
 

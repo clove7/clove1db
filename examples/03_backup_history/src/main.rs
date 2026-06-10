@@ -13,7 +13,7 @@ use clove1db::{
 // 1. ENTITY
 // ═══════════════════════════════════════════════════════════
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Document {
     id: String,
     title: String,
@@ -80,6 +80,7 @@ impl OutputDto<Document> for DocumentResponse {
 
 fn main() -> Result<()> {
     let base_dir = PathBuf::from("./examples_data/03_backup_history");
+    let _ = std::fs::remove_dir_all(&base_dir);
 
     // ── 1. Build Storage with Backup Enabled ───────────────
     println!("━━━ Building Storage ━━━");

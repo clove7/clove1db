@@ -1,328 +1,671 @@
 // storage.rs
+
 use std::any::{Any, TypeId};
+
 use std::collections::HashMap;
+
 use std::env;
+
 use std::marker::PhantomData;
+
 use std::path::PathBuf;
+
 use std::sync::Arc;
 
+
+
 use crate::{
+
     domain::Domain,
+
     entity::Entity,
-    migration::chain::MigrationChain,
+
+    migration::chain::DbMigrationIndex,
+
     migration::decoder::SchemaDecoderRegistry,
+
+    migration::layout::FieldLayout,
+
     migration::runner::MigrationRunner,
+
     repository::DatabaseManager,
+
     repository::Repository,
-    units::Result,
+
+    units::{ClError, Result},
+
+    upgrade::{OpenUpgradePipeline, TableRegistration, UpgradeInput},
+
 };
 
+
+
 const DEFAULT_CACHE_CAPACITY: u64 = 10_000;
+
 const DEFAULT_CACHE_TTL: u64 = 300;
+
 const DEFAULT_CACHE_IDLE: u64 = 60;
+
 const LOG_CHANNEL_CAPACITY: usize = 1024;
 
-// ── Inner ──────────────────────────────────────────────────────────────────────
+
 
 struct StorageInner {
+
     domains: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
+
     database_managers: HashMap<String, DatabaseManager>,
+
     decoder_registry: Arc<SchemaDecoderRegistry>,
+
 }
 
-// ── Storage ────────────────────────────────────────────────────────────────────
+
 
 #[derive(Clone)]
+
 pub struct Storage(Arc<StorageInner>);
 
+
+
 impl Storage {
+
     pub fn builder(config: StorageConfig) -> StorageBuilder {
+
         StorageBuilder::new(config)
+
     }
 
-    /// Invoke Domain<E>
+
+
     pub fn domain<E: Entity>(&self) -> &Domain<E> {
+
         self.0
+
             .domains
+
             .get(&TypeId::of::<E>())
+
             .and_then(|b| b.downcast_ref::<Domain<E>>())
+
             .unwrap_or_else(|| {
+
                 panic!(
+
                     "[Storage] Domain<{}> not registered",
+
                     std::any::type_name::<E>()
+
                 )
+
             })
+
     }
 
-    /// Access a specific DatabaseManager by name
+
+
     pub fn db_manager(&self, name: &str) -> &DatabaseManager {
+
         self.0
+
             .database_managers
+
             .get(name)
+
             .unwrap_or_else(|| panic!("[Storage] DatabaseManager '{}' not found", name))
+
     }
+
+
 
     pub fn db_list(&self) -> Vec<&DatabaseManager> {
+
         self.0.database_managers.values().collect()
+
     }
+
+
 
     pub fn db_list_names(&self) -> Vec<String> {
+
         self.0
+
             .database_managers
+
             .keys()
+
             .map(|k| k.to_string())
+
             .collect()
+
     }
+
+
 
     pub fn migration_runner(&self) -> MigrationRunner {
-        MigrationRunner::new(
-            self.clone(),
-            (*self.0.decoder_registry).clone(),
-        )
+
+        MigrationRunner::new(self.clone(), (*self.0.decoder_registry).clone())
+
     }
 
-    pub fn migration_chain(&self, db_name: &str) -> Result<MigrationChain> {
+
+
+    pub fn migration_index(&self, db_name: &str) -> Result<DbMigrationIndex> {
+
         let db = self.db_manager(db_name);
-        let guard = db.migration_chain()?;
-        Ok(guard.clone())
+
+        Ok(db.migration_index()?.clone())
+
     }
+
+
 
     pub fn decoder_registry(&self) -> Arc<SchemaDecoderRegistry> {
+
         self.0.decoder_registry.clone()
+
     }
+
 }
 
-// ── DomainFactory ──────────────────────────────────────────────────────────────
+
 
 trait DomainFactory: Send + Sync {
+
     fn table_name(&self) -> &'static str;
+
+    fn layout(&self) -> FieldLayout;
+
     fn build(&self, database_manager: &DatabaseManager) -> (TypeId, Box<dyn Any + Send + Sync>);
+
 }
 
-struct TypedFactory<E: Entity> {
+
+
+struct TypedFactory<E: Entity + serde::Serialize + Default> {
+
     table: &'static str,
+
+    layout: FieldLayout,
+
     _marker: PhantomData<fn() -> E>,
+
 }
 
-impl<E: Entity> DomainFactory for TypedFactory<E> {
+
+
+impl<E: Entity + serde::Serialize + Default> DomainFactory for TypedFactory<E> {
+
     fn table_name(&self) -> &'static str {
+
         self.table
+
     }
+
+
+
+    fn layout(&self) -> FieldLayout {
+
+        self.layout.clone()
+
+    }
+
+
 
     fn build(&self, database_manager: &DatabaseManager) -> (TypeId, Box<dyn Any + Send + Sync>) {
+
         let repo = Repository::<E>::new(self.table, database_manager.clone());
+
         let domain = Domain::new(repo);
+
         (TypeId::of::<E>(), Box::new(domain))
+
     }
+
 }
 
-// ── DatabaseConfig — builder for each DatabaseManager ──────────────────────────────
+
 
 pub struct DatabaseConfig {
+
     has_cache: bool,
+
     dir_path: PathBuf,
+
     backup_dir_path: Option<PathBuf>,
+
     dir_name: String,
+
     db_name: String,
+
     cache_capacity: u64,
+
     cache_ttl: u64,
+
     cache_idle: u64,
+
     factories: Vec<Box<dyn DomainFactory>>,
+
     backup_enabled: bool,
-    initial_schema: Option<String>,
+
 }
+
+
 
 impl DatabaseConfig {
+
     pub fn new(dir_name: &str, db_name: &str) -> Self {
+
         Self {
+
             has_cache: true,
+
             dir_path: PathBuf::from(""),
+
             backup_dir_path: None,
+
             dir_name: dir_name.to_string(),
+
             db_name: db_name.to_string(),
+
             cache_capacity: DEFAULT_CACHE_CAPACITY,
+
             cache_ttl: DEFAULT_CACHE_TTL,
+
             cache_idle: DEFAULT_CACHE_IDLE,
+
             factories: Vec::new(),
+
             backup_enabled: false,
-            initial_schema: None,
+
         }
+
     }
 
-    pub fn schema_name(mut self, schema: &str) -> Self {
-        self.initial_schema = Some(schema.to_string());
-        self
-    }
+
 
     pub fn has_cache(mut self, has_cache: bool) -> Self {
+
         self.has_cache = has_cache;
+
         self
+
     }
+
+
 
     pub fn dir_path(mut self, path: PathBuf) -> Self {
+
         self.dir_path = path;
+
         self
+
     }
+
+
 
     pub fn backup_dir(mut self, path: PathBuf) -> Self {
+
         self.backup_enabled = true;
+
         self.backup_dir_path = Some(path);
+
         self
+
     }
+
+
 
     pub fn backup_enabled(mut self, enabled: bool) -> Self {
+
         self.backup_enabled = enabled;
+
         self
+
     }
+
+
 
     pub fn cache(mut self, capacity: u64, ttl_secs: u64, idle_secs: u64) -> Self {
+
         self.cache_capacity = capacity;
+
         self.cache_ttl = ttl_secs;
+
         self.cache_idle = idle_secs;
+
         self.has_cache = true;
+
         self
+
     }
 
-    /// Register Repository<E> under this DatabaseManager
-    pub fn register<E: Entity>(mut self, table: &'static str) -> Self {
+
+
+    pub fn register<E: Entity + serde::Serialize + Default>(mut self, table: &'static str) -> Self {
+
+        let layout =
+
+            FieldLayout::capture_from_entity_json(&E::default()).unwrap_or_else(|_| {
+
+                FieldLayout::from_json_value(&serde_json::json!({}))
+
+            });
+
         self.factories.push(Box::new(TypedFactory::<E> {
+
             table,
+
+            layout,
+
             _marker: PhantomData,
+
         }));
+
         self
+
     }
+
 }
+
+
 
 #[derive(Clone)]
+
 pub struct StorageConfig {
+
     log_channel_capacity: usize,
+
     name: String,
+
     dir_path: PathBuf,
+
 }
+
+
 
 impl StorageConfig {
+
     pub fn default() -> Self {
+
         let dir_path = env::current_exe()
+
             .ok()
+
             .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+
             .unwrap_or_else(|| PathBuf::from("."));
 
+
+
         Self {
+
             log_channel_capacity: LOG_CHANNEL_CAPACITY,
+
             name: "storage".to_string(),
+
             dir_path,
+
         }
+
     }
+
+
 
     pub fn change_log_channel_capacity(mut self, capacity: usize) -> Self {
+
         self.log_channel_capacity = capacity;
+
         self
+
     }
+
+
 
     pub fn change_name(mut self, name: &str) -> Self {
+
         self.name = name.to_string();
+
         self
+
     }
+
+
 
     pub fn change_dir_path(mut self, path: PathBuf) -> Self {
+
         self.dir_path = path;
+
         self
+
     }
+
 }
 
-// ── StorageBuilder ─────────────────────────────────────────────────────────────
+
 
 pub struct StorageBuilder {
+
     database_configs: Vec<DatabaseConfig>,
+
     storage_config: StorageConfig,
+
     decoder_registry: SchemaDecoderRegistry,
+
 }
+
+
 
 impl StorageBuilder {
+
     fn new(config: StorageConfig) -> Self {
+
         Self {
+
             database_configs: Vec::new(),
+
             storage_config: config,
+
             decoder_registry: crate::migration::default_registry(),
+
         }
+
     }
+
+
 
     pub fn decoder_registry(mut self, registry: SchemaDecoderRegistry) -> Self {
+
         self.decoder_registry = registry;
+
         self
+
     }
+
+
 
     pub fn register_decoder<D: crate::migration::SchemaDecoder + 'static>(
+
         mut self,
+
         name: impl Into<String>,
+
         decoder: D,
+
     ) -> Self {
+
         self.decoder_registry.register(name, decoder);
+
         self
+
     }
 
-    /// Add DatabaseManager with its repositories
+
+
     pub fn add_database(mut self, config: DatabaseConfig) -> Self {
+
         let mut config = config;
+
         if (config.dir_path.to_str().is_some() && config.dir_path.to_str().unwrap().is_empty())
+
             || config.dir_path.to_str().is_none()
+
         {
+
             config.dir_path = self.storage_config.dir_path.clone();
+
         }
+
         if config.backup_enabled && config.backup_dir_path.is_none() {
+
             config.backup_dir_path = Some(config.dir_path.clone());
+
         }
+
         self.database_configs.push(config);
+
         self
+
     }
+
+
 
     pub fn build(self) -> Result<Storage> {
+
         let mut domains: HashMap<TypeId, Box<dyn Any + Send + Sync>> = HashMap::new();
+
         let mut database_managers: HashMap<String, DatabaseManager> = HashMap::new();
+
         let decoder_registry = Arc::new(self.decoder_registry);
 
+
+
         for config in self.database_configs {
-            // Collect table names for this DatabaseManager
-            let tables: Vec<String> = config
-                .factories
-                .iter()
-                .map(|f| f.table_name().to_string())
-                .collect();
 
-            // Create an independent DatabaseManager for each config
-            let initial_schema = config
-                .initial_schema
-                .clone()
-                .unwrap_or_else(|| config.db_name.clone());
+            if config.factories.is_empty() {
 
-            let db_manager = DatabaseManager::new(
-                &config.dir_path,
-                config.backup_dir_path.as_ref(),
-                &config.dir_name,
-                &config.db_name,
-                tables,
-                config.cache_capacity,
-                config.cache_ttl,
-                config.cache_idle,
-                config.has_cache,
-                &initial_schema,
-                decoder_registry.clone(),
-            )?;
+                return Err(ClError::Validation(
 
-            // Create a Domain for each factory under this DatabaseManager
-            for factory in &config.factories {
-                let (type_id, domain) = factory.build(&db_manager);
-                domains.insert(type_id, domain);
+                    "DatabaseConfig must register at least one table".into(),
+
+                ));
+
             }
 
-            // Keep the DatabaseManager for maintenance
+
+
+            let table_regs: Vec<TableRegistration> = config
+
+                .factories
+
+                .iter()
+
+                .map(|f| TableRegistration {
+
+                    name: f.table_name().to_string(),
+
+                    layout: f.layout(),
+
+                })
+
+                .collect();
+
+
+
+            let upgrade = OpenUpgradePipeline::run(&UpgradeInput {
+
+                dir_path: &config.dir_path,
+
+                backup_dir_path: config
+
+                    .backup_dir_path
+
+                    .as_ref()
+
+                    .map(|p| p.as_path()),
+
+                dir_name: &config.dir_name,
+
+                db_name: &config.db_name,
+
+                tables: &table_regs,
+
+                backup_enabled: config.backup_enabled,
+
+                has_cache: config.has_cache,
+
+            })?;
+
+
+
+            let tables: Vec<String> = config
+
+                .factories
+
+                .iter()
+
+                .map(|f| f.table_name().to_string())
+
+                .collect();
+
+
+
+            let db_manager = DatabaseManager::open(
+
+                &config.dir_path,
+
+                config.backup_dir_path.as_ref(),
+
+                &config.dir_name,
+
+                &config.db_name,
+
+                tables,
+
+                config.cache_capacity,
+
+                config.cache_ttl,
+
+                config.cache_idle,
+
+                config.has_cache,
+
+                upgrade.table_layouts,
+
+                decoder_registry.clone(),
+
+            )?;
+
+
+
+            for factory in &config.factories {
+
+                let (type_id, domain) = factory.build(&db_manager);
+
+                domains.insert(type_id, domain);
+
+            }
+
+
+
             database_managers.insert(config.db_name.clone(), db_manager);
+
         }
 
+
+
         Ok(Storage(Arc::new(StorageInner {
+
             domains,
+
             database_managers,
+
             decoder_registry,
+
         })))
+
     }
+
 }
+
+

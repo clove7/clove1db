@@ -1,6 +1,6 @@
 # clove1db
 
-An embedded database framework for Rust — built on [redb](https://github.com/cberner/redb) with layered cache, versioned backup, schema migrations, and domain-driven storage.
+An embedded database framework for Rust — built on [redb](https://github.com/cberner/redb) with layered cache, versioned backup, per-table schema migrations, and domain-driven storage.
 
 > **Work in progress.** The API and internals are still evolving. We welcome contributions, issue reports, and real-world feedback — see [Contributing](#contributing) below.
 
@@ -11,29 +11,31 @@ An embedded database framework for Rust — built on [redb](https://github.com/c
 - 🔁 **Versioned Backup**: Every write/delete is recorded — restore any entity to any previous version
 - 📦 **Bulk Operations**: Update and restore multiple entities at once with a single `bulk_id`
 - 🧩 **Domain-Driven**: Clean separation via `Entity`, `InputDto`, `OutputDto`, `Repository`, `Domain`
-- 🗂️ **Multi-Database**: Multiple isolated DB files in a single `Storage` instance
-- 🔄 **Migrations**: Schema upgrades, cross-database moves, migration chains, and safe history display
+- 🗂️ **Multi-Database**: Multiple isolated `.cldb` files in a single `Storage` instance
+- 🔄 **Migrations**: In-place evolve, cross-DB transfer, external redb import, per-table migration chains
+- 🏷️ **Metadata & Auto-Upgrade**: `_clove_meta` inside `.cldb`, automatic upgrade from legacy eras on `build()`
+- 🔍 **Inspect**: Classify `.cldb` files (`Legacy042`, `Clove049`, `Authenticated`, `ExternalRedb`, …) without opening `Storage`
 
 ## Install
 
 ```toml
 [dependencies]
-clove1db = "0.0.49"
-
+clove1db = "0.0.56"
 ```
 
 ## Quick Start
 
+Register tables with `.register::<YourEntity>("table_name")` — no global `schema_name` required.
+
 ```rust
 use serde::{Deserialize, Serialize};
 use clove1db::{
-    storage::{DatabaseConfig, Storage, StorageConfig},
-    entity::Entity,
     dto::{InputDto, OutputDto},
+    entity::Entity,
+    storage::{DatabaseConfig, Storage, StorageConfig},
     units::Result,
 };
 
-// 1. Define your entity
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct User {
     id: String,
@@ -44,147 +46,257 @@ impl Entity for User {
     fn entity_id(&self) -> &str { &self.id }
 }
 
-// (Assuming CreateUserDto implements InputDto and UserResponse implements OutputDto)
-#[derive(Deserialize)] struct CreateUserDto { name: String }
-#[derive(Serialize)] struct UserResponse { id: String, name: String }
+#[derive(Deserialize)]
+struct CreateUserDto { name: String }
+
+impl InputDto<User> for CreateUserDto {
+    fn into_entity(self) -> Result<User> {
+        let id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+            .to_string();
+        Ok(User { id, name: self.name })
+    }
+}
+
+#[derive(Serialize)]
+struct UserResponse { id: String, name: String }
+
+impl OutputDto<User> for UserResponse {
+    fn from_entity(e: User) -> Self {
+        Self { id: e.id, name: e.name }
+    }
+}
 
 fn main() -> Result<()> {
-    // 2. Build storage (Synchronous)
     let storage = Storage::builder(StorageConfig::default())
         .add_database(
             DatabaseConfig::new("users_db", "users")
+                .backup_enabled(true)
                 .cache(10_000, 300, 60)
-                .register::<User>("users")
+                .register::<User>("users"),
         )
         .build()?;
 
-    // 3. Use domain
     let domain = storage.domain::<User>();
-    
-    let input = CreateUserDto { name: "Alice".into() };
-
-    // CRUD Operations
-    let user  = domain.create::<CreateUserDto, UserResponse>(input)?;
-    let found = domain.get::<UserResponse>(&user.id)?;
-    let list  = domain.list::<UserResponse>()?;
-    
-    domain.update::<CreateUserDto, UserResponse>(
-        &user.id, 
-        CreateUserDto { name: "Alice Updated".into() }
-    )?;
-    
+    let user = domain.create::<CreateUserDto, UserResponse>(CreateUserDto {
+        name: "Alice".into(),
+    })?;
+    let _found = domain.get::<UserResponse>(&user.id)?;
     domain.delete(&user.id)?;
-
     Ok(())
 }
+```
 
+## Schema & Migrations
+
+Each registered table has its own version chain:
+
+| Concept | Meaning |
+|---------|---------|
+| `schema_id` | Table name (e.g. `"products"`) |
+| `schema_version` | `u32` per table (`1`, `2`, `3`, …) |
+| Entity JSON | Fields only in primary `.cldb` — version lives in `_clove_meta` and migration files |
+
+On-disk migration layout:
+
+```
+{db}.migration/
+  index.json
+  tables/
+    products/
+      index.json
+      layouts/v1.json
+      mig-*/manifest.json
+      mig-*/refs/
+```
+
+### Migration kinds (resolved automatically)
+
+| Kind | When | `delete_source` |
+|------|------|-----------------|
+| **InPlaceEvolve** | `.from_db(d, t)` only, or same `db` + `table` | Ignored |
+| **DataTransfer** | Different `db` and/or `table` | Honoured |
+| **ExternalImport** | `.from_external(...)` | Ignored |
+
+```rust
+use std::path::PathBuf;
+use clove1db::migration::{
+    ExternalFrom, FieldMap, FieldTransform, KeyDecoder, MigrationTo,
+    TargetConflictPolicy, ValueDecoder,
+};
+
+// In-place schema evolve (same db + table)
+storage.migration_runner()
+    .from_db("catalog", "products")
+    .execute()?;
+
+// Cross-database move
+storage.migration_runner()
+    .from_db("catalog", "products")
+    .to(MigrationTo::new("shop").table("products").delete_source(true))
+    .on_target_conflict(TargetConflictPolicy::Fail)
+    .execute()?;
+
+// External redb → clove1db (requires field_map and/or custom decoder)
+storage.migration_runner()
+    .from_external(ExternalFrom {
+        path: PathBuf::from("./vendor.redb"),
+        table: "vendor_catalog".into(),
+        key_decoder: KeyDecoder::Utf8String,
+        value_decoder: ValueDecoder::JsonValidate,
+        field_map: Some(
+            FieldMap::new()
+                .rename("title", "name")
+                .transform("price_usd", "price_cents", FieldTransform::UsdToCents),
+        ),
+        decoder: None,
+    })
+    .to(MigrationTo::new("shop").table("products"))
+    .execute()?;
+```
+
+### External redb key/value layouts
+
+| `KeyDecoder` | `ValueDecoder` | Typical source |
+|--------------|----------------|----------------|
+| `Utf8String` | `JsonValidate` | UTF-8 keys, JSON bytes (`&[u8]`) |
+| `U64AsString` | `JsonValidate` | `u64` keys, JSON bytes |
+| `U64AsString` | `JsonString` | `u64` keys, JSON stored as redb `String` |
+
+Use `list_external_tables(path)` and `read_external_table(path, &spec)` to probe a foreign `.redb` before importing.
+
+Register custom decoders for nested JSON → flat entity mapping:
+
+```rust
+use clove1db::migration::{default_registry, SchemaDecoder, SchemaDecoderRegistry};
+
+struct MyDecoder;
+impl SchemaDecoder for MyDecoder {
+    fn decode_to_json(&self, bytes: &[u8]) -> clove1db::units::Result<serde_json::Value> {
+        Ok(serde_json::from_slice(bytes)?)
+    }
+    fn migrate_bytes(&self, bytes: &[u8]) -> clove1db::units::Result<Vec<u8>> {
+        // map legacy JSON → clove entity JSON
+        todo!()
+    }
+}
+
+let mut registry = default_registry();
+registry.register("my_legacy", MyDecoder);
+// Storage::builder(...).decoder_registry(registry)
 ```
 
 ## Backup & Versioning
 
 ```rust
 use redb::TableDefinition;
-use clove1db::units::Result;
+use clove1db::{backup::view::HistoryDisplayMode, units::Result};
 
-fn main() -> Result<()> {
-    // ... (Storage setup with backup_enabled(true) assumed) ...
-    
+fn demo(storage: &clove1db::storage::Storage, id: &str) -> Result<()> {
     let domain = storage.domain::<User>();
-    let id = "some-user-id";
-
-    // View full history
     let bm = storage.db_manager("users_db").backup_manager.as_ref().unwrap();
+
     let history = bm.history(TableDefinition::new("users"), id)?;
-
-    // View data at a specific version (read-only)
-    let data_v2 = bm.view_by_version(TableDefinition::new("users"), id, 2)?;
-
-    // View data at a point in time (read-only)
-    let timestamp_ms = chrono::Utc::now().timestamp_millis();
-    let data_time = bm.view_at(TableDefinition::new("users"), id, timestamp_ms)?;
-
-    // Restore to a specific version (writes to DB + cache + backup)
+    let _at_v2 = bm.view_by_version(TableDefinition::new("users"), id, 2)?;
     domain.restore_by_version(id, 1)?;
 
-    // Restore to a point in time
-    domain.restore_at(id, timestamp_ms)?;
-
+    // Domain API with normalized history (applies migration chain)
+    let _record = domain.get_by_version_with_mode(id, 1, HistoryDisplayMode::Normalized)?;
     Ok(())
 }
-
 ```
 
 ## Bulk Operations
 
 ```rust
-use clove1db::units::Result;
-
-fn main() -> Result<()> {
-    // ... (Storage setup assumed) ...
-    let domain = storage.domain::<User>();
-
-    // Update multiple entities at once — returns (results, bulk_id)
-    let bulk_payload = vec![
-        ("id-1".to_string(), CreateUserDto { name: "Alice".into() }),
-        ("id-2".to_string(), CreateUserDto { name: "Bob".into()   }),
-    ];
-
-    let (updated, bulk_id) = domain.update_bulk::<CreateUserDto, UserResponse>(bulk_payload)?;
-
-    // Restore all entities to their state before the bulk update
-    domain.restore_bulk(&bulk_id)?;
-
-    // List all saved bulk snapshots
-    let bm = storage.db_manager("users_db").backup_manager.as_ref().unwrap();
-    let snapshots = bm.list_bulk("users")?;
-    
-    for snap in snapshots {
-        println!("bulk_id: {} | {} entries | {}", snap.bulk_id, snap.entries.len(), snap.date);
-    }
-
-    Ok(())
-}
-
+let domain = storage.domain::<User>();
+let payload = vec![
+    ("id-1".into(), CreateUserDto { name: "Alice".into() }),
+    ("id-2".into(), CreateUserDto { name: "Bob".into() }),
+];
+let (_updated, bulk_id) = domain.update_bulk::<CreateUserDto, UserResponse>(payload)?;
+domain.restore_bulk(&bulk_id)?;
 ```
 
 ## Multi-Database
 
 ```rust
 use std::path::PathBuf;
-use clove1db::{storage::{DatabaseConfig, Storage, StorageConfig}, units::Result};
+use clove1db::storage::{DatabaseConfig, Storage, StorageConfig};
 
-fn main() -> Result<()> {
-    let storage = Storage::builder(StorageConfig::default())
-        // DB 1 — default path
-        .add_database(
-            DatabaseConfig::new("users_db", "users")
-                .register::<User>("users")
-        )
-        // DB 2 — custom path + backup enabled
-        .add_database(
-            DatabaseConfig::new("catalog_db", "catalog")
-                .dir_path(PathBuf::from("./data"))
-                .backup_enabled(true)
-                .register::<Product>("products") // Assumes Product Entity
-                .register::<Order>("orders")     // Assumes Order Entity
-        )
-        .build()?;
-
-    Ok(())
-}
-
+let storage = Storage::builder(StorageConfig::default())
+    .add_database(
+        DatabaseConfig::new("users_db", "users")
+            .register::<User>("users"),
+    )
+    .add_database(
+        DatabaseConfig::new("catalog_db", "catalog")
+            .dir_path(PathBuf::from("./data"))
+            .backup_enabled(true)
+            .register::<Product>("products"),
+    )
+    .build()?;
 ```
+
+## Metadata, Inspect & Auto-Upgrade
+
+On `Storage::build()`, clove1db automatically:
+
+1. Classifies the `.cldb` era (`Legacy042`, `Clove049`, or current)
+2. Writes or updates `_clove_meta` (per-table `schema_id` / `schema_version`)
+3. Ensures `{db}.migration/tables/{table}/` matches registered layouts
+4. Upgrades legacy v0.0.49 single-root migration indexes to per-table chains
+5. Normalizes `.cldb.bak` to canonical `BackupRecord` JSON (`.pre-upgrade` copy removed on success)
+
+Inspect without opening `Storage`:
+
+```rust
+use clove1db::{inspect_cldb, FileKind};
+
+let report = inspect_cldb("./data/shop/shop.cldb")?;
+match report.kind {
+    FileKind::New => { /* empty / missing */ }
+    FileKind::Legacy042 => { /* pre-metadata clove */ }
+    FileKind::Clove049 => { /* old migration index */ }
+    FileKind::Authenticated => { /* _clove_meta present */ }
+    FileKind::ExternalRedb => { /* raw redb, not clove */ }
+    FileKind::Invalid => { /* directory or unreadable */ }
+    _ => {}
+}
+```
+
+## Examples & local demos
+
+Runnable examples live in the **Git repository** under `examples/` (not included in the crates.io package). Clone the repo and run from each folder:
+
+```bash
+git clone https://github.com/clove7/clove1db
+cd clove1db/examples/01_basic_crud && cargo run
+```
+
+| Example | Topic |
+|---------|-------|
+| `01_basic_crud` | Entity, DTO, CRUD |
+| `02_multi_database` | Multiple `.cldb` files in one `Storage` |
+| `03_backup_history` | Versioned backup, restore, history |
+| `04_bulk_operations` | Bulk update / restore |
+| `05_domain_dto_patterns` | Input/Output DTO patterns |
+| `06_large_files_no_cache` | Large blobs, cache off |
+| `07_migration` | In-place evolve, cross-DB move, external import, restore guards |
+| `08_inspect_upgrade` | Era fixtures (0.0.42 / 0.0.49 / 0.0.56), upgrade pipeline |
 
 ## Contributing
 
-This project is under active development and needs help to grow:
+This project is under active development:
 
-- **Bug reports & feature requests** — open a [GitHub issue](https://github.com/clove7/clove1db/issues)
-- **Code contributions** — fork, branch, and open a pull request
-- **Examples & docs** — see `examples/` for patterns; new scenarios are especially welcome
-- **Feedback** — tell us how you use (or want to use) clove1db in your apps
+- **Bug reports & feature requests** — [GitHub issues](https://github.com/clove7/clove1db/issues)
+- **Code contributions** — fork, branch, open a pull request
+- **Examples & docs** — scenarios in `examples/` are especially welcome
+- **Feedback** — tell us how you use (or want to use) clove1db
 
-Before large changes, open an issue to discuss the approach. Smaller fixes and example improvements can go straight to a PR.
+Before large changes, open an issue to discuss the approach.
 
 ## License
 
