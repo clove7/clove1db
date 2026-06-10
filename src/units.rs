@@ -41,6 +41,32 @@ pub enum ClError {
 
     #[error("Option None error")]
     OptionNone,
+
+    #[error("Migration error: {0}")]
+    MigrationError(String),
+
+    #[error(
+        "Version {version} (schema {schema_at_version}) is not restorable; current schema is {current_schema} (migration {migration_id})"
+    )]
+    NotRestorable {
+        version: u64,
+        schema_at_version: String,
+        current_schema: String,
+        migration_id: String,
+    },
+
+    #[error("Migration key conflict on table '{table}' key '{key}' with policy {policy:?}")]
+    MigrationConflict {
+        table: String,
+        key: String,
+        policy: String,
+    },
+
+    #[error("Decoder not found for schema '{schema}' (migration {migration_id})")]
+    DecoderNotFound {
+        schema: String,
+        migration_id: String,
+    },
 }
 
 impl From<std::io::Error> for ClError {

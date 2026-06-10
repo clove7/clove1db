@@ -1,6 +1,5 @@
-use itertools::Itertools;
-
 use crate::{
+    backup::view::HistoryDisplayMode,
     dto::{InputDto, OutputDto},
     entity::Entity,
     repository::{BackupRecordRepository, Repository},
@@ -89,31 +88,21 @@ impl<E: Entity> Domain<E> {
         Ok(())
     }
 
-    pub fn get_by_version<O: OutputDto<E>>(
+    pub fn get_by_version(
         &self,
         id: &str,
         version: u64,
-    ) -> Result<BackupRecordRepository<O>> {
-        let entity = self.repository.get_by_version(id, version)?;
+    ) -> Result<BackupRecordRepository<E>> {
+        self.get_by_version_with_mode(id, version, HistoryDisplayMode::AsStored)
+    }
 
-        let data = if let Some(data) = entity.data {
-            let value = O::from_entity(data);
-            Some(value)
-        } else {
-            None
-        };
-
-        Ok(BackupRecordRepository::<O> {
-            version: entity.version,
-            timestamp: entity.timestamp,
-            date: entity.date,
-            operation: entity.operation,
-            table: entity.table,
-            key: entity.key,
-            data: data,
-            restored_version: entity.restored_version,
-            bulk_id: entity.bulk_id,
-        })
+    pub fn get_by_version_with_mode(
+        &self,
+        id: &str,
+        version: u64,
+        mode: HistoryDisplayMode,
+    ) -> Result<BackupRecordRepository<E>> {
+        self.repository.get_by_version(id, version, mode)
     }
 
     pub fn restore_at(&self, id: &str, timestamp: i64) -> Result<()> {
@@ -121,31 +110,21 @@ impl<E: Entity> Domain<E> {
         Ok(())
     }
 
-    pub fn get_version_by_at<O: OutputDto<E>>(
+    pub fn get_version_by_at(
         &self,
         id: &str,
         timestamp: i64,
-    ) -> Result<BackupRecordRepository<O>> {
-        let entity = self.repository.get_version_by_at(id, timestamp)?;
+    ) -> Result<BackupRecordRepository<E>> {
+        self.get_version_by_at_with_mode(id, timestamp, HistoryDisplayMode::AsStored)
+    }
 
-        let data = if let Some(data) = entity.data {
-            let value = O::from_entity(data);
-            Some(value)
-        } else {
-            None
-        };
-
-        Ok(BackupRecordRepository::<O> {
-            version: entity.version,
-            timestamp: entity.timestamp,
-            date: entity.date,
-            operation: entity.operation,
-            table: entity.table,
-            key: entity.key,
-            data: data,
-            restored_version: entity.restored_version,
-            bulk_id: entity.bulk_id,
-        })
+    pub fn get_version_by_at_with_mode(
+        &self,
+        id: &str,
+        timestamp: i64,
+        mode: HistoryDisplayMode,
+    ) -> Result<BackupRecordRepository<E>> {
+        self.repository.get_version_by_at(id, timestamp, mode)
     }
 
     pub fn restore_bulk(&self, bulk_id: &str) -> Result<()> {
@@ -153,34 +132,30 @@ impl<E: Entity> Domain<E> {
         Ok(())
     }
 
-    pub fn history<O: OutputDto<E>>(&self, id: &str) -> Result<Vec<BackupRecordRepository<O>>> {
-        let entities = self.repository.history(id)?;
+    pub fn history(&self, id: &str) -> Result<Vec<BackupRecordRepository<E>>> {
+        self.history_with_mode(id, HistoryDisplayMode::AsStored)
+    }
 
-        let history = entities
-            .into_iter()
-            .map(|record| {
-                let data = if let Some(data) = record.data {
-                    let value = O::from_entity(data);
-                    Some(value)
-                } else {
-                    None
-                };
+    pub fn history_with_mode(
+        &self,
+        id: &str,
+        mode: HistoryDisplayMode,
+    ) -> Result<Vec<BackupRecordRepository<E>>> {
+        self.repository.history(id, mode)
+    }
 
-                BackupRecordRepository::<O> {
-                    version: record.version,
-                    timestamp: record.timestamp,
-                    date: record.date,
-                    operation: record.operation,
-                    table: record.table,
-                    key: record.key,
-                    data: data,
-                    restored_version: record.restored_version,
-                    bulk_id: record.bulk_id,
+    pub fn history_typed<O: OutputDto<E>>(&self, id: &str) -> Result<Vec<O>> {
+        let records = self.repository.history(id, HistoryDisplayMode::AsStored)?;
+        let mut out = Vec::new();
+        for r in records {
+            if r.restorable {
+                if let Some(json) = r.data.as_json() {
+                    let entity: E = serde_json::from_value(json.clone())?;
+                    out.push(O::from_entity(entity));
                 }
-            })
-            .collect_vec();
-
-        Ok(history)
+            }
+        }
+        Ok(out)
     }
 
     pub fn current_version(&self, id: &str) -> Result<u64> {

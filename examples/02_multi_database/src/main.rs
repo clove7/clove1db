@@ -9,7 +9,7 @@ use clove1db::{
 };
 
 // ═══════════════════════════════════════════════════════════
-// 1. ENTITIES (موزعة على قواعد بيانات مختلفة)
+// 1. ENTITIES (spread across different databases)
 // ═══════════════════════════════════════════════════════════
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,20 +132,20 @@ fn main() -> Result<()> {
     println!("━━━ Building Multi-Database Storage ━━━");
 
     let storage = Storage::builder(StorageConfig::default())
-        // قاعدة البيانات الأولى: مخصصة للمستخدمين
+        // Database 1: users
         .add_database(
             DatabaseConfig::new("users_db", "users")
                 .dir_path(base_dir.clone())
                 .register::<User>("users"),
         )
-        // قاعدة البيانات الثانية: مخصصة للمتجر (منتجات، طلبات..الخ)
+        // Database 2: catalog (products, orders, etc.)
         .add_database(
             DatabaseConfig::new("catalog_db", "catalog")
                 .dir_path(base_dir.clone())
-                .cache(5_000, 600, 120) // إعدادات كاش مخصصة
+                .cache(5_000, 600, 120) // custom cache settings
                 .register::<Product>("products"),
         )
-        // قاعدة بيانات ثالثة: بدون كاش (مثلاً للملفات الكبيرة)
+        // Database 3: no cache (e.g. large files)
         .add_database(
             DatabaseConfig::new("attachments_db", "attachments")
                 .dir_path(base_dir.clone())
@@ -153,7 +153,7 @@ fn main() -> Result<()> {
         )
         .build()?;
 
-    // عرض قواعد البيانات المسجلة في النظام
+    // List registered databases
     println!("\n  ✅ Active Databases: {:?}", storage.db_list_names());
 
     // ── 2. Interact with Database 1 (Users) ────────────────

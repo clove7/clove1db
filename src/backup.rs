@@ -1,4 +1,9 @@
 // backup.rs
+pub mod view;
+
+use crate::backup::view::{BackupRecordView, HistoryDisplayMode, RecordData};
+use crate::migration::chain::MigrationChain;
+use crate::migration::decoder::SchemaDecoderRegistry;
 use crate::units::ClError;
 use crate::units::Result;
 use chrono::Local;
@@ -409,5 +414,142 @@ impl BackupManager {
         };
 
         Ok(bulk_id)
+    }
+
+    pub fn resolve_record(
+        raw: &BackupRecord,
+        chain: Option<&MigrationChain>,
+        registry: &SchemaDecoderRegistry,
+        mode: HistoryDisplayMode,
+    ) -> BackupRecordView {
+        let schema_at_version = chain
+            .map(|c| c.schema_for_version(raw.version).to_string())
+            .unwrap_or_else(|| "current".to_string());
+
+        let migration_id = chain
+            .and_then(|c| c.migration_id_for_version(raw.version))
+            .map(|s| s.to_string());
+
+        let restorable = chain.map(|c| c.is_restorable(raw.version)).unwrap_or(true);
+        let decode_path_single = vec![schema_at_version.clone()];
+
+        if raw.data.is_none() || matches!(raw.operation, BackupOperation::Delete) {
+            return BackupRecordView {
+                version: raw.version,
+                timestamp: raw.timestamp,
+                date: raw.date.clone(),
+                operation: raw.operation.clone(),
+                table: raw.table.clone(),
+                key: raw.key.clone(),
+                data: RecordData::None,
+                schema_at_version,
+                migration_id,
+                readable: true,
+                restorable,
+                decode_path: decode_path_single,
+                bulk_id: raw.bulk_id.clone(),
+                restored_version: raw.restored_version,
+            };
+        }
+
+        let bytes = raw.data.as_ref().unwrap();
+
+        match chain {
+            Some(c) => match c.decode_to_json(bytes, raw.version, mode, registry) {
+                Ok((json, decode_path)) => {
+                    let data = if restorable {
+                        RecordData::Typed(json)
+                    } else {
+                        RecordData::Json(json)
+                    };
+                    BackupRecordView {
+                        version: raw.version,
+                        timestamp: raw.timestamp,
+                        date: raw.date.clone(),
+                        operation: raw.operation.clone(),
+                        table: raw.table.clone(),
+                        key: raw.key.clone(),
+                        data,
+                        schema_at_version,
+                        migration_id,
+                        readable: true,
+                        restorable,
+                        decode_path,
+                        bulk_id: raw.bulk_id.clone(),
+                        restored_version: raw.restored_version,
+                    }
+                }
+                Err(_) => BackupRecordView {
+                    version: raw.version,
+                    timestamp: raw.timestamp,
+                    date: raw.date.clone(),
+                    operation: raw.operation.clone(),
+                    table: raw.table.clone(),
+                    key: raw.key.clone(),
+                    data: RecordData::None,
+                    schema_at_version: schema_at_version.clone(),
+                    migration_id,
+                    readable: false,
+                    restorable: false,
+                    decode_path: decode_path_single.clone(),
+                    bulk_id: raw.bulk_id.clone(),
+                    restored_version: raw.restored_version,
+                },
+            },
+            None => match serde_json::from_slice(bytes) {
+                Ok(json) => BackupRecordView {
+                    version: raw.version,
+                    timestamp: raw.timestamp,
+                    date: raw.date.clone(),
+                    operation: raw.operation.clone(),
+                    table: raw.table.clone(),
+                    key: raw.key.clone(),
+                    data: RecordData::Typed(json),
+                    schema_at_version,
+                    migration_id,
+                    readable: true,
+                    restorable: true,
+                    decode_path: decode_path_single.clone(),
+                    bulk_id: raw.bulk_id.clone(),
+                    restored_version: raw.restored_version,
+                },
+                Err(_) => BackupRecordView {
+                    version: raw.version,
+                    timestamp: raw.timestamp,
+                    date: raw.date.clone(),
+                    operation: raw.operation.clone(),
+                    table: raw.table.clone(),
+                    key: raw.key.clone(),
+                    data: RecordData::None,
+                    schema_at_version: schema_at_version.clone(),
+                    migration_id,
+                    readable: false,
+                    restorable: false,
+                    decode_path: decode_path_single,
+                    bulk_id: raw.bulk_id.clone(),
+                    restored_version: raw.restored_version,
+                },
+            },
+        }
+    }
+
+    pub fn assert_restorable(
+        chain: Option<&MigrationChain>,
+        version: u64,
+    ) -> Result<()> {
+        if let Some(c) = chain {
+            if !c.is_restorable(version) {
+                return Err(ClError::NotRestorable {
+                    version,
+                    schema_at_version: c.schema_for_version(version).to_string(),
+                    current_schema: c.current_schema().to_string(),
+                    migration_id: c
+                        .migration_id_for_version(version)
+                        .unwrap_or("unknown")
+                        .to_string(),
+                });
+            }
+        }
+        Ok(())
     }
 }

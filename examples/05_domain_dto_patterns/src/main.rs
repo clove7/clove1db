@@ -41,7 +41,7 @@ impl InputDto<UserAccount> for RegisterUserDto {
     }
 
     fn into_entity(self) -> Result<UserAccount> {
-        // Business Logic: هنا نقوم بتشفير الباسورد قبل تحويله لـ Entity
+        // Business logic: hash password before building the entity
         let simulated_hash = format!("hashed_{}", self.raw_password);
 
         Ok(UserAccount {
@@ -53,7 +53,7 @@ impl InputDto<UserAccount> for RegisterUserDto {
     }
 }
 
-// Output DTO: لا يحتوي على الـ password_hash نهائياً (آمن للـ API)
+// Output DTO: omits password_hash (safe for APIs)
 #[derive(Debug, Serialize)]
 struct UserPublicProfile {
     id: String,
@@ -117,7 +117,7 @@ impl InputDto<Order> for PlaceOrderDto {
     }
 }
 
-// Output DTO: إرجاع فاتورة منسقة
+// Output DTO: formatted receipt
 #[derive(Debug, Serialize)]
 struct OrderReceipt {
     order_id: String,
@@ -141,7 +141,7 @@ impl OutputDto<Order> for OrderReceipt {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SystemSetting {
-    key: String, // هنا نستخدم الـ Key كـ ID بدلاً من UUID
+    key: String, // use key as ID instead of UUID
     value: String,
 }
 
@@ -164,13 +164,13 @@ impl InputDto<SystemSetting> for UpdateSettingDto {
 
     fn into_entity(self) -> Result<SystemSetting> {
         Ok(SystemSetting {
-            key: self.key, // ID مخصص
+            key: self.key,
             value: self.value,
         })
     }
 }
 
-// Output DTO: بسيط جداً يعكس الـ Entity تماماً
+// Output DTO: mirrors the entity
 #[derive(Debug, Serialize)]
 struct SettingResponse {
     key: String,
@@ -212,9 +212,9 @@ fn main() -> Result<()> {
         raw_password: "supersecret123".into(),
     })?;
 
-    // لاحظ أن المخرجات `UserPublicProfile` لا تحتوي على `password_hash` نهائياً
+    // UserPublicProfile never exposes password_hash
     println!("  ✅ Created User (Public View): {:?}", new_user);
-    // println!("Hash: {}", new_user.password_hash); // ❌ هذا سيعطي خطأ برمجي (Compile Error) وهو المطلوب أمنياً
+    // println!("Hash: {}", new_user.password_hash); // compile error — intentional
 
     // ── 2. Scenario: Business Logic (Orders) ────────────────
     println!("\n━━━ Scenario 2: Order Calculations ━━━");
@@ -225,14 +225,14 @@ fn main() -> Result<()> {
         base_price: 1000.0,
     })?;
 
-    // الـ DTO قام بحساب الضريبة (150) والإجمالي (1150) وتنسيق الملخص
+    // DTO computed tax (150), total (1150), and formatted summary
     println!("  ✅ Order Receipt Generated: {:?}", receipt);
 
     // ── 3. Scenario: Custom ID (Settings) ───────────────────
     println!("\n━━━ Scenario 3: Custom ID Settings ━━━");
     let settings_domain = storage.domain::<SystemSetting>();
 
-    // نستخدم الـ Key كمعرّف (ID) مباشر
+    // Use the key string as the entity ID
     let setting =
         settings_domain.create::<UpdateSettingDto, SettingResponse>(UpdateSettingDto {
             key: "THEME_COLOR".into(),
@@ -240,9 +240,9 @@ fn main() -> Result<()> {
         })?;
     println!("  ✅ Setting Saved: {:?}", setting);
 
-    // تحديث الإعداد باستخدام نفس الـ Key
+    // Update using the same key as ID
     let updated_setting = settings_domain.update::<UpdateSettingDto, SettingResponse>(
-        "THEME_COLOR", // الـ ID هو الكلمة نفسها
+        "THEME_COLOR",
         UpdateSettingDto {
             key: "THEME_COLOR".into(),
             value: "LIGHT_MODE".into(),

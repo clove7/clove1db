@@ -1,6 +1,12 @@
 // use crate::emitter::LogEventEmitter;
 use crate::{
-    backup::{BackupManager, BackupOperation, BackupRecord},
+    backup::{
+        view::{BackupRecordView, HistoryDisplayMode, RecordData},
+        BackupManager, BackupOperation, BackupRecord,
+    },
+    migration::chain::MigrationChain,
+    migration::decoder::SchemaDecoderRegistry,
+    migration::types::MigrationManifest,
     units::{ClError, Result},
 };
 // use crate::units::{CACHE_IDLE_SECONDS, CACHE_MAX_CAPACITY, CACHE_TTL_SECONDS};
@@ -13,7 +19,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 #[derive(Clone, Debug)]
@@ -41,6 +47,12 @@ pub struct DatabaseManager {
 
     // Has cache
     has_cache: bool,
+
+    // Migration chain
+    migration_chain: Arc<RwLock<MigrationChain>>,
+
+    // Shared decoder registry for history resolution
+    decoder_registry: Arc<SchemaDecoderRegistry>,
 }
 
 impl DatabaseManager {
@@ -54,6 +66,8 @@ impl DatabaseManager {
         cache_ttl_seconds: u64,
         cache_idle_seconds: u64,
         has_cache: bool,
+        initial_schema: &str,
+        decoder_registry: Arc<SchemaDecoderRegistry>,
     ) -> Result<Self> {
         let dir = dir_path.join(dir_name);
         let backup_dir = if let Some(backup_dir_path) = backup_dir_path {
@@ -115,6 +129,12 @@ impl DatabaseManager {
             year: now.year() as u32,
         };
 
+        let migration_chain = Arc::new(RwLock::new(MigrationChain::load(
+            &dir_local.dir,
+            db_name,
+            initial_schema,
+        )?));
+
         Ok(Self {
             memory_cache,
             db: db,
@@ -124,7 +144,100 @@ impl DatabaseManager {
             db_name: db_name.to_string(),
             tables_names: tables,
             has_cache,
+            migration_chain,
+            decoder_registry,
         })
+    }
+
+    pub fn migration_chain(&self) -> Result<std::sync::RwLockReadGuard<'_, MigrationChain>> {
+        self.migration_chain
+            .read()
+            .map_err(|_| ClError::MigrationError("migration chain lock poisoned".into()))
+    }
+
+    pub fn decoder_registry(&self) -> &SchemaDecoderRegistry {
+        &self.decoder_registry
+    }
+
+    pub fn append_migration(
+        &self,
+        manifest: MigrationManifest,
+        snapshot: Option<&[(String, Vec<u8>)]>,
+    ) -> Result<()> {
+        let mut chain = self
+            .migration_chain
+            .write()
+            .map_err(|_| ClError::MigrationError("migration chain lock poisoned".into()))?;
+        chain.append(manifest, snapshot)?;
+        Ok(())
+    }
+
+    pub fn list_entries(&self, table_name: &str) -> Result<Vec<(String, Vec<u8>)>> {
+        let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(table_name);
+        let read_txn = self.db.begin_read()?;
+        let table_ref = read_txn.open_table(table)?;
+        Ok(table_ref
+            .iter()?
+            .filter_map(|entry| {
+                entry
+                    .ok()
+                    .map(|(k, v)| (k.value().to_string(), v.value().to_vec()))
+            })
+            .collect_vec())
+    }
+
+    pub fn get_raw(&self, table_name: &str, key: &str) -> Result<Option<Vec<u8>>> {
+        let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(table_name);
+        self.get(table, table_name, key)
+    }
+
+    pub fn delete_raw(&self, table_name: &str, key: &str) -> Result<()> {
+        let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(table_name);
+        self.delete(table, table_name, key)?;
+        Ok(())
+    }
+
+    pub fn commit_batch(
+        &self,
+        writes: &[(String, String, Vec<u8>)],
+        deletes: &[(String, String)],
+    ) -> Result<()> {
+        let mut write_txn = self.db.begin_write()?;
+        if !self.has_cache {
+            write_txn.set_durability(Durability::Immediate)?;
+        }
+
+        for (table_name, key, value) in writes {
+            let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(table_name.as_str());
+            let mut table_ref = write_txn.open_table(table)?;
+            if self.has_cache {
+                table_ref.insert(key.as_str(), value.as_slice())?;
+            } else {
+                let mut slot = table_ref.insert_reserve(key.as_str(), value.len())?;
+                slot.as_mut().copy_from_slice(value);
+            }
+        }
+
+        for (table_name, key) in deletes {
+            let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(table_name.as_str());
+            let mut table_ref = write_txn.open_table(table)?;
+            let _ = table_ref.remove(key.as_str());
+        }
+
+        write_txn.commit()?;
+
+        if self.has_cache {
+            for (table_name, key, value) in writes {
+                let cache_key = format!("{}:{}", table_name, key);
+                self.memory_cache.insert(cache_key, value.clone());
+            }
+            for (table_name, key) in deletes {
+                let cache_key = format!("{}:{}", table_name, key);
+                self.memory_cache.invalidate(&cache_key);
+            }
+        }
+
+        Ok(())
     }
 
     /// Write-Through: Write to both cache and DB
@@ -270,6 +383,10 @@ impl DatabaseManager {
             .backup_manager
             .as_ref()
             .ok_or_else(|| ClError::NotFound("backup not configured".into()))?;
+
+        if let Ok(chain) = self.migration_chain() {
+            BackupManager::assert_restorable(Some(&chain), version)?;
+        }
 
         // Read the specified record directly
         let backup_key = format!("{}:{}", key, version);
@@ -428,6 +545,24 @@ impl DatabaseManager {
             .backup_manager
             .as_ref()
             .ok_or_else(|| ClError::NotFound("backup not configured".into()))?;
+
+        let bulk_entries = {
+            let bulk_name = format!("{}_bulk", table_name);
+            let bulk_table: TableDefinition<&str, &[u8]> = TableDefinition::new(bulk_name.as_str());
+            let read_txn = bm.db.begin_read()?;
+            let btbl = read_txn.open_table(bulk_table)?;
+            let bulk_data = btbl
+                .get(bulk_id)?
+                .ok_or_else(|| ClError::NotFound(format!("bulk_id {} not found", bulk_id)))?;
+            let bulk: crate::backup::BulkRecord = serde_json::from_slice(bulk_data.value())?;
+            bulk.entries
+        };
+
+        if let Ok(chain) = self.migration_chain() {
+            for entry in &bulk_entries {
+                BackupManager::assert_restorable(Some(&chain), entry.version)?;
+            }
+        }
 
         let results = bm.restore_bulk(table, table_name, bulk_id)?;
 
@@ -596,54 +731,43 @@ impl<T: DeserializeOwned + Serialize + Clone> Repository<T> {
             .restore_by_version(table, self.table, id, version)
     }
 
-    pub fn get_by_version(&self, id: &str, version: u64) -> Result<BackupRecordRepository<T>> {
+    pub fn get_by_version(
+        &self,
+        id: &str,
+        version: u64,
+        mode: HistoryDisplayMode,
+    ) -> Result<BackupRecordRepository<T>> {
         let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(self.table);
         let record = self.database_manager.get_by_version(table, id, version)?;
-
-        let data = if let Some(data) = record.data {
-            let value = serde_json::from_slice(&data)?;
-            Some(value)
-        } else {
-            None
-        };
-
-        Ok(BackupRecordRepository::<T> {
-            version: record.version,
-            timestamp: record.timestamp,
-            date: record.date,
-            operation: record.operation,
-            table: record.table,
-            key: record.key,
-            data: data,
-            restored_version: record.restored_version,
-            bulk_id: record.bulk_id,
-        })
+        self.resolve_backup_record(record, mode)
     }
 
-    pub fn get_version_by_at(&self, id: &str, timestamp: i64) -> Result<BackupRecordRepository<T>> {
+    pub fn get_version_by_at(
+        &self,
+        id: &str,
+        timestamp: i64,
+        mode: HistoryDisplayMode,
+    ) -> Result<BackupRecordRepository<T>> {
         let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(self.table);
         let record = self
             .database_manager
             .get_version_by_at(table, id, timestamp)?;
+        self.resolve_backup_record(record, mode)
+    }
 
-        let data = if let Some(data) = record.data {
-            let value = serde_json::from_slice(&data)?;
-            Some(value)
-        } else {
-            None
-        };
-
-        Ok(BackupRecordRepository::<T> {
-            version: record.version,
-            timestamp: record.timestamp,
-            date: record.date,
-            operation: record.operation,
-            table: record.table,
-            key: record.key,
-            data: data,
-            restored_version: record.restored_version,
-            bulk_id: record.bulk_id,
-        })
+    fn resolve_backup_record(
+        &self,
+        record: BackupRecord,
+        mode: HistoryDisplayMode,
+    ) -> Result<BackupRecordRepository<T>> {
+        let chain = self.database_manager.migration_chain().ok();
+        let view = BackupManager::resolve_record(
+            &record,
+            chain.as_deref().map(|g| &*g),
+            self.database_manager.decoder_registry(),
+            mode,
+        );
+        Ok(view_into_repository(view))
     }
 
     pub fn restore_at(&self, id: &str, timestamp: i64) -> Result<()> {
@@ -658,31 +782,27 @@ impl<T: DeserializeOwned + Serialize + Clone> Repository<T> {
             .restore_bulk(table, self.table, bulk_id)
     }
 
-    pub fn history(&self, id: &str) -> Result<Vec<BackupRecordRepository<T>>> {
+    pub fn history(
+        &self,
+        id: &str,
+        mode: HistoryDisplayMode,
+    ) -> Result<Vec<BackupRecordRepository<T>>> {
         let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(self.table);
+        let chain = self.database_manager.migration_chain().ok();
+        let registry = self.database_manager.decoder_registry();
+
         let history = self
             .database_manager
             .history(table, id)?
             .into_iter()
             .map(|record| {
-                let data = if let Some(data) = record.data {
-                    let value = serde_json::from_slice(&data).unwrap();
-                    Some(value)
-                } else {
-                    None
-                };
-
-                BackupRecordRepository::<T> {
-                    version: record.version,
-                    timestamp: record.timestamp,
-                    date: record.date,
-                    operation: record.operation,
-                    table: record.table,
-                    key: record.key,
-                    data: data,
-                    restored_version: record.restored_version,
-                    bulk_id: record.bulk_id,
-                }
+                let view = BackupManager::resolve_record(
+                    &record,
+                    chain.as_deref().map(|g| &*g),
+                    registry,
+                    mode,
+                );
+                view_into_repository(view)
             })
             .collect_vec();
 
@@ -702,7 +822,34 @@ pub struct BackupRecordRepository<T> {
     pub operation: BackupOperation,
     pub table: String,
     pub key: String,
-    pub data: Option<T>,
+    pub data: RecordData,
     pub bulk_id: Option<String>,
     pub restored_version: Option<u64>,
+    pub schema_at_version: String,
+    pub migration_id: Option<String>,
+    pub readable: bool,
+    pub restorable: bool,
+    pub decode_path: Vec<String>,
+    #[serde(skip)]
+    pub _marker: std::marker::PhantomData<T>,
+}
+
+fn view_into_repository<T>(view: BackupRecordView) -> BackupRecordRepository<T> {
+    BackupRecordRepository {
+        version: view.version,
+        timestamp: view.timestamp,
+        date: view.date,
+        operation: view.operation,
+        table: view.table,
+        key: view.key,
+        data: view.data,
+        bulk_id: view.bulk_id,
+        restored_version: view.restored_version,
+        schema_at_version: view.schema_at_version,
+        migration_id: view.migration_id,
+        readable: view.readable,
+        restorable: view.restorable,
+        decode_path: view.decode_path,
+        _marker: std::marker::PhantomData,
+    }
 }

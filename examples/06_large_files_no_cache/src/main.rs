@@ -18,7 +18,7 @@ struct FileRecord {
     filename: String,
     mime_type: String,
     size_bytes: usize,
-    data: Vec<u8>, // حمولة الملف (Binary Payload)
+    data: Vec<u8>, // file binary payload
     uploaded_at: i64,
 }
 
@@ -44,7 +44,7 @@ impl InputDto<FileRecord> for UploadFileDto {
         if self.data.is_empty() {
             return Err(ClError::Validation("File data cannot be empty".into()).into());
         }
-        // يمكن إضافة حد أقصى لحجم الملف هنا (مثلاً 50MB)
+        // optional max file size (e.g. 50MB)
         if self.data.len() > 50 * 1024 * 1024 {
             return Err(ClError::Validation("File size exceeds 50MB limit".into()).into());
         }
@@ -68,7 +68,7 @@ impl InputDto<FileRecord> for UploadFileDto {
 // 3. OUTPUT DTOs (Metadata vs Full Download)
 // ═══════════════════════════════════════════════════════════
 
-// DTO 1: لإرجاع معلومات الملف فقط بدون تحميل الـ Binary في الذاكرة
+// DTO 1: metadata only — no binary loaded
 #[derive(Debug, Serialize)]
 struct FileMetadataResponse {
     id: String,
@@ -88,7 +88,7 @@ impl OutputDto<FileRecord> for FileMetadataResponse {
     }
 }
 
-// DTO 2: يستخدم فقط عند الحاجة لتحميل/قراءة الملف الفعلي
+// DTO 2: full download — loads binary into memory
 #[derive(Debug, Serialize)]
 struct FileDownloadResponse {
     filename: String,
@@ -120,8 +120,8 @@ fn main() -> Result<()> {
         .add_database(
             DatabaseConfig::new("attachments_db", "attachments")
                 .dir_path(base_dir)
-                .backup_enabled(false) // ❌ إيقاف الباك أب لمنع تضخم المساحة
-                .has_cache(false) // ❌ إيقاف الكاش لحماية الـ RAM
+                .backup_enabled(false) // disable backup to save disk space
+                .has_cache(false) // disable cache to protect RAM
                 .register::<FileRecord>("files"),
         )
         .build()?;
@@ -131,7 +131,7 @@ fn main() -> Result<()> {
     // ── 2. Simulate File Upload ────────────────────────────
     println!("\n━━━ 1. Uploading Large File ━━━");
 
-    // محاكاة بيانات ملف بحجم 2MB تقريباً
+    // simulate ~2MB file payload
     let mock_binary_data = vec![0u8; 2 * 1024 * 1024];
 
     let upload_input = UploadFileDto {
@@ -140,7 +140,7 @@ fn main() -> Result<()> {
         data: mock_binary_data,
     };
 
-    // نستخدم FileMetadataResponse لنرجع فقط البيانات الوصفية بعد الرفع
+    // return metadata only after upload
     let metadata = file_domain.create::<UploadFileDto, FileMetadataResponse>(upload_input)?;
     println!("  ✅ File Uploaded Successfully!");
     println!("     ID: {}", metadata.id);
@@ -156,7 +156,7 @@ fn main() -> Result<()> {
 
     // ── 4. Download File (Fetch Full Binary) ───────────────
     println!("\n━━━ 3. Downloading File ━━━");
-    // هنا فقط نقوم بسحب الـ Vec<u8> كاملة من قاعدة البيانات
+    // load full Vec<u8> from the database
     let download = file_domain.get::<FileDownloadResponse>(&metadata.id)?;
     println!(
         "  ✅ Downloaded '{}' | Loaded {} bytes into memory.",

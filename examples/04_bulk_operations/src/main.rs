@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use clove1db::{
+    backup::view::RecordData,
     dto::{InputDto, OutputDto},
     entity::Entity,
     storage::{DatabaseConfig, Storage, StorageConfig},
@@ -86,7 +87,7 @@ fn main() -> Result<()> {
         .add_database(
             DatabaseConfig::new("devices_db", "devices")
                 .dir_path(base_dir)
-                .backup_enabled(true) // تفعيل النسخ الاحتياطي ضروري لعمليات الـ Restore
+                .backup_enabled(true) // backup required for restore_bulk
                 .register::<Device>("devices"),
         )
         .build()?;
@@ -137,19 +138,19 @@ fn main() -> Result<()> {
 
     // ── 4. Modify Individual Devices Afterward ─────────────
     println!("\n━━━ 3. Individual Updates After Bulk ━━━");
-    // قمنا بتعديل أحد الأجهزة لاحقاً لجعله "Offline"
+    // Change one device to Offline after the bulk update
     device_domain.update::<DeviceConfigDto, DeviceResponse>(
         &dev1.id,
         DeviceConfigDto {
             name: "Server-Alpha".into(),
-            status: "Offline".into(), // حالة جديدة
+            status: "Offline".into(),
         },
     )?;
     println!("  ✅ dev1 changed to Offline manually.");
 
     // ── 5. Restore Bulk ────────────────────────────────────
     println!("\n━━━ 4. Restoring Entire Bulk Snapshot ━━━");
-    // نسترجع كل الأجهزة إلى اللحظة التي تمت فيها عملية الـ Bulk Update
+    // Roll back all devices to the bulk snapshot
     device_domain.restore_bulk(&bulk_id)?;
 
     let restored1 = device_domain.get::<DeviceResponse>(&dev1.id)?;
@@ -159,7 +160,7 @@ fn main() -> Result<()> {
     println!(
         "     dev1 Restored State: {} - {}",
         restored1.name, restored1.status
-    ); // سيعود إلى "Maintenance"
+    ); // back to "Maintenance"
     println!(
         "     dev2 Restored State: {} - {}",
         restored2.name, restored2.status
@@ -167,12 +168,12 @@ fn main() -> Result<()> {
 
     // ── 6. Verify Audit Logs with bulk_id ──────────────────
     println!("\n━━━ 5. Audit History for dev1 ━━━");
-    let history = device_domain.history::<DeviceResponse>(&dev1.id)?;
+    let history = device_domain.history(&dev1.id)?;
     for r in &history {
         let status = r
             .data
-            .as_ref()
-            .map(|d| d.status.as_str())
+            .as_json()
+            .and_then(|j| j.get("status").and_then(|s| s.as_str()))
             .unwrap_or("❌ Deleted");
         println!(
             "  v{} | Op: {:?} | Status: {:<12} | bulk_id: {:?}",

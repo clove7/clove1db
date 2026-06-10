@@ -7,7 +7,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::{
-    domain::Domain, entity::Entity, repository::DatabaseManager, repository::Repository,
+    domain::Domain,
+    entity::Entity,
+    migration::chain::MigrationChain,
+    migration::decoder::SchemaDecoderRegistry,
+    migration::runner::MigrationRunner,
+    repository::DatabaseManager,
+    repository::Repository,
     units::Result,
 };
 
@@ -20,8 +26,8 @@ const LOG_CHANNEL_CAPACITY: usize = 1024;
 
 struct StorageInner {
     domains: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
-    // We keep them for maintenance (backup update, etc.)
     database_managers: HashMap<String, DatabaseManager>,
+    decoder_registry: Arc<SchemaDecoderRegistry>,
 }
 
 // ── Storage ────────────────────────────────────────────────────────────────────
@@ -67,6 +73,23 @@ impl Storage {
             .map(|k| k.to_string())
             .collect()
     }
+
+    pub fn migration_runner(&self) -> MigrationRunner {
+        MigrationRunner::new(
+            self.clone(),
+            (*self.0.decoder_registry).clone(),
+        )
+    }
+
+    pub fn migration_chain(&self, db_name: &str) -> Result<MigrationChain> {
+        let db = self.db_manager(db_name);
+        let guard = db.migration_chain()?;
+        Ok(guard.clone())
+    }
+
+    pub fn decoder_registry(&self) -> Arc<SchemaDecoderRegistry> {
+        self.0.decoder_registry.clone()
+    }
 }
 
 // ── DomainFactory ──────────────────────────────────────────────────────────────
@@ -106,6 +129,7 @@ pub struct DatabaseConfig {
     cache_idle: u64,
     factories: Vec<Box<dyn DomainFactory>>,
     backup_enabled: bool,
+    initial_schema: Option<String>,
 }
 
 impl DatabaseConfig {
@@ -121,7 +145,13 @@ impl DatabaseConfig {
             cache_idle: DEFAULT_CACHE_IDLE,
             factories: Vec::new(),
             backup_enabled: false,
+            initial_schema: None,
         }
+    }
+
+    pub fn schema_name(mut self, schema: &str) -> Self {
+        self.initial_schema = Some(schema.to_string());
+        self
     }
 
     pub fn has_cache(mut self, has_cache: bool) -> Self {
@@ -205,6 +235,7 @@ impl StorageConfig {
 pub struct StorageBuilder {
     database_configs: Vec<DatabaseConfig>,
     storage_config: StorageConfig,
+    decoder_registry: SchemaDecoderRegistry,
 }
 
 impl StorageBuilder {
@@ -212,7 +243,22 @@ impl StorageBuilder {
         Self {
             database_configs: Vec::new(),
             storage_config: config,
+            decoder_registry: crate::migration::default_registry(),
         }
+    }
+
+    pub fn decoder_registry(mut self, registry: SchemaDecoderRegistry) -> Self {
+        self.decoder_registry = registry;
+        self
+    }
+
+    pub fn register_decoder<D: crate::migration::SchemaDecoder + 'static>(
+        mut self,
+        name: impl Into<String>,
+        decoder: D,
+    ) -> Self {
+        self.decoder_registry.register(name, decoder);
+        self
     }
 
     /// Add DatabaseManager with its repositories
@@ -233,6 +279,7 @@ impl StorageBuilder {
     pub fn build(self) -> Result<Storage> {
         let mut domains: HashMap<TypeId, Box<dyn Any + Send + Sync>> = HashMap::new();
         let mut database_managers: HashMap<String, DatabaseManager> = HashMap::new();
+        let decoder_registry = Arc::new(self.decoder_registry);
 
         for config in self.database_configs {
             // Collect table names for this DatabaseManager
@@ -243,6 +290,11 @@ impl StorageBuilder {
                 .collect();
 
             // Create an independent DatabaseManager for each config
+            let initial_schema = config
+                .initial_schema
+                .clone()
+                .unwrap_or_else(|| config.db_name.clone());
+
             let db_manager = DatabaseManager::new(
                 &config.dir_path,
                 config.backup_dir_path.as_ref(),
@@ -253,6 +305,8 @@ impl StorageBuilder {
                 config.cache_ttl,
                 config.cache_idle,
                 config.has_cache,
+                &initial_schema,
+                decoder_registry.clone(),
             )?;
 
             // Create a Domain for each factory under this DatabaseManager
@@ -268,6 +322,7 @@ impl StorageBuilder {
         Ok(Storage(Arc::new(StorageInner {
             domains,
             database_managers,
+            decoder_registry,
         })))
     }
 }

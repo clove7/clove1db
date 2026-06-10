@@ -1,6 +1,8 @@
 # clove1db
 
-A lightweight embedded database framework for Rust — built on redb with layered cache, versioned backup, and domain-driven storage.
+An embedded database framework for Rust — built on [redb](https://github.com/cberner/redb) with layered cache, versioned backup, schema migrations, and domain-driven storage.
+
+> **Work in progress.** The API and internals are still evolving. We welcome contributions, issue reports, and real-world feedback — see [Contributing](#contributing) below.
 
 ## Features
 
@@ -10,12 +12,13 @@ A lightweight embedded database framework for Rust — built on redb with layere
 - 📦 **Bulk Operations**: Update and restore multiple entities at once with a single `bulk_id`
 - 🧩 **Domain-Driven**: Clean separation via `Entity`, `InputDto`, `OutputDto`, `Repository`, `Domain`
 - 🗂️ **Multi-Database**: Multiple isolated DB files in a single `Storage` instance
+- 🔄 **Migrations**: Schema upgrades, cross-database moves, migration chains, and safe history display
 
 ## Install
 
 ```toml
 [dependencies]
-clove1db = "0.0.42"
+clove1db = "0.0.49"
 
 ```
 
@@ -172,8 +175,17 @@ fn main() -> Result<()> {
 
 ```
 
+## Contributing
+
+This project is under active development and needs help to grow:
+
+- **Bug reports & feature requests** — open a [GitHub issue](https://github.com/clove7/clove1db/issues)
+- **Code contributions** — fork, branch, and open a pull request
+- **Examples & docs** — see `examples/` for patterns; new scenarios are especially welcome
+- **Feedback** — tell us how you use (or want to use) clove1db in your apps
+
+Before large changes, open an issue to discuss the approach. Smaller fixes and example improvements can go straight to a PR.
+
 ## License
 
-Licensed under either of
-
-- MIT license ([LICENSE-MIT](https://www.google.com/search?q=LICENSE-MIT))
+Licensed under the MIT license — see [LICENSE-MIT](LICENSE-MIT).

@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use clove1db::{
+    backup::view::RecordData,
     dto::{InputDto, OutputDto},
     entity::Entity,
     storage::{DatabaseConfig, Storage, StorageConfig},
@@ -86,7 +87,7 @@ fn main() -> Result<()> {
         .add_database(
             DatabaseConfig::new("docs_db", "documents")
                 .dir_path(base_dir)
-                .backup_enabled(true) // ⚠️ تفعيل نظام التتبع والـ Backup
+                .backup_enabled(true) // enable versioned backup
                 .register::<Document>("documents"),
         )
         .build()?;
@@ -130,18 +131,19 @@ fn main() -> Result<()> {
 
     // ── 6. View Full History ───────────────────────────────
     println!("\n━━━ 5. Audit History ━━━");
-    let history = doc_domain.history::<DocumentResponse>(&doc.id)?;
+    let history = doc_domain.history(&doc.id)?;
     println!("  Total versions found: {}", history.len());
 
     for record in &history {
         match &record.data {
-            Some(d) => {
+            RecordData::Typed(json) | RecordData::Json(json) => {
+                let title = json.get("title").and_then(|v| v.as_str()).unwrap_or("?");
                 println!(
-                    "  v{} | Op: {:?} | Date: {} | Title: {}",
-                    record.version, record.operation, record.date, d.title
+                    "  v{} | Op: {:?} | Date: {} | Title: {} | restorable: {}",
+                    record.version, record.operation, record.date, title, record.restorable
                 );
             }
-            None => {
+            RecordData::None => {
                 println!(
                     "  v{} | Op: {:?} | Date: {} | ❌ Data Deleted",
                     record.version, record.operation, record.date
@@ -152,19 +154,19 @@ fn main() -> Result<()> {
 
     // ── 7. View Past Version (Read-Only) ───────────────────
     println!("\n━━━ 6. Inspect Past Version (v2) ━━━");
-    let v2_data = doc_domain
-        .get_by_version::<DocumentResponse>(&doc.id, 2)?
-        .data;
-    if let Some(d) = v2_data {
+    let v2_record = doc_domain.get_by_version(&doc.id, 2)?;
+    if let Some(json) = v2_record.data.as_json() {
+        let title = json.get("title").and_then(|v| v.as_str()).unwrap_or("?");
+        let content = json.get("content").and_then(|v| v.as_str()).unwrap_or("?");
         println!(
             "  🔍 Found v2 Data -> Title: {} | Content: {}",
-            d.title, d.content
+            title, content
         );
     }
 
     // ── 8. Restore to Past Version ─────────────────────────
     println!("\n━━━ 7. Restore Document to v1 ━━━");
-    // هذا سيأخذ البيانات من v1 ويسجلها كإصدار جديد (v5) في قاعدة البيانات
+    // Restores v1 data and records a new version in the database
     doc_domain.restore_by_version(&doc.id, 1)?;
 
     let restored_doc = doc_domain.get::<DocumentResponse>(&doc.id)?;
@@ -175,7 +177,7 @@ fn main() -> Result<()> {
 
     // ── 9. Final History Check ─────────────────────────────
     println!("\n━━━ Final History After Restore ━━━");
-    let final_history = doc_domain.history::<DocumentResponse>(&doc.id)?;
+    let final_history = doc_domain.history(&doc.id)?;
     if let Some(latest) = final_history.last() {
         println!(
             "  Latest Version: v{} | Restored From: v{:?} | Op: {:?}",
