@@ -4,9 +4,11 @@ use serde_json::Value;
 use clove1db::{
     dto::{InputDto, OutputDto},
     entity::Entity,
-    migration::SchemaDecoder,
+    migration::MigrateTo,
     units::Result,
 };
+
+use crate::external::ExternalCatalogRow;
 
 // ── Product schema generations ───────────────────────────────────────────────
 
@@ -166,7 +168,7 @@ impl OutputDto<ProductV3> for ProductV3Response {
     }
 }
 
-// ── Decoders ─────────────────────────────────────────────────────────────────
+// ── Typed migrations (MigrateTo) ─────────────────────────────────────────────
 
 fn slug(name: &str) -> String {
     name.to_lowercase()
@@ -176,63 +178,34 @@ fn slug(name: &str) -> String {
         .collect()
 }
 
-pub struct ProductV1ToV2Decoder;
-
-impl SchemaDecoder for ProductV1ToV2Decoder {
-    fn decode_to_json(&self, bytes: &[u8]) -> Result<Value> {
-        Ok(serde_json::from_slice(bytes)?)
-    }
-
-    fn migrate_bytes(&self, bytes: &[u8]) -> Result<Vec<u8>> {
-        let v1: ProductV1 = serde_json::from_slice(bytes)?;
-        let v2 = ProductV2 {
+impl MigrateTo<ProductV2> for ProductV1 {
+    fn migrate_json(value: Value) -> Result<Value> {
+        let v1: ProductV1 = serde_json::from_value(value)?;
+        Ok(serde_json::to_value(ProductV2 {
             id: v1.id,
             name: v1.name.clone(),
             sku: format!("SKU-{}", slug(&v1.name)),
             price_cents: 9_900,
-        };
-        Ok(serde_json::to_vec(&v2)?)
+        })?)
     }
 }
 
-/// Maps external vendor_catalog JSON → ProductV2 entity bytes for clove1db.
-pub struct ExternalCatalogToProductV2Decoder;
-
-#[derive(Debug, Deserialize)]
-struct ExternalCatalogRow {
-    id: String,
-    title: String,
-    price_usd: f64,
-    vendor_code: String,
-}
-
-impl SchemaDecoder for ExternalCatalogToProductV2Decoder {
-    fn decode_to_json(&self, bytes: &[u8]) -> Result<Value> {
-        Ok(serde_json::from_slice(bytes)?)
-    }
-
-    fn migrate_bytes(&self, bytes: &[u8]) -> Result<Vec<u8>> {
-        let row: ExternalCatalogRow = serde_json::from_slice(bytes)?;
+impl MigrateTo<ProductV2> for ExternalCatalogRow {
+    fn migrate_json(value: Value) -> Result<Value> {
+        let row: ExternalCatalogRow = serde_json::from_value(value)?;
         let price_cents = (row.price_usd * 100.0).round() as u64;
-        let v2 = ProductV2 {
+        Ok(serde_json::to_value(ProductV2 {
             id: row.id,
             name: row.title,
             sku: row.vendor_code,
             price_cents,
-        };
-        Ok(serde_json::to_vec(&v2)?)
+        })?)
     }
 }
 
-pub struct ProductV2ToV3Decoder;
-
-impl SchemaDecoder for ProductV2ToV3Decoder {
-    fn decode_to_json(&self, bytes: &[u8]) -> Result<Value> {
-        Ok(serde_json::from_slice(bytes)?)
-    }
-
-    fn migrate_bytes(&self, bytes: &[u8]) -> Result<Vec<u8>> {
-        let v2: ProductV2 = serde_json::from_slice(bytes)?;
+impl MigrateTo<ProductV3> for ProductV2 {
+    fn migrate_json(value: Value) -> Result<Value> {
+        let v2: ProductV2 = serde_json::from_value(value)?;
         let category = if v2.name.to_lowercase().contains("mouse") {
             "peripherals"
         } else if v2.name.to_lowercase().contains("laptop") {
@@ -240,15 +213,14 @@ impl SchemaDecoder for ProductV2ToV3Decoder {
         } else {
             "accessories"
         };
-        let v3 = ProductV3 {
+        Ok(serde_json::to_value(ProductV3 {
             id: v2.id,
             name: v2.name,
             sku: v2.sku,
             price_cents: v2.price_cents,
             category: category.into(),
             stock: 50,
-        };
-        Ok(serde_json::to_vec(&v3)?)
+        })?)
     }
 }
 

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use crate::backup::view::HistoryDisplayMode;
-use crate::migration::decoder::SchemaDecoderRegistry;
+use crate::migration::step_registry::MigrationStepRegistry;
 use crate::migration::layout::FieldLayout;
 use crate::upgrade::legacy_migration::{is_legacy_root_index, upgrade_legacy_migration_index};
 use crate::migration::types::{
@@ -285,7 +285,7 @@ impl TableMigrationChain {
         bytes: &[u8],
         backup_version: u64,
         mode: HistoryDisplayMode,
-        registry: &SchemaDecoderRegistry,
+        registry: &MigrationStepRegistry,
     ) -> Result<(Value, Vec<String>)> {
         let era_version = self.schema_version_for_backup(backup_version);
         let mut decode_path = vec!(format!("{}@{}", self.index.schema_id, era_version));
@@ -301,12 +301,13 @@ impl TableMigrationChain {
 
                 for manifest in &self.manifests {
                     if current_ver == manifest.from.schema_version {
-                        let decoder = registry.get(&manifest.decoder).map_err(|_| {
-                            ClError::DecoderNotFound {
-                                schema: manifest.decoder.clone(),
+                        let decoder = registry
+                            .get_by_layout(&manifest.from_layout_hash, &manifest.to_layout_hash)
+                            .map_err(|_| ClError::DecoderNotFound {
+                                from_layout_hash: manifest.from_layout_hash.clone(),
+                                to_layout_hash: manifest.to_layout_hash.clone(),
                                 migration_id: manifest.migration_id.clone(),
-                            }
-                        })?;
+                            })?;
                         current_bytes = decoder.migrate_bytes(&current_bytes)?;
                         current_ver = manifest.to.schema_version;
                         decode_path.push(format!("{}@{}", self.index.schema_id, current_ver));
@@ -419,7 +420,8 @@ mod tests {
                         scope_table: "products".into(),
                         primary_snapshot_ref: None,
                     },
-                    decoder: "auto".into(),
+                    from_layout_hash: "hash-v1".into(),
+                    to_layout_hash: "hash-v2".into(),
                     target_conflict_policy: TargetConflictPolicy::Fail,
                     table_rename: None,
                     field_diff: None,
@@ -447,7 +449,8 @@ mod tests {
                         scope_table: "products".into(),
                         primary_snapshot_ref: None,
                     },
-                    decoder: "auto".into(),
+                    from_layout_hash: "hash-v2".into(),
+                    to_layout_hash: "hash-v3".into(),
                     target_conflict_policy: TargetConflictPolicy::Fail,
                     table_rename: None,
                     field_diff: None,

@@ -4,14 +4,17 @@ use clove1db::{
     backup::view::{HistoryDisplayMode, RecordData},
     inspect_cldb, FileKind,
     migration::{
-        redb_external::list_external_tables, ExternalFrom, FieldMap, FieldTransform, KeyDecoder,
-        MigrationTo, TargetConflictPolicy, ValueDecoder,
+        redb_external::list_external_tables, ExternalFrom, KeyDecoder, MigrationTo,
+        TargetConflictPolicy, ValueDecoder,
     },
     storage::Storage,
     units::{ClError, Result},
 };
 
-use crate::external::{read_all_rows, seed_vendor_inventory, vendor_inventory_path, VENDOR_TABLE};
+use crate::external::{
+    ExternalCatalogRow, read_all_rows, seed_vendor_inventory, vendor_inventory_path, VENDOR_TABLE,
+};
+use crate::product::ProductV1;
 use crate::log;
 use crate::product::{
     format_price, ProductV1Dto, ProductV1Response, ProductV2Response, ProductV3Dto, ProductV3Response,
@@ -104,11 +107,10 @@ pub fn example_seed_legacy_catalog(base: &PathBuf) -> Result<(Storage, CatalogSe
 pub fn example_dry_run_v1_to_v2(storage: &Storage) -> Result<()> {
     log::banner("Example 2 — dry_run: ProductV1 → ProductV2");
 
-    log::step("MigrationRunner: InPlace products@1 → @2, decoder ProductV1_to_V2");
+    log::step("migrate::<ProductV1, ProductV2>: InPlace products@1 → @2");
     let report = storage
-        .migration_runner()
+        .migrate::<ProductV1, crate::product::ProductV2>()
         .from_db("legacy", "products")
-        .with_decoder("ProductV1_to_V2")
         .dry_run()?;
 
     log::print_migration_report("dry_run report", &report);
@@ -122,9 +124,8 @@ pub fn example_migrate_v1_to_v2(storage: Storage, seed: &CatalogSeed) -> Result<
     log::banner("Example 3 — Execute: ProductV1 → ProductV2");
 
     let result = storage
-        .migration_runner()
+        .migrate::<ProductV1, crate::product::ProductV2>()
         .from_db("legacy", "products")
-        .with_decoder("ProductV1_to_V2")
         .execute()?;
 
     log::kv("migration_id", &result.migration_id);
@@ -206,9 +207,8 @@ pub fn example_migrate_v2_to_v3(storage: Storage, seed: &CatalogSeed) -> Result<
     }
 
     let result = storage
-        .migration_runner()
+        .migrate::<crate::product::ProductV2, crate::product::ProductV3>()
         .from_db("legacy", "products")
-        .with_decoder("ProductV2_to_V3")
         .execute()?;
 
     log::kv("migration_id", &result.migration_id);
@@ -307,14 +307,13 @@ pub fn example_cross_db_product_move(base: &PathBuf) -> Result<()> {
     }
 
     let report = storage
-        .migration_runner()
+        .migrate::<ProductV1, crate::product::ProductV2>()
         .from_db("legacy_wh", "warehouse_products")
         .to(
             MigrationTo::new("shop")
                 .table("floor_products")
                 .delete_source(true),
         )
-        .with_decoder("ProductV1_to_V2")
         .on_target_conflict(TargetConflictPolicy::Overwrite)
         .execute()?;
 
@@ -368,10 +367,9 @@ pub fn example_conflict_skip(base: &PathBuf) -> Result<()> {
     log::line("shop floor already owns this key with different ProductV2 JSON");
 
     let report = storage
-        .migration_runner()
+        .migrate::<ProductV1, crate::product::ProductV2>()
         .from_db("legacy_wh", "warehouse_products")
         .to(MigrationTo::new("shop").table("floor_products"))
-        .with_decoder("ProductV1_to_V2")
         .on_target_conflict(TargetConflictPolicy::Skip)
         .dry_run()?;
 
@@ -427,20 +425,12 @@ pub fn example_external_redb_import(base: &PathBuf) -> Result<()> {
         table: VENDOR_TABLE.to_string(),
         key_decoder: KeyDecoder::Utf8String,
         value_decoder: ValueDecoder::JsonValidate,
-        field_map: Some(
-            FieldMap::new()
-                .rename("title", "name")
-                .rename("vendor_code", "sku")
-                .transform("price_usd", "price_cents", FieldTransform::UsdToCents),
-        ),
-        decoder: None,
     };
 
-    log::step("dry_run: ExternalFrom → import/products (field_map)");
-    log::line("  title → name, vendor_code → sku, price_usd → price_cents");
+    log::step("dry_run: migrate::<ExternalCatalogRow, ProductV2> from external redb");
 
     let dry = storage
-        .migration_runner()
+        .migrate::<ExternalCatalogRow, crate::product::ProductV2>()
         .from_external(external.clone())
         .to(MigrationTo::new("imported").table("products"))
         .dry_run()?;
@@ -448,7 +438,7 @@ pub fn example_external_redb_import(base: &PathBuf) -> Result<()> {
 
     log::step("execute ExternalImport migration");
     let result = storage
-        .migration_runner()
+        .migrate::<ExternalCatalogRow, crate::product::ProductV2>()
         .from_external(external)
         .to(MigrationTo::new("imported").table("products"))
         .execute()?;
@@ -462,7 +452,8 @@ pub fn example_external_redb_import(base: &PathBuf) -> Result<()> {
         log::kv("products schema_version", tc.current_version());
         if let Some(m) = tc.manifests.last() {
             log::kv("manifest.kind", format!("{:?}", m.kind));
-            log::kv("manifest.decoder", &m.decoder);
+            log::kv("manifest.from_layout_hash", &m.from_layout_hash);
+            log::kv("manifest.to_layout_hash", &m.to_layout_hash);
             log::line(format!(
                 "from: {}.{} @{}",
                 m.from.db, m.from.table, m.from.schema_version

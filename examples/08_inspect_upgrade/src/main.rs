@@ -30,7 +30,7 @@ fn run() -> Result<()> {
 
     log::banner("Example 08 — Inspect, Upgrade & Era Fixtures");
     log::line("Lab for inspect_cldb, Storage::build() upgrade, backup normalize, cache, attachments.");
-    log::kv("upgrade_target", "clove1db 0.0.56 (path ../..)");
+    log::kv("upgrade_target", "clove1db 0.0.63 (path ../..)");
     log::kv("era_seeders", "vendor/clove1db-v042 + vendor/clove1db-v049 (isolated snapshots)");
 
     let seed = fixtures::seed_all()?;

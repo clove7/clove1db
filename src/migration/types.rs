@@ -75,7 +75,8 @@ pub struct MigrationManifest {
     pub from: SchemaRef,
     pub to: SchemaRef,
     pub version_scope: VersionScope,
-    pub decoder: String,
+    pub from_layout_hash: String,
+    pub to_layout_hash: String,
     pub target_conflict_policy: TargetConflictPolicy,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub table_rename: Option<TableRenameInfo>,
@@ -162,8 +163,6 @@ pub struct ExternalFrom {
     pub table: String,
     pub key_decoder: KeyDecoder,
     pub value_decoder: ValueDecoder,
-    pub field_map: Option<super::field_map::FieldMap>,
-    pub decoder: Option<String>,
 }
 
 pub fn migration_dir_name(db_name: &str) -> String {

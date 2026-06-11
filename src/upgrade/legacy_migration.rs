@@ -5,8 +5,9 @@ use std::path::Path;
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::migration::layout::FieldLayout;
 use crate::migration::types::{
-    migration_dir_name, table_chain_dir, DbMigrationRootIndex, MigrationIndexEntry,
+    layout_path, migration_dir_name, table_chain_dir, DbMigrationRootIndex, MigrationIndexEntry,
     MigrationKind, MigrationManifest, MIGRATION_INDEX_VERSION, SchemaRef, TableChainIndex,
     TableChainSummary, TargetConflictPolicy, VersionScope,
 };
@@ -44,6 +45,7 @@ struct LegacyManifest {
     from: LegacySchemaRef,
     to: LegacySchemaRef,
     version_scope: LegacyVersionScope,
+    #[allow(dead_code)]
     decoder: String,
     key_conflict_policy: Option<String>,
     target_conflict_policy: Option<String>,
@@ -113,7 +115,13 @@ pub fn upgrade_legacy_migration_index(
         let to_version = from_version + 1;
         table_versions.insert(table.clone(), to_version);
 
-        let new_manifest = convert_manifest(&legacy_manifest, from_version, to_version)?;
+        let table_dir = table_chain_dir(&migration_dir, &table);
+        let new_manifest = convert_manifest(
+            &legacy_manifest,
+            from_version,
+            to_version,
+            &table_dir,
+        )?;
         let new_mig_dir = table_chain_dir(&migration_dir, &table).join(&entry.migration_id);
         fs::create_dir_all(new_mig_dir.parent().unwrap())?;
         if new_mig_dir.exists() {
@@ -172,10 +180,23 @@ pub fn upgrade_legacy_migration_index(
     Ok(())
 }
 
+fn layout_hash_at(table_dir: &Path, version: u32) -> String {
+    let path = layout_path(table_dir, version);
+    if path.exists() {
+        if let Ok(data) = fs::read_to_string(&path) {
+            if let Ok(layout) = serde_json::from_str::<FieldLayout>(&data) {
+                return layout.layout_hash;
+            }
+        }
+    }
+    format!("unknown-v{version}")
+}
+
 fn convert_manifest(
     legacy: &LegacyManifest,
     from_version: u32,
     to_version: u32,
+    table_dir: &Path,
 ) -> Result<MigrationManifest> {
     let kind = match legacy.kind.as_str() {
         "SameDbRemapTable" => MigrationKind::InPlaceEvolve,
@@ -219,7 +240,8 @@ fn convert_manifest(
             scope_table: legacy.from.table.clone(),
             primary_snapshot_ref: legacy.version_scope.primary_snapshot_ref.clone(),
         },
-        decoder: legacy.decoder.clone(),
+        from_layout_hash: layout_hash_at(table_dir, from_version),
+        to_layout_hash: layout_hash_at(table_dir, to_version),
         target_conflict_policy: policy,
         table_rename: None,
         field_diff: None,

@@ -1,17 +1,15 @@
 [package]
 name = "clove1db"
-version = "0.0.56"
+version = "0.0.63"
 edition = "2024"
 license = "MIT"
 authors = ["clove7"]
 description = "An embedded database framework for Rust (work in progress) — redb-backed storage with cache, versioned backup, migrations, and domain-driven APIs. Contributions and feedback welcome."
 repository = "https://github.com/clove7/clove1db"
-keywords = ["database", "embedded", "storage", "cache", "backup"]
-categories = ["database", "caching", "data-structures"]
+keywords = ["database", "embedded", "migration", "backup", "redb"]
+categories = ["database", "database-implementations", "caching"]
 readme = "README.md"
-exclude = [
-    "examples/**",
-]
+exclude = ["examples/**"]
 
 
 [dependencies]

@@ -152,8 +152,6 @@ mod tests {
             table: "v".into(),
             key_decoder: KeyDecoder::Utf8String,
             value_decoder: ValueDecoder::JsonValidate,
-            field_map: None,
-            decoder: None,
         };
         assert!(resolve_plan(&MigrationSource::External(ext), None).is_err());
     }

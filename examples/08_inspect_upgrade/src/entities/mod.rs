@@ -9,7 +9,7 @@ pub use attachment::{
 pub use buyer::{BuyerV1, BuyerDto, BuyerResponse};
 pub use employee::{EmployeeV1, EmployeeDto, EmployeeResponse};
 pub use product::{
-    ProductV1, ProductV2, ProductV1Dto, ProductV1Response, ProductV2Response, RetailV1ToV2Decoder,
+    ProductV1, ProductV2, ProductV1Dto, ProductV1Response, ProductV2Response,
 };
 
 pub mod seed_counts {

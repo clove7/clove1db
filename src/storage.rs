@@ -22,11 +22,13 @@ use crate::{
 
     migration::chain::DbMigrationIndex,
 
-    migration::decoder::SchemaDecoderRegistry,
-
     migration::layout::FieldLayout,
 
-    migration::runner::MigrationRunner,
+    migration::migrate_to::{MigrateTo, MigrationSourceType, MigrationTargetType},
+
+    migration::runner::MigrationRun,
+
+    migration::step_registry::MigrationStepRegistry,
 
     repository::DatabaseManager,
 
@@ -56,7 +58,7 @@ struct StorageInner {
 
     database_managers: HashMap<String, DatabaseManager>,
 
-    decoder_registry: Arc<SchemaDecoderRegistry>,
+    migration_registry: Arc<MigrationStepRegistry>,
 
 }
 
@@ -142,28 +144,22 @@ impl Storage {
 
 
 
-    pub fn migration_runner(&self) -> MigrationRunner {
-
-        MigrationRunner::new(self.clone(), (*self.0.decoder_registry).clone())
-
+    pub fn migrate<F, T>(&self) -> MigrationRun<'_, F, T>
+    where
+        F: MigrationSourceType,
+        T: MigrationTargetType,
+        F: MigrateTo<T>,
+    {
+        MigrationRun::new(self.clone(), self.0.migration_registry.clone())
     }
-
-
 
     pub fn migration_index(&self, db_name: &str) -> Result<DbMigrationIndex> {
-
         let db = self.db_manager(db_name);
-
         Ok(db.migration_index()?.clone())
-
     }
 
-
-
-    pub fn decoder_registry(&self) -> Arc<SchemaDecoderRegistry> {
-
-        self.0.decoder_registry.clone()
-
+    pub fn migration_registry(&self) -> Arc<MigrationStepRegistry> {
+        self.0.migration_registry.clone()
     }
 
 }
@@ -450,7 +446,9 @@ pub struct StorageBuilder {
 
     storage_config: StorageConfig,
 
-    decoder_registry: SchemaDecoderRegistry,
+    migration_registry: Arc<MigrationStepRegistry>,
+
+    migration_steps: Vec<fn(&MigrationStepRegistry) -> crate::units::Result<()>>,
 
 }
 
@@ -466,38 +464,31 @@ impl StorageBuilder {
 
             storage_config: config,
 
-            decoder_registry: crate::migration::default_registry(),
+            migration_registry: MigrationStepRegistry::global(),
+
+            migration_steps: Vec::new(),
 
         }
 
     }
 
-
-
-    pub fn decoder_registry(mut self, registry: SchemaDecoderRegistry) -> Self {
-
-        self.decoder_registry = registry;
-
+    /// Pre-register a typed migration step (for backup history replay without running migrate).
+    pub fn migration_step<F, T>(mut self) -> Self
+    where
+        F: MigrationSourceType,
+        T: MigrationTargetType,
+        F: MigrateTo<T>,
+    {
+        fn register_step<F, T>(reg: &MigrationStepRegistry) -> Result<()>
+        where
+            F: MigrationSourceType,
+            T: MigrationTargetType,
+            F: MigrateTo<T>,
+        {
+            reg.register::<F, T>().map(|_| ())
+        }
+        self.migration_steps.push(register_step::<F, T>);
         self
-
-    }
-
-
-
-    pub fn register_decoder<D: crate::migration::SchemaDecoder + 'static>(
-
-        mut self,
-
-        name: impl Into<String>,
-
-        decoder: D,
-
-    ) -> Self {
-
-        self.decoder_registry.register(name, decoder);
-
-        self
-
     }
 
 
@@ -536,9 +527,10 @@ impl StorageBuilder {
 
         let mut database_managers: HashMap<String, DatabaseManager> = HashMap::new();
 
-        let decoder_registry = Arc::new(self.decoder_registry);
-
-
+        let migration_registry = self.migration_registry.clone();
+        for register in &self.migration_steps {
+            register(&migration_registry)?;
+        }
 
         for config in self.database_configs {
 
@@ -632,7 +624,7 @@ impl StorageBuilder {
 
                 upgrade.table_layouts,
 
-                decoder_registry.clone(),
+                migration_registry.clone(),
 
             )?;
 
@@ -660,7 +652,7 @@ impl StorageBuilder {
 
             database_managers,
 
-            decoder_registry,
+            migration_registry,
 
         })))
 

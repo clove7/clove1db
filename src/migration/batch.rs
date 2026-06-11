@@ -43,7 +43,6 @@ impl MigrationBatch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::migration::decoder::SchemaDecoderRegistry;
     use crate::storage::{DatabaseConfig, Storage, StorageConfig};
     use serde::{Deserialize, Serialize};
     use crate::entity::Entity;
@@ -65,7 +64,6 @@ mod tests {
         let dir = PathBuf::from("./target/test_migration_batch");
         let _ = std::fs::remove_dir_all(&dir);
         let storage = Storage::builder(StorageConfig::default())
-            .decoder_registry(SchemaDecoderRegistry::new())
             .add_database(
                 DatabaseConfig::new("t", "items")
                     .dir_path(dir.clone())

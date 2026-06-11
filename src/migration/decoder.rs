@@ -55,7 +55,7 @@ impl SchemaDecoder for AutoAdditiveDecoder {
     }
 }
 
-fn merge_defaults(target: &mut Value, template: &Value) {
+pub(crate) fn merge_defaults(target: &mut Value, template: &Value) {
     let (Value::Object(tgt), Value::Object(tpl)) = (target, template) else {
         return;
     };
@@ -116,7 +116,8 @@ impl SchemaDecoderRegistry {
             .get(name)
             .cloned()
             .ok_or_else(|| ClError::DecoderNotFound {
-                schema: name.to_string(),
+                from_layout_hash: name.to_string(),
+                to_layout_hash: String::new(),
                 migration_id: String::new(),
             })
     }

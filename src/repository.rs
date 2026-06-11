@@ -7,7 +7,7 @@ use crate::{
     metadata::types::META_TABLE,
     migration::chain::DbMigrationIndex,
     migration::layout::FieldLayout,
-    migration::decoder::SchemaDecoderRegistry,
+    migration::step_registry::MigrationStepRegistry,
     metadata::store::{read_meta, write_meta},
     migration::types::MigrationManifest,
     units::{ClError, Result},
@@ -55,7 +55,7 @@ pub struct DatabaseManager {
     migration_index: Arc<RwLock<DbMigrationIndex>>,
 
     // Shared decoder registry for history resolution
-    decoder_registry: Arc<SchemaDecoderRegistry>,
+    migration_registry: Arc<MigrationStepRegistry>,
 }
 
 impl DatabaseManager {
@@ -70,7 +70,7 @@ impl DatabaseManager {
         cache_idle_seconds: u64,
         has_cache: bool,
         table_layouts: std::collections::HashMap<String, FieldLayout>,
-        decoder_registry: Arc<SchemaDecoderRegistry>,
+        migration_registry: Arc<MigrationStepRegistry>,
     ) -> Result<Self> {
         let dir = dir_path.join(dir_name);
         let backup_dir = if let Some(backup_dir_path) = backup_dir_path {
@@ -153,7 +153,7 @@ impl DatabaseManager {
             tables_names: tables,
             has_cache,
             migration_index,
-            decoder_registry,
+            migration_registry,
         })
     }
 
@@ -169,7 +169,7 @@ impl DatabaseManager {
         cache_idle_seconds: u64,
         has_cache: bool,
         table_layouts: std::collections::HashMap<String, FieldLayout>,
-        decoder_registry: Arc<SchemaDecoderRegistry>,
+        migration_registry: Arc<MigrationStepRegistry>,
     ) -> Result<Self> {
         Self::open(
             dir_path,
@@ -182,7 +182,7 @@ impl DatabaseManager {
             cache_idle_seconds,
             has_cache,
             table_layouts,
-            decoder_registry,
+            migration_registry,
         )
     }
 
@@ -216,8 +216,8 @@ impl DatabaseManager {
         bm.rewrite_table_name(from_table, to_table)
     }
 
-    pub fn decoder_registry(&self) -> &SchemaDecoderRegistry {
-        &self.decoder_registry
+    pub fn migration_registry(&self) -> &MigrationStepRegistry {
+        &self.migration_registry
     }
 
     pub fn append_migration(
@@ -842,7 +842,7 @@ impl<T: DeserializeOwned + Serialize + Clone> Repository<T> {
         let view = BackupManager::resolve_record(
             &record,
             index.as_deref().map(|g| &*g),
-            self.database_manager.decoder_registry(),
+            self.database_manager.migration_registry(),
             mode,
         );
         Ok(view_into_repository(view))
@@ -867,7 +867,7 @@ impl<T: DeserializeOwned + Serialize + Clone> Repository<T> {
     ) -> Result<Vec<BackupRecordRepository<T>>> {
         let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(self.table);
         let index = self.database_manager.migration_index().ok();
-        let registry = self.database_manager.decoder_registry();
+        let registry = self.database_manager.migration_registry();
 
         let history = self
             .database_manager

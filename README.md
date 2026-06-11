@@ -20,7 +20,7 @@ An embedded database framework for Rust — built on [redb](https://github.com/c
 
 ```toml
 [dependencies]
-clove1db = "0.0.56"
+clove1db = "0.0.63"
 ```
 
 ## Quick Start
@@ -120,41 +120,58 @@ On-disk migration layout:
 | **DataTransfer** | Different `db` and/or `table` | Honoured |
 | **ExternalImport** | `.from_external(...)` | Ignored |
 
+Typed migrations use `MigrateTo` + `storage.migrate::<From, To>()`. Migration steps are keyed automatically by `layout_hash` pairs stored in each manifest (`from_layout_hash` / `to_layout_hash`).
+
+> **Breaking in 0.0.63:** `migration_runner()`, `.with_decoder()`, `field_map`, and string-keyed `decoder` manifests are removed. Re-seed or re-run migrations so manifests include `from_layout_hash` / `to_layout_hash`. Register steps at build via `.migration_step::<From, To>()` when you need backup history replay without calling `migrate()` in the same session.
+
 ```rust
 use std::path::PathBuf;
 use clove1db::migration::{
-    ExternalFrom, FieldMap, FieldTransform, KeyDecoder, MigrationTo,
-    TargetConflictPolicy, ValueDecoder,
+    ExternalFrom, KeyDecoder, MigrateTo, MigrationTo, TargetConflictPolicy, ValueDecoder,
 };
+use serde_json::Value;
 
-// In-place schema evolve (same db + table)
-storage.migration_runner()
+// 1) Implement the transform once
+impl MigrateTo<ProductV2> for ProductV1 {
+    fn migrate_json(value: Value) -> clove1db::units::Result<Value> {
+        let v1: ProductV1 = serde_json::from_value(value)?;
+        Ok(serde_json::to_value(ProductV2 {
+            id: v1.id,
+            name: v1.name,
+            sku: "SKU-default".into(),
+            price_cents: 0,
+        })?)
+    }
+}
+
+// 2) In-place schema evolve (same db + table)
+storage.migrate::<ProductV1, ProductV2>()
     .from_db("catalog", "products")
     .execute()?;
 
-// Cross-database move
-storage.migration_runner()
-    .from_db("catalog", "products")
+// 3) Cross-database move
+storage.migrate::<ProductV1, ProductV2>()
+    .from_db("warehouse", "products")
     .to(MigrationTo::new("shop").table("products").delete_source(true))
     .on_target_conflict(TargetConflictPolicy::Fail)
     .execute()?;
 
-// External redb → clove1db (requires field_map and/or custom decoder)
-storage.migration_runner()
+// 4) External redb → clove1db (VendorRow matches vendor JSON)
+storage.migrate::<VendorRow, ProductV2>()
     .from_external(ExternalFrom {
         path: PathBuf::from("./vendor.redb"),
         table: "vendor_catalog".into(),
         key_decoder: KeyDecoder::Utf8String,
         value_decoder: ValueDecoder::JsonValidate,
-        field_map: Some(
-            FieldMap::new()
-                .rename("title", "name")
-                .transform("price_usd", "price_cents", FieldTransform::UsdToCents),
-        ),
-        decoder: None,
     })
     .to(MigrationTo::new("shop").table("products"))
     .execute()?;
+
+// Optional: warm registry at build for backup history replay without running migrate
+Storage::builder(config)
+    .migration_step::<ProductV1, ProductV2>()
+    .add_database(/* ... */)
+    .build()?;
 ```
 
 ### External redb key/value layouts
@@ -166,27 +183,6 @@ storage.migration_runner()
 | `U64AsString` | `JsonString` | `u64` keys, JSON stored as redb `String` |
 
 Use `list_external_tables(path)` and `read_external_table(path, &spec)` to probe a foreign `.redb` before importing.
-
-Register custom decoders for nested JSON → flat entity mapping:
-
-```rust
-use clove1db::migration::{default_registry, SchemaDecoder, SchemaDecoderRegistry};
-
-struct MyDecoder;
-impl SchemaDecoder for MyDecoder {
-    fn decode_to_json(&self, bytes: &[u8]) -> clove1db::units::Result<serde_json::Value> {
-        Ok(serde_json::from_slice(bytes)?)
-    }
-    fn migrate_bytes(&self, bytes: &[u8]) -> clove1db::units::Result<Vec<u8>> {
-        // map legacy JSON → clove entity JSON
-        todo!()
-    }
-}
-
-let mut registry = default_registry();
-registry.register("my_legacy", MyDecoder);
-// Storage::builder(...).decoder_registry(registry)
-```
 
 ## Backup & Versioning
 
@@ -285,7 +281,7 @@ cd clove1db/examples/01_basic_crud && cargo run
 | `05_domain_dto_patterns` | Input/Output DTO patterns |
 | `06_large_files_no_cache` | Large blobs, cache off |
 | `07_migration` | In-place evolve, cross-DB move, external import, restore guards |
-| `08_inspect_upgrade` | Era fixtures (0.0.42 / 0.0.49 / 0.0.56), upgrade pipeline |
+| `08_inspect_upgrade` | Era fixtures (0.0.42 / 0.0.49 / 0.0.63), upgrade pipeline |
 
 ## Contributing
 

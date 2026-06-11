@@ -11,7 +11,7 @@ pub const VENDOR_TABLE: &str = "vendor_catalog";
 const TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new(VENDOR_TABLE);
 
 /// JSON row stored in external redb — keys are UTF-8 strings matching `id`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ExternalCatalogRow {
     pub id: String,
     pub title: String,

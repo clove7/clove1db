@@ -1,28 +1,21 @@
 use clove1db::{
-    migration::{default_registry, SchemaDecoderRegistry},
     storage::{DatabaseConfig, Storage, StorageConfig},
     units::Result,
 };
 
 use crate::entities::{
     BuyerDto, BuyerResponse, BuyerV1, EmployeeDto, EmployeeResponse, EmployeeV1, ProductV1,
-    ProductV1Dto, ProductV1Response, RetailV1ToV2Decoder,
+    ProductV1Dto, ProductV1Response, ProductV2,
 };
 use crate::entities::seed_counts;
 use crate::paths;
-
-fn decoders() -> SchemaDecoderRegistry {
-    let mut r = default_registry();
-    r.register("RetailV1_to_V2", RetailV1ToV2Decoder);
-    r
-}
 
 pub fn create() -> Result<()> {
     let retail_parent = paths::era_056_retail_dir().parent().unwrap().to_path_buf();
     std::fs::create_dir_all(&retail_parent)?;
 
     let storage = Storage::builder(StorageConfig::default())
-        .decoder_registry(decoders())
+        .migration_step::<ProductV1, ProductV2>()
         .add_database(
             DatabaseConfig::new("retail", "retail")
                 .dir_path(retail_parent)

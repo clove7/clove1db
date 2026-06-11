@@ -4,7 +4,7 @@ pub mod view;
 
 use crate::backup::view::{BackupRecordView, HistoryDisplayMode, RecordData};
 use crate::migration::chain::DbMigrationIndex;
-use crate::migration::decoder::SchemaDecoderRegistry;
+use crate::migration::step_registry::MigrationStepRegistry;
 use crate::units::ClError;
 use crate::units::Result;
 use chrono::Local;
@@ -457,7 +457,7 @@ impl BackupManager {
     pub fn resolve_record(
         raw: &BackupRecord,
         index: Option<&DbMigrationIndex>,
-        registry: &SchemaDecoderRegistry,
+        registry: &MigrationStepRegistry,
         mode: HistoryDisplayMode,
     ) -> BackupRecordView {
         let table_chain = index.and_then(|i| i.tables.get(&raw.table));

@@ -62,9 +62,10 @@ pub enum ClError {
         policy: String,
     },
 
-    #[error("Decoder not found for schema '{schema}' (migration {migration_id})")]
+    #[error("Migration decoder not found for layout {from_layout_hash} -> {to_layout_hash} (migration {migration_id})")]
     DecoderNotFound {
-        schema: String,
+        from_layout_hash: String,
+        to_layout_hash: String,
         migration_id: String,
     },
 
@@ -85,7 +86,7 @@ pub enum ClError {
         existing_keys: usize,
     },
 
-    #[error("external import requires field mapping or decoder for table '{table}'")]
+    #[error("external import requires migrate::<Source, Target>() with MigrateTo impl for table '{table}'")]
     ExternalMappingRequired { table: String },
 
     #[error("incompatible overwrite on table '{table}' key '{key}'")]

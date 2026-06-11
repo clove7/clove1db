@@ -1,10 +1,11 @@
 use clove1db::{
     dto::{InputDto, OutputDto},
     entity::Entity,
-    migration::SchemaDecoder,
+    migration::MigrateTo,
     units::Result,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ProductV1 {
@@ -80,22 +81,15 @@ impl OutputDto<ProductV2> for ProductV2Response {
     }
 }
 
-pub struct RetailV1ToV2Decoder;
-
-impl SchemaDecoder for RetailV1ToV2Decoder {
-    fn decode_to_json(&self, bytes: &[u8]) -> Result<serde_json::Value> {
-        Ok(serde_json::from_slice(bytes)?)
-    }
-
-    fn migrate_bytes(&self, bytes: &[u8]) -> Result<Vec<u8>> {
-        let v1: ProductV1 = serde_json::from_slice(bytes)?;
+impl MigrateTo<ProductV2> for ProductV1 {
+    fn migrate_json(value: Value) -> Result<Value> {
+        let v1: ProductV1 = serde_json::from_value(value)?;
         let sku = format!("SKU-{}", &v1.id[..8.min(v1.id.len())]);
-        let v2 = ProductV2 {
+        Ok(serde_json::to_value(ProductV2 {
             id: v1.id,
             name: v1.name,
             sku,
             price_cents: 1000,
-        };
-        Ok(serde_json::to_vec(&v2)?)
+        })?)
     }
 }
