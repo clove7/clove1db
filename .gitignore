@@ -1,4 +1,2 @@
 /target
 Cargo.lock
-test/external_import/target/
-test/external_import/clove_data/
