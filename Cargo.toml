@@ -1,6 +1,6 @@
 [package]
 name = "clove1db"
-version = "0.0.63"
+version = "0.0.70"
 edition = "2024"
 license = "MIT"
 authors = ["clove7"]
@@ -14,7 +14,7 @@ exclude = ["examples/**"]
 
 [dependencies]
 chrono = "0.4.45"
-itertools = "0.14.0"
+itertools = "0.15.0"
 moka = { version = "0.12.15", features = ["sync"] }
 redb = "4.1.0"
 serde = { version = "1.0.228", features = ["derive"] }

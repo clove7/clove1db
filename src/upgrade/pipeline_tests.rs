@@ -3,7 +3,7 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::entity::Entity;
-    use crate::metadata::inspect::{inspect_database, FileKind};
+    use crate::metadata::inspect::{FileKind, inspect_database};
     use crate::metadata::store::read_meta;
     use crate::migration::layout::FieldLayout;
     use crate::storage::{DatabaseConfig, Storage, StorageConfig};
@@ -71,5 +71,41 @@ mod tests {
         let migration = dir.join("t").join("users.migration");
         let report = inspect_database(&primary, None, &migration).unwrap();
         assert_eq!(report.kind, FileKind::New);
+    }
+
+    #[test]
+    fn reopen_empty_authenticated_db_without_entity_rows() {
+        let dir = PathBuf::from("./target/test_reopen_empty_auth");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let storage = Storage::builder(StorageConfig::default().change_dir_path(dir.clone()))
+            .add_database(
+                DatabaseConfig::new("bots", "bots")
+                    .dir_path(dir.clone())
+                    .backup_enabled(true)
+                    .register::<User>("bots"),
+            )
+            .build()
+            .unwrap();
+        drop(storage);
+
+        let primary = dir.join("bots").join("bots.cldb");
+        let migration = dir.join("bots").join("bots.migration");
+        let report = inspect_database(&primary, None, &migration).unwrap();
+        assert_eq!(
+            report.kind,
+            FileKind::Authenticated,
+            "empty entity tables must still inspect as Authenticated when _clove_meta exists"
+        );
+
+        Storage::builder(StorageConfig::default().change_dir_path(dir.clone()))
+            .add_database(
+                DatabaseConfig::new("bots", "bots")
+                    .dir_path(dir.clone())
+                    .backup_enabled(true)
+                    .register::<User>("bots"),
+            )
+            .build()
+            .expect("second build must succeed for empty authenticated db");
     }
 }

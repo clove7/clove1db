@@ -4,9 +4,7 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, TableHand
 
 use crate::backup::BackupRecord;
 use crate::metadata::store::read_meta;
-use crate::metadata::types::{
-    FileEra, META_TABLE, BACKUP_PRE_UPGRADE_SUFFIX, FRAMEWORK_ID,
-};
+use crate::metadata::types::{BACKUP_PRE_UPGRADE_SUFFIX, FRAMEWORK_ID, FileEra, META_TABLE};
 use crate::migration::types::migration_dir_name;
 use crate::units::{ClError, Result};
 
@@ -71,7 +69,8 @@ pub fn inspect_cldb(primary_path: &Path) -> Result<InspectReport> {
     let inspection = inspect_database(primary_path, backup_path.as_deref(), &migration_dir)?;
 
     let (framework_version, table_schemas) = if inspection.kind == FileKind::Authenticated {
-        let db = Database::open(primary_path).map_err(|e| ClError::Database(redb::Error::from(e)))?;
+        let db =
+            Database::open(primary_path).map_err(|e| ClError::Database(redb::Error::from(e)))?;
         if let Some(meta) = read_meta(&db)? {
             let schemas = meta
                 .tables
@@ -142,21 +141,6 @@ pub fn inspect_database(
     let db = Database::open(primary_path).map_err(|e| ClError::Database(redb::Error::from(e)))?;
     let read_txn = db.begin_read()?;
 
-    if !primary_has_clove_entity_json(&read_txn)? {
-        return Ok(DatabaseInspection {
-            kind: FileKind::ExternalRedb,
-            primary_path: primary_path.to_path_buf(),
-            backup_path: backup_path.map(|p| p.to_path_buf()),
-            migration_dir: migration_dir.to_path_buf(),
-            primary_exists: true,
-            backup_exists,
-            migration_exists,
-            tables: list_user_tables(&read_txn)?,
-            file_era: None,
-            backup_upgraded: !backup_exists,
-        });
-    }
-
     let tables = list_user_tables(&read_txn)?;
     let meta = read_meta(&db)?;
     let file_era = meta.as_ref().map(|m| m.file_era);
@@ -165,8 +149,10 @@ pub fn inspect_database(
         FileKind::Authenticated
     } else if migration_exists {
         FileKind::Clove049
-    } else {
+    } else if primary_has_clove_entity_json(&read_txn)? {
         FileKind::Legacy042
+    } else {
+        FileKind::ExternalRedb
     };
 
     let backup_upgraded = if backup_exists {

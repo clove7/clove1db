@@ -20,7 +20,7 @@ An embedded database framework for Rust — built on [redb](https://github.com/c
 
 ```toml
 [dependencies]
-clove1db = "0.0.63"
+clove1db = "0.0.70"
 ```
 
 ## Quick Start
@@ -281,7 +281,7 @@ cd clove1db/examples/01_basic_crud && cargo run
 | `05_domain_dto_patterns` | Input/Output DTO patterns |
 | `06_large_files_no_cache` | Large blobs, cache off |
 | `07_migration` | In-place evolve, cross-DB move, external import, restore guards |
-| `08_inspect_upgrade` | Era fixtures (0.0.42 / 0.0.49 / 0.0.63), upgrade pipeline |
+| `08_inspect_upgrade` | Era fixtures (0.0.42 / 0.0.49 / 0.0.70), upgrade pipeline |
 
 ## Contributing
 
