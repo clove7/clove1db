@@ -2,7 +2,24 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+pub use crate::metadata::types::TableStorageMode;
+
 pub const MIGRATION_INDEX_VERSION: u32 = 2;
+
+#[derive(Debug, Clone)]
+pub struct BlobMigrationPolicy {
+    pub batch_size: usize,
+    pub delete_source_blobs: bool,
+}
+
+impl Default for BlobMigrationPolicy {
+    fn default() -> Self {
+        Self {
+            batch_size: 256,
+            delete_source_blobs: true,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -41,6 +58,14 @@ pub enum ValueDecoder {
     JsonValidate,
     /// `u64` keys with JSON stored in redb's `String` column (legacy API style).
     JsonString,
+    /// Parse row bytes as JSON `Value`.
+    JsonValue,
+    /// UTF-8 string wrapped as JSON string `Value`.
+    Utf8String,
+    /// Raw bytes as JSON array of numbers.
+    BytesAsArray,
+    /// Base64-encoded string as JSON `Value`.
+    Base64String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -76,12 +76,33 @@ fn read_u64_table(
 
 fn decode_value(bytes: &[u8], decoder: ValueDecoder) -> Result<Vec<u8>> {
     match decoder {
-        ValueDecoder::RawPassthrough => Ok(bytes.to_vec()),
-        ValueDecoder::JsonValidate | ValueDecoder::JsonString => {
+        ValueDecoder::RawPassthrough
+        | ValueDecoder::BytesAsArray
+        | ValueDecoder::Utf8String
+        | ValueDecoder::Base64String => Ok(bytes.to_vec()),
+        ValueDecoder::JsonValidate | ValueDecoder::JsonString | ValueDecoder::JsonValue => {
             serde_json::from_slice::<serde_json::Value>(bytes)?;
             Ok(bytes.to_vec())
         }
     }
+}
+
+pub fn scan_external_table(path: &Path, spec: &RedbTableSpec) -> Result<crate::migration::scan::MigrationScanReport> {
+    use crate::migration::scan::{scan_record, MigrationScanReport};
+    use crate::migration::types::TableStorageMode;
+
+    let entries = read_external_table(path, spec)?;
+    let mut report = MigrationScanReport::new(&spec.source_table, &spec.source_table);
+    for (key, bytes) in entries {
+        scan_record(
+            &mut report,
+            &key,
+            &bytes,
+            TableStorageMode::InlineJson,
+            TableStorageMode::BlobSidecar,
+        )?;
+    }
+    Ok(report)
 }
 
 pub fn list_external_tables(path: &Path) -> Result<Vec<String>> {

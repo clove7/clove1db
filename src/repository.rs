@@ -4,7 +4,8 @@ use crate::{
         view::{BackupRecordView, HistoryDisplayMode, RecordData},
         BackupManager, BackupOperation, BackupRecord,
     },
-    metadata::types::META_TABLE,
+    blob::BlobStore,
+    metadata::types::{TableStorageMode, META_TABLE},
     migration::chain::DbMigrationIndex,
     migration::layout::FieldLayout,
     migration::step_registry::MigrationStepRegistry,
@@ -18,8 +19,10 @@ use itertools::Itertools;
 use moka::sync::Cache;
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 // use std::env;
-use serde::Serialize;
+use crate::entity::Entity;
 use serde::de::DeserializeOwned;
+use serde::Serialize;
+use std::fs::File;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -51,6 +54,11 @@ pub struct DatabaseManager {
     // Has cache
     has_cache: bool,
 
+    // Blob sidecar storage
+    blob_enabled: bool,
+    table_storage: std::collections::HashMap<String, TableStorageMode>,
+    blob_store: Option<BlobStore>,
+
     // Per-table migration index
     migration_index: Arc<RwLock<DbMigrationIndex>>,
 
@@ -69,6 +77,8 @@ impl DatabaseManager {
         cache_ttl_seconds: u64,
         cache_idle_seconds: u64,
         has_cache: bool,
+        blob_enabled: bool,
+        table_storage: std::collections::HashMap<String, TableStorageMode>,
         table_layouts: std::collections::HashMap<String, FieldLayout>,
         migration_registry: Arc<MigrationStepRegistry>,
     ) -> Result<Self> {
@@ -88,9 +98,11 @@ impl DatabaseManager {
             None
         };
 
-        let db = Arc::new(
-            Database::create(db_path).map_err(|e| ClError::Database(redb::Error::from(e)))?,
-        );
+        let db = Arc::new(if db_path.exists() {
+            Database::open(&db_path).map_err(|e| ClError::Database(redb::Error::from(e)))?
+        } else {
+            Database::create(&db_path).map_err(|e| ClError::Database(redb::Error::from(e)))?
+        });
 
         let backup_manager = if let Some(backup_db_path) = backup_db_path {
             let backup_manager = BackupManager::new(&backup_db_path, has_cache);
@@ -143,6 +155,19 @@ impl DatabaseManager {
 
         let migration_index = Arc::new(RwLock::new(migration_index));
 
+        let blob_store = if blob_enabled {
+            let store = BlobStore::new(dir_local.dir.as_path(), db_name);
+            store.ensure_root()?;
+            for table in &tables {
+                if table_storage.get(table).copied() == Some(TableStorageMode::BlobSidecar) {
+                    store.ensure_table(table)?;
+                }
+            }
+            Some(store)
+        } else {
+            None
+        };
+
         Ok(Self {
             memory_cache,
             db: db,
@@ -152,6 +177,9 @@ impl DatabaseManager {
             db_name: db_name.to_string(),
             tables_names: tables,
             has_cache,
+            blob_enabled,
+            table_storage,
+            blob_store,
             migration_index,
             migration_registry,
         })
@@ -168,6 +196,8 @@ impl DatabaseManager {
         cache_ttl_seconds: u64,
         cache_idle_seconds: u64,
         has_cache: bool,
+        blob_enabled: bool,
+        table_storage: std::collections::HashMap<String, TableStorageMode>,
         table_layouts: std::collections::HashMap<String, FieldLayout>,
         migration_registry: Arc<MigrationStepRegistry>,
     ) -> Result<Self> {
@@ -181,9 +211,68 @@ impl DatabaseManager {
             cache_ttl_seconds,
             cache_idle_seconds,
             has_cache,
+            blob_enabled,
+            table_storage,
             table_layouts,
             migration_registry,
         )
+    }
+
+    pub fn blob_enabled(&self) -> bool {
+        self.blob_enabled
+    }
+
+    pub fn table_storage_mode(&self, table: &str) -> TableStorageMode {
+        self.table_storage
+            .get(table)
+            .copied()
+            .unwrap_or(TableStorageMode::InlineJson)
+    }
+
+    pub fn is_blob_table(&self, table: &str) -> bool {
+        self.table_storage_mode(table) == TableStorageMode::BlobSidecar
+    }
+
+    pub fn blob_store(&self) -> Result<&BlobStore> {
+        self.blob_store.as_ref().ok_or_else(|| {
+            ClError::Validation("blob storage not enabled on this database".into())
+        })
+    }
+
+    pub fn write_blob(&self, table: &str, id: &str, data: &[u8]) -> Result<()> {
+        self.blob_store()?.write_atomic(table, id, data)
+    }
+
+    pub fn open_blob(&self, table: &str, id: &str) -> Result<File> {
+        self.blob_store()?.open_read(table, id)
+    }
+
+    pub fn delete_blob(&self, table: &str, id: &str) -> Result<bool> {
+        match &self.blob_store {
+            Some(store) => store.delete(table, id),
+            None => Ok(false),
+        }
+    }
+
+    pub fn copy_blob(
+        &self,
+        table: &str,
+        id: &str,
+        dest: &DatabaseManager,
+        dest_table: &str,
+        dest_id: &str,
+    ) -> Result<()> {
+        let src = self.blob_store()?;
+        let dest_store = dest.blob_store()?;
+        src.copy(table, id, dest_store, dest_table, dest_id)
+    }
+
+    pub fn blobs_root(&self) -> Option<PathBuf> {
+        if self.blob_enabled {
+            Some(crate::blob::blobs_root(&self.dir.dir, &self.db_name))
+        } else {
+            None
+        }
     }
 
     pub fn migration_index(&self) -> Result<std::sync::RwLockReadGuard<'_, DbMigrationIndex>> {
@@ -266,6 +355,9 @@ impl DatabaseManager {
     }
 
     pub fn delete_raw(&self, table_name: &str, key: &str) -> Result<()> {
+        if self.is_blob_table(table_name) {
+            let _ = self.delete_blob(table_name, key);
+        }
         let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(table_name);
         self.delete(table, table_name, key)?;
         Ok(())
@@ -752,7 +844,7 @@ pub struct Repository<T: DeserializeOwned + Serialize + Clone + 'static> {
     _marker: std::marker::PhantomData<T>,
 }
 
-impl<T: DeserializeOwned + Serialize + Clone> Repository<T> {
+impl<T: DeserializeOwned + Serialize + Clone + Entity> Repository<T> {
     pub fn new(table: &'static str, database_manager: DatabaseManager) -> Self {
         Self {
             table,
@@ -798,9 +890,48 @@ impl<T: DeserializeOwned + Serialize + Clone> Repository<T> {
     }
 
     pub fn delete(&self, id: &str) -> Result<()> {
+        if self.database_manager.is_blob_table(self.table) {
+            let _ = self.database_manager.delete_blob(self.table, id);
+        }
         let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(self.table);
         self.database_manager.delete(table, self.table, id)?;
         Ok(())
+    }
+
+    pub fn set_with_blob(&self, id: &str, meta: &T, blob: &[u8]) -> Result<()> {
+        if !self.database_manager.is_blob_table(self.table) {
+            return Err(ClError::Validation(format!(
+                "table '{}' is not registered as blob sidecar",
+                self.table
+            )));
+        }
+        let mut meta_json = serde_json::to_value(meta)?;
+        if let serde_json::Value::Object(ref mut obj) = meta_json {
+            obj.insert("size_bytes".to_string(), serde_json::json!(blob.len()));
+        }
+        let data = serde_json::to_vec(&meta_json)?;
+        let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(self.table);
+        self.database_manager.set(table, self.table, id, data)?;
+        self.database_manager.write_blob(self.table, id, blob)?;
+        Ok(())
+    }
+
+    pub fn create_with_blob(&self, meta: &T, blob: &[u8]) -> Result<()> {
+        self.set_with_blob(meta.entity_id(), meta, blob)
+    }
+
+    pub fn open_blob(&self, id: &str) -> Result<File> {
+        if !self.database_manager.is_blob_table(self.table) {
+            return Err(ClError::Validation(format!(
+                "table '{}' is not registered as blob sidecar",
+                self.table
+            )));
+        }
+        self.database_manager.open_blob(self.table, id)
+    }
+
+    pub fn is_blob_table(&self) -> bool {
+        self.database_manager.is_blob_table(self.table)
     }
 
     pub fn restore_by_version(&self, id: &str, version: u64) -> Result<()> {

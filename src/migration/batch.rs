@@ -6,6 +6,7 @@ use crate::units::Result;
 #[derive(Debug, Default)]
 pub struct MigrationBatch {
     writes: HashMap<String, Vec<(String, Vec<u8>)>>,
+    blob_writes: Vec<(String, String, Vec<u8>)>,
     deletes: Vec<(String, String)>,
 }
 
@@ -25,8 +26,16 @@ impl MigrationBatch {
         self.deletes.push((table.into(), key.into()));
     }
 
+    pub fn stage_blob(&mut self, table: impl Into<String>, key: impl Into<String>, data: Vec<u8>) {
+        self.blob_writes.push((table.into(), key.into(), data));
+    }
+
     pub fn write_count(&self) -> usize {
         self.writes.values().map(|v| v.len()).sum()
+    }
+
+    pub fn blob_write_count(&self) -> usize {
+        self.blob_writes.len()
     }
 
     pub fn commit(&self, db: &DatabaseManager) -> Result<()> {
@@ -36,7 +45,17 @@ impl MigrationBatch {
                 flat_writes.push((table.clone(), key.clone(), value.clone()));
             }
         }
-        db.commit_batch(&flat_writes, &self.deletes)
+        db.commit_batch(&flat_writes, &self.deletes)?;
+        for (table, key, data) in &self.blob_writes {
+            db.write_blob(table, key, data)?;
+        }
+        Ok(())
+    }
+
+    pub fn clear(&mut self) {
+        self.writes.clear();
+        self.blob_writes.clear();
+        self.deletes.clear();
     }
 }
 

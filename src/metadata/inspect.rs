@@ -44,6 +44,9 @@ pub struct InspectReport {
     pub migration_exists: bool,
     pub framework_version: Option<String>,
     pub table_schemas: Vec<(String, u32)>,
+    pub blob_enabled: bool,
+    pub blobs_root: Option<PathBuf>,
+    pub table_storage: Vec<(String, crate::metadata::types::TableStorageMode)>,
 }
 
 pub fn inspect_cldb(primary_path: &Path) -> Result<InspectReport> {
@@ -68,7 +71,8 @@ pub fn inspect_cldb(primary_path: &Path) -> Result<InspectReport> {
     let migration_dir = parent.join(migration_dir_name(&db_name));
     let inspection = inspect_database(primary_path, backup_path.as_deref(), &migration_dir)?;
 
-    let (framework_version, table_schemas) = if inspection.kind == FileKind::Authenticated {
+    let (framework_version, table_schemas, blob_enabled, table_storage) =
+        if inspection.kind == FileKind::Authenticated {
         let db =
             Database::open(primary_path).map_err(|e| ClError::Database(redb::Error::from(e)))?;
         if let Some(meta) = read_meta(&db)? {
@@ -77,12 +81,23 @@ pub fn inspect_cldb(primary_path: &Path) -> Result<InspectReport> {
                 .iter()
                 .map(|t| (t.name.clone(), t.schema_version))
                 .collect();
-            (Some(meta.framework_version), schemas)
+            let storage = meta
+                .tables
+                .iter()
+                .map(|t| (t.name.clone(), t.storage))
+                .collect();
+            (Some(meta.framework_version), schemas, meta.blob_enabled, storage)
         } else {
-            (None, Vec::new())
+            (None, Vec::new(), false, Vec::new())
         }
     } else {
-        (None, Vec::new())
+        (None, Vec::new(), false, Vec::new())
+    };
+
+    let blobs_root = if blob_enabled {
+        Some(parent.join(format!("{db_name}.blobs")))
+    } else {
+        None
     };
 
     Ok(InspectReport {
@@ -96,6 +111,9 @@ pub fn inspect_cldb(primary_path: &Path) -> Result<InspectReport> {
         migration_exists: inspection.migration_exists,
         framework_version,
         table_schemas,
+        blob_enabled,
+        blobs_root,
+        table_storage,
     })
 }
 

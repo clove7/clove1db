@@ -78,6 +78,25 @@ impl<E: Entity> Domain<E> {
         Ok((results, bulk_id))
     }
 
+    pub fn create_with_blob<I, O>(&self, input: I, blob: Vec<u8>) -> Result<O>
+    where
+        I: InputDto<E>,
+        O: OutputDto<E>,
+    {
+        input.validate()?;
+        let entity = input.into_entity()?;
+        self.repository.create_with_blob(&entity, &blob)?;
+        Ok(O::from_entity(entity))
+    }
+
+    pub fn set_with_blob(&self, id: &str, meta: &E, blob: &[u8]) -> Result<()> {
+        self.repository.set_with_blob(id, meta, blob)
+    }
+
+    pub fn open_blob(&self, id: &str) -> Result<std::fs::File> {
+        self.repository.open_blob(id)
+    }
+
     pub fn delete(&self, id: &str) -> Result<()> {
         self.repository.delete(id)?;
         Ok(())

@@ -32,12 +32,22 @@ impl BackupFormat {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TableStorageMode {
+    #[default]
+    InlineJson,
+    BlobSidecar,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableMeta {
     pub name: String,
     pub schema_id: String,
     pub schema_version: u32,
     pub layout_hash: String,
+    #[serde(default)]
+    pub storage: TableStorageMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +66,8 @@ pub struct CloveMeta {
     pub file_era: FileEra,
     pub db_name: String,
     pub backup_enabled: bool,
+    #[serde(default)]
+    pub blob_enabled: bool,
     pub backup_format: String,
     pub backup_upgraded: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -71,6 +83,7 @@ impl CloveMeta {
         db_name: impl Into<String>,
         file_era: FileEra,
         backup_enabled: bool,
+        blob_enabled: bool,
         tables: Vec<TableMeta>,
     ) -> Self {
         Self {
@@ -80,6 +93,7 @@ impl CloveMeta {
             file_era,
             db_name: db_name.into(),
             backup_enabled,
+            blob_enabled,
             backup_format: if backup_enabled {
                 BackupFormat::JsonWrappedV1.as_str().to_string()
             } else {

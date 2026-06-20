@@ -9,6 +9,7 @@ use crate::metadata::store::{ensure_meta_table, read_meta, write_meta};
 use crate::metadata::types::{BackupFormat, CloveMeta, FileEra, TableMeta, BACKUP_FORMAT_JSON};
 use crate::migration::chain::DbMigrationIndex;
 use crate::migration::layout::FieldLayout;
+use crate::metadata::types::TableStorageMode;
 use crate::migration::types::migration_dir_name;
 use crate::upgrade::backup_normalize::eager_normalize;
 use crate::upgrade::migration_refs::upgrade_migration_refs;
@@ -17,6 +18,7 @@ use crate::units::{ClError, Result};
 pub struct TableRegistration {
     pub name: String,
     pub layout: FieldLayout,
+    pub storage: TableStorageMode,
 }
 
 pub struct UpgradeInput<'a> {
@@ -26,6 +28,7 @@ pub struct UpgradeInput<'a> {
     pub db_name: &'a str,
     pub tables: &'a [TableRegistration],
     pub backup_enabled: bool,
+    pub blob_enabled: bool,
     pub has_cache: bool,
 }
 
@@ -195,10 +198,17 @@ fn build_meta(input: &UpgradeInput<'_>, file_era: FileEra) -> CloveMeta {
             schema_id: reg.name.clone(),
             schema_version: 1,
             layout_hash: reg.layout.layout_hash.clone(),
+            storage: reg.storage,
         })
         .collect();
 
-    let mut meta = CloveMeta::new(input.db_name, file_era, input.backup_enabled, tables);
+    let mut meta = CloveMeta::new(
+        input.db_name,
+        file_era,
+        input.backup_enabled,
+        input.blob_enabled,
+        tables,
+    );
 
     if input.backup_enabled {
         meta.backup_format = BackupFormat::JsonWrappedV1.as_str().to_string();

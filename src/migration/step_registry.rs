@@ -4,7 +4,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use serde_json::Value;
 
-use crate::migration::decoder::SchemaDecoder;
+use crate::metadata::types::TableStorageMode;
+use crate::migration::decoder::{
+    ensure_meta_id, row_bytes_to_value, MigratedRecord, MigrationRecordContext, SchemaDecoder,
+};
 use crate::migration::layout::FieldLayout;
 use crate::migration::migrate_to::{MigrateTo, MigrationSourceType, MigrationTargetType};
 use crate::units::{ClError, Result};
@@ -123,6 +126,42 @@ where
         let migrated = F::migrate_json(value)?;
         Ok(serde_json::to_vec(&migrated)?)
     }
+
+    fn migrate_record(
+        &self,
+        ctx: &MigrationRecordContext,
+        bytes: &[u8],
+    ) -> Result<MigratedRecord> {
+        use TableStorageMode::*;
+
+        let use_json_path = ctx.from_storage == BlobSidecar && !ctx.is_external;
+
+        if use_json_path {
+            let value: Value = serde_json::from_slice(bytes)?;
+            let migrated = F::migrate_json(value)?;
+            let meta = ensure_meta_id(migrated, &ctx.key);
+            return Ok(MigratedRecord {
+                metadata_bytes: serde_json::to_vec(&meta)?,
+                blob: None,
+            });
+        }
+
+        let value = row_bytes_to_value(bytes, ctx.is_external, ctx.value_decoder)?;
+        let (payload, meta_opt) = F::migrate_blob(value)?;
+        let meta = meta_opt.ok_or_else(|| {
+            ClError::MigrationError("migrate_blob returned None metadata".into())
+        })?;
+        let meta = ensure_meta_id(meta, &ctx.key);
+        let blob = if payload.is_empty() {
+            None
+        } else {
+            Some(payload)
+        };
+        Ok(MigratedRecord {
+            metadata_bytes: serde_json::to_vec(&meta)?,
+            blob,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -130,6 +169,7 @@ mod tests {
     use super::*;
     use crate::entity::Entity;
     use crate::migration::migrate_to::auto_migrate_json;
+    use crate::migration::types::ValueDecoder;
     use serde::{Deserialize, Serialize};
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -173,6 +213,29 @@ mod tests {
         let input = serde_json::json!({"id":"1","name":"test"});
         let out = decoder.migrate_bytes(&serde_json::to_vec(&input).unwrap()).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["sku"], "");
+    }
+
+    #[test]
+    fn migrate_record_inline_path() {
+        let reg = MigrationStepRegistry::new();
+        let key = reg.register::<V1, V2>().unwrap();
+        let decoder = reg
+            .get_by_layout(&key.from_layout_hash, &key.to_layout_hash)
+            .unwrap();
+        let ctx = MigrationRecordContext {
+            key: "1".into(),
+            from_storage: TableStorageMode::InlineJson,
+            to_storage: TableStorageMode::InlineJson,
+            is_external: false,
+            value_decoder: ValueDecoder::JsonValidate,
+        };
+        let input = serde_json::json!({"id":"1","name":"test"});
+        let rec = decoder
+            .migrate_record(&ctx, &serde_json::to_vec(&input).unwrap())
+            .unwrap();
+        assert!(rec.blob.is_none());
+        let v: serde_json::Value = serde_json::from_slice(&rec.metadata_bytes).unwrap();
         assert_eq!(v["sku"], "");
     }
 }

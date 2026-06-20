@@ -5,6 +5,7 @@ mod tests {
     use crate::entity::Entity;
     use crate::metadata::inspect::{FileKind, inspect_database};
     use crate::metadata::store::read_meta;
+    use crate::metadata::types::TableStorageMode;
     use crate::migration::layout::FieldLayout;
     use crate::storage::{DatabaseConfig, Storage, StorageConfig};
     use crate::upgrade::{OpenUpgradePipeline, TableRegistration, UpgradeInput};
@@ -41,6 +42,7 @@ mod tests {
         let tables = vec![TableRegistration {
             name: "users".to_string(),
             layout,
+            storage: TableStorageMode::InlineJson,
         }];
         let out = OpenUpgradePipeline::run(&UpgradeInput {
             dir_path: &dir,
@@ -49,6 +51,7 @@ mod tests {
             db_name: "users",
             tables: &tables,
             backup_enabled: false,
+            blob_enabled: false,
             has_cache: true,
         })
         .unwrap();

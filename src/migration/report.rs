@@ -20,6 +20,18 @@ pub struct MigrationReport {
     pub conflicts: Vec<ConflictEntry>,
     pub would_delete_old_db: bool,
     pub errors: Vec<String>,
+    #[serde(default)]
+    pub blobs_written: usize,
+    #[serde(default)]
+    pub blobs_copied: usize,
+    #[serde(default)]
+    pub blobs_deleted: usize,
+    #[serde(default)]
+    pub metadata_only_rows: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_storage: Option<crate::metadata::types::TableStorageMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_storage: Option<crate::metadata::types::TableStorageMode>,
 }
 
 impl MigrationReport {
@@ -34,6 +46,12 @@ impl MigrationReport {
             conflicts: Vec::new(),
             would_delete_old_db: false,
             errors: Vec::new(),
+            blobs_written: 0,
+            blobs_copied: 0,
+            blobs_deleted: 0,
+            metadata_only_rows: 0,
+            from_storage: None,
+            to_storage: None,
         }
     }
 
@@ -47,4 +65,11 @@ pub struct MigrationResult {
     pub migration_id: String,
     pub records_migrated: usize,
     pub report: MigrationReport,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExternalScanSummary {
+    pub table: String,
+    pub row_count: usize,
+    pub total_value_bytes: u64,
 }

@@ -4,16 +4,19 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::migration::batch::MigrationBatch;
+use crate::migration::decoder::MigrationRecordContext;
 use crate::migration::guard::{assert_target_available, check_compatible_overwrite};
 use crate::migration::layout::FieldLayout;
 use crate::migration::migrate_to::{MigrateTo, MigrationSourceType, MigrationTargetType};
-use crate::migration::plan::{MigrationSource, resolve_plan};
+use crate::migration::plan::{MigrationPlan, MigrationSource, resolve_plan};
 use crate::migration::redb_external::read_external_table;
 use crate::migration::report::{ConflictEntry, MigrationReport, MigrationResult};
+use crate::migration::scan::{scan_record, MigrationScanReport};
 use crate::migration::step_registry::MigrationStepRegistry;
 use crate::migration::types::{
-    ExternalFrom, MigrationFrom, MigrationKind, MigrationManifest, MigrationTo,
-    RedbTableSpec, SchemaRef, TableRenameInfo, TargetConflictPolicy, VersionScope,
+    BlobMigrationPolicy, ExternalFrom, MigrationFrom, MigrationKind, MigrationManifest,
+    MigrationTo, RedbTableSpec, SchemaRef, TableRenameInfo, TableStorageMode,
+    TargetConflictPolicy, VersionScope,
 };
 use crate::repository::DatabaseManager;
 use crate::storage::Storage;
@@ -25,6 +28,7 @@ pub struct MigrationRun<'a, F, T> {
     source: Option<MigrationSource>,
     target: Option<MigrationTo>,
     conflict_policy: TargetConflictPolicy,
+    blob_policy: BlobMigrationPolicy,
     _from: PhantomData<F>,
     _to: PhantomData<T>,
     _lifetime: PhantomData<&'a ()>,
@@ -44,6 +48,7 @@ where
             source: None,
             target: None,
             conflict_policy: TargetConflictPolicy::Fail,
+            blob_policy: BlobMigrationPolicy::default(),
             _from: PhantomData,
             _to: PhantomData,
             _lifetime: PhantomData,
@@ -82,6 +87,38 @@ where
         }
     }
 
+    pub fn blob_policy(self, policy: BlobMigrationPolicy) -> Self {
+        Self {
+            blob_policy: policy,
+            ..self
+        }
+    }
+
+    pub fn scan(&self) -> Result<MigrationScanReport> {
+        let source = self
+            .source
+            .as_ref()
+            .ok_or_else(|| ClError::MigrationError("migration source not set".into()))?;
+        let mut plan = resolve_plan(source, self.target.as_ref())?;
+        self.enrich_plan_storage(&mut plan);
+
+        let mut report = MigrationScanReport::new(&plan.from.table, &plan.to.table);
+        report.from_storage = plan.from.storage;
+        report.to_storage = plan.to.storage;
+
+        let entries = self.read_source(source)?;
+        for (key, bytes) in entries {
+            scan_record(
+                &mut report,
+                &key,
+                &bytes,
+                plan.from.storage,
+                plan.to.storage,
+            )?;
+        }
+        Ok(report)
+    }
+
     pub fn dry_run(&self) -> Result<MigrationReport> {
         self.run(true)
     }
@@ -95,15 +132,29 @@ where
         })
     }
 
+    fn enrich_plan_storage(&self, plan: &mut MigrationPlan) {
+        if plan.from.db != "external" {
+            let db = self.storage.db_manager(&plan.from.db);
+            plan.from.storage = db.table_storage_mode(&plan.from.table);
+        } else {
+            plan.from.storage = TableStorageMode::InlineJson;
+        }
+        let target_db = self.storage.db_manager(&plan.to.db);
+        plan.to.storage = target_db.table_storage_mode(&plan.to.table);
+    }
+
     fn run(&self, dry_run: bool) -> Result<MigrationReport> {
         let source = self
             .source
             .as_ref()
             .ok_or_else(|| ClError::MigrationError("migration source not set".into()))?;
 
-        let plan = resolve_plan(source, self.target.as_ref())?;
+        let mut plan = resolve_plan(source, self.target.as_ref())?;
+        self.enrich_plan_storage(&mut plan);
         let migration_id = format!("mig-{}", &Uuid::new_v4().to_string()[..8]);
         let mut report = MigrationReport::new(migration_id.clone(), dry_run);
+        report.from_storage = Some(plan.from.storage);
+        report.to_storage = Some(plan.to.storage);
 
         let target_db = self.storage.db_manager(&plan.to.db).clone();
         assert_target_available(&plan, &target_db, self.conflict_policy)?;
@@ -126,11 +177,32 @@ where
         let in_place = plan.kind == MigrationKind::InPlaceEvolve;
         let target_layout = target_db.table_layout(&plan.to.table)?;
 
+        let is_external = plan.external.is_some();
+        let value_decoder = plan
+            .external
+            .as_ref()
+            .map(|e| e.value_decoder)
+            .unwrap_or(crate::migration::types::ValueDecoder::JsonValidate);
+        let source_db = if plan.from.db != "external" {
+            Some(self.storage.db_manager(&plan.from.db).clone())
+        } else {
+            None
+        };
+
         let mut batch = MigrationBatch::new();
         let mut snapshot = Vec::new();
+        let mut pending_blobs: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut pending_copies: Vec<(String, String)> = Vec::new();
 
         for (key, bytes) in &entries {
-            let migrated = decoder.migrate_bytes(bytes)?;
+                let ctx = MigrationRecordContext {
+                    key: key.clone(),
+                    from_storage: plan.from.storage,
+                    to_storage: plan.to.storage,
+                    is_external,
+                    value_decoder,
+                };
+            let migrated = decoder.migrate_record(&ctx, bytes)?;
             let exists = target_db.get_raw(&plan.to.table, key)?.is_some();
 
             if exists && !in_place {
@@ -154,7 +226,11 @@ where
                         let existing = target_db
                             .get_raw(&plan.to.table, key)?
                             .unwrap_or_default();
-                        if !check_compatible_overwrite(&existing, &migrated, &target_layout)? {
+                        if !check_compatible_overwrite(
+                            &existing,
+                            &migrated.metadata_bytes,
+                            &target_layout,
+                        )? {
                             report.conflicts.push(ConflictEntry {
                                 table: plan.to.table.clone(),
                                 key: key.clone(),
@@ -172,9 +248,37 @@ where
             }
 
             if !dry_run {
-                snapshot.push((key.clone(), bytes.clone()));
+                snapshot.push((key.clone(), migrated.metadata_bytes.clone()));
             }
-            batch.stage_write(&plan.to.table, key, migrated);
+
+            batch.stage_write(&plan.to.table, key, migrated.metadata_bytes);
+
+            if plan.from.storage == TableStorageMode::BlobSidecar
+                && plan.to.storage == TableStorageMode::BlobSidecar
+            {
+                if !dry_run {
+                    pending_copies.push((key.clone(), key.clone()));
+                }
+                report.blobs_copied += 1;
+            } else if plan.to.storage == TableStorageMode::BlobSidecar {
+                if let Some(blob) = migrated.blob {
+                    if !dry_run {
+                        pending_blobs.push((key.clone(), blob));
+                    }
+                    report.blobs_written += 1;
+                }
+            }
+
+            if !dry_run && batch.write_count() >= self.blob_policy.batch_size {
+                Self::flush_batch(
+                    &mut batch,
+                    &target_db,
+                    source_db.as_ref(),
+                    &plan,
+                    &mut pending_blobs,
+                    &mut pending_copies,
+                )?;
+            }
         }
 
         if !report.conflicts.is_empty()
@@ -195,7 +299,16 @@ where
             return Ok(report);
         }
 
-        batch.commit(&target_db)?;
+        if batch.write_count() > 0 {
+            Self::flush_batch(
+                &mut batch,
+                &target_db,
+                source_db.as_ref(),
+                &plan,
+                &mut pending_blobs,
+                &mut pending_copies,
+            )?;
+        }
 
         let keys: Vec<String> = entries.iter().map(|(k, _)| k.clone()).collect();
         let max_version = self.max_backup_version(&target_db, &plan.to.table, &keys)?;
@@ -257,12 +370,18 @@ where
         )?;
 
         if plan.effective_delete_source {
-            let source_db = self.storage.db_manager(&plan.from.db).clone();
-            for (key, _) in &entries {
-                source_db.delete_raw(&plan.from.table, key)?;
-            }
-            if plan.from.table != plan.to.table && plan.from.db == plan.to.db {
-                target_db.rewrite_backup_table(&plan.from.table, &plan.to.table)?;
+            if let Some(source_db) = source_db {
+                for (key, _) in &entries {
+                    if self.blob_policy.delete_source_blobs
+                        && plan.from.storage == TableStorageMode::BlobSidecar
+                    {
+                        let _ = source_db.delete_blob(&plan.from.table, key);
+                    }
+                    source_db.delete_raw(&plan.from.table, key)?;
+                }
+                if plan.from.table != plan.to.table && plan.from.db == plan.to.db {
+                    target_db.rewrite_backup_table(&plan.from.table, &plan.to.table)?;
+                }
             }
         }
 
@@ -270,7 +389,7 @@ where
         Ok(report)
     }
 
-    fn resolve_from_version(&self, plan: &crate::migration::plan::MigrationPlan) -> Result<u32> {
+    fn resolve_from_version(&self, plan: &MigrationPlan) -> Result<u32> {
         if plan.kind == MigrationKind::ExternalImport {
             let index = self.storage.db_manager(&plan.to.db).migration_index()?;
             return Ok(index
@@ -323,5 +442,35 @@ where
             }
         }
         Ok(0)
+    }
+
+    fn flush_batch(
+        batch: &mut MigrationBatch,
+        target_db: &DatabaseManager,
+        source_db: Option<&DatabaseManager>,
+        plan: &MigrationPlan,
+        pending_blobs: &mut Vec<(String, Vec<u8>)>,
+        pending_copies: &mut Vec<(String, String)>,
+    ) -> Result<()> {
+        if batch.write_count() == 0 {
+            return Ok(());
+        }
+        batch.commit(target_db)?;
+        batch.clear();
+        for (key, blob) in pending_blobs.drain(..) {
+            target_db.write_blob(&plan.to.table, &key, &blob)?;
+        }
+        if let Some(src_db) = source_db {
+            for (src_key, dest_key) in pending_copies.drain(..) {
+                src_db.copy_blob(
+                    &plan.from.table,
+                    &src_key,
+                    target_db,
+                    &plan.to.table,
+                    &dest_key,
+                )?;
+            }
+        }
+        Ok(())
     }
 }

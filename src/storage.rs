@@ -15,10 +15,9 @@ use std::sync::Arc;
 
 
 use crate::{
-
     domain::Domain,
-
     entity::Entity,
+    metadata::types::TableStorageMode,
 
     migration::chain::DbMigrationIndex,
 
@@ -167,57 +166,37 @@ impl Storage {
 
 
 trait DomainFactory: Send + Sync {
-
     fn table_name(&self) -> &'static str;
-
     fn layout(&self) -> FieldLayout;
-
+    fn storage(&self) -> TableStorageMode;
     fn build(&self, database_manager: &DatabaseManager) -> (TypeId, Box<dyn Any + Send + Sync>);
-
 }
-
-
 
 struct TypedFactory<E: Entity + serde::Serialize + Default> {
-
     table: &'static str,
-
     layout: FieldLayout,
-
+    storage: TableStorageMode,
     _marker: PhantomData<fn() -> E>,
-
 }
 
-
-
 impl<E: Entity + serde::Serialize + Default> DomainFactory for TypedFactory<E> {
-
     fn table_name(&self) -> &'static str {
-
         self.table
-
     }
-
-
 
     fn layout(&self) -> FieldLayout {
-
         self.layout.clone()
-
     }
 
-
+    fn storage(&self) -> TableStorageMode {
+        self.storage
+    }
 
     fn build(&self, database_manager: &DatabaseManager) -> (TypeId, Box<dyn Any + Send + Sync>) {
-
         let repo = Repository::<E>::new(self.table, database_manager.clone());
-
         let domain = Domain::new(repo);
-
         (TypeId::of::<E>(), Box::new(domain))
-
     }
-
 }
 
 
@@ -244,6 +223,7 @@ pub struct DatabaseConfig {
 
     backup_enabled: bool,
 
+    blob_enabled: bool,
 }
 
 
@@ -274,6 +254,8 @@ impl DatabaseConfig {
 
             backup_enabled: false,
 
+            blob_enabled: false,
+
         }
 
     }
@@ -283,6 +265,9 @@ impl DatabaseConfig {
     pub fn has_cache(mut self, has_cache: bool) -> Self {
 
         self.has_cache = has_cache;
+        if has_cache {
+            self.blob_enabled = false;
+        }
 
         self
 
@@ -303,6 +288,7 @@ impl DatabaseConfig {
     pub fn backup_dir(mut self, path: PathBuf) -> Self {
 
         self.backup_enabled = true;
+        self.blob_enabled = false;
 
         self.backup_dir_path = Some(path);
 
@@ -315,9 +301,21 @@ impl DatabaseConfig {
     pub fn backup_enabled(mut self, enabled: bool) -> Self {
 
         self.backup_enabled = enabled;
+        if enabled {
+            self.blob_enabled = false;
+        }
 
         self
 
+    }
+
+    pub fn blob_enabled(mut self, enabled: bool) -> Self {
+        self.blob_enabled = enabled;
+        if enabled {
+            self.backup_enabled = false;
+            self.has_cache = false;
+        }
+        self
     }
 
 
@@ -331,6 +329,7 @@ impl DatabaseConfig {
         self.cache_idle = idle_secs;
 
         self.has_cache = true;
+        self.blob_enabled = false;
 
         self
 
@@ -338,28 +337,30 @@ impl DatabaseConfig {
 
 
 
-    pub fn register<E: Entity + serde::Serialize + Default>(mut self, table: &'static str) -> Self {
+    pub fn register<E: Entity + serde::Serialize + Default>(self, table: &'static str) -> Self {
+        self.register_with_storage::<E>(table, TableStorageMode::InlineJson)
+    }
 
+    pub fn register_blob<E: Entity + serde::Serialize + Default>(self, table: &'static str) -> Self {
+        self.register_with_storage::<E>(table, TableStorageMode::BlobSidecar)
+    }
+
+    fn register_with_storage<E: Entity + serde::Serialize + Default>(
+        mut self,
+        table: &'static str,
+        storage: TableStorageMode,
+    ) -> Self {
         let layout =
-
             FieldLayout::capture_from_entity_json(&E::default()).unwrap_or_else(|_| {
-
                 FieldLayout::from_json_value(&serde_json::json!({}))
-
             });
-
         self.factories.push(Box::new(TypedFactory::<E> {
-
             table,
-
             layout,
-
+            storage,
             _marker: PhantomData,
-
         }));
-
         self
-
     }
 
 }
@@ -544,7 +545,15 @@ impl StorageBuilder {
 
             }
 
-
+            let has_blob_table = config
+                .factories
+                .iter()
+                .any(|f| f.storage() == TableStorageMode::BlobSidecar);
+            if has_blob_table && !config.blob_enabled {
+                return Err(ClError::Validation(
+                    "register_blob requires blob_enabled(true) on DatabaseConfig".into(),
+                ));
+            }
 
             let table_regs: Vec<TableRegistration> = config
 
@@ -557,6 +566,8 @@ impl StorageBuilder {
                     name: f.table_name().to_string(),
 
                     layout: f.layout(),
+
+                    storage: f.storage(),
 
                 })
 
@@ -584,6 +595,8 @@ impl StorageBuilder {
 
                 backup_enabled: config.backup_enabled,
 
+                blob_enabled: config.blob_enabled,
+
                 has_cache: config.has_cache,
 
             })?;
@@ -600,7 +613,11 @@ impl StorageBuilder {
 
                 .collect();
 
-
+            let table_storage: std::collections::HashMap<String, TableStorageMode> = config
+                .factories
+                .iter()
+                .map(|f| (f.table_name().to_string(), f.storage()))
+                .collect();
 
             let db_manager = DatabaseManager::open(
 
@@ -621,6 +638,10 @@ impl StorageBuilder {
                 config.cache_idle,
 
                 config.has_cache,
+
+                config.blob_enabled,
+
+                table_storage,
 
                 upgrade.table_layouts,
 

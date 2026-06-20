@@ -5,11 +5,75 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::metadata::types::TableStorageMode;
+use crate::migration::types::ValueDecoder;
 use crate::units::{ClError, Result};
+
+#[derive(Debug, Clone)]
+pub struct MigratedRecord {
+    pub metadata_bytes: Vec<u8>,
+    pub blob: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MigrationRecordContext {
+    pub key: String,
+    pub from_storage: TableStorageMode,
+    pub to_storage: TableStorageMode,
+    pub is_external: bool,
+    pub value_decoder: ValueDecoder,
+}
 
 pub trait SchemaDecoder: Send + Sync {
     fn decode_to_json(&self, bytes: &[u8]) -> Result<Value>;
     fn migrate_bytes(&self, bytes: &[u8]) -> Result<Vec<u8>>;
+
+    fn migrate_record(
+        &self,
+        _ctx: &MigrationRecordContext,
+        bytes: &[u8],
+    ) -> Result<MigratedRecord> {
+        let metadata_bytes = self.migrate_bytes(bytes)?;
+        Ok(MigratedRecord {
+            metadata_bytes,
+            blob: None,
+        })
+    }
+}
+
+pub fn row_bytes_to_value(
+    bytes: &[u8],
+    is_external: bool,
+    decoder: ValueDecoder,
+) -> Result<Value> {
+    if !is_external {
+        return Ok(serde_json::from_slice(bytes)?);
+    }
+    match decoder {
+        ValueDecoder::RawPassthrough | ValueDecoder::BytesAsArray => {
+            let arr: Vec<Value> = bytes
+                .iter()
+                .map(|b| Value::Number((*b as u64).into()))
+                .collect();
+            Ok(Value::Array(arr))
+        }
+        ValueDecoder::Utf8String | ValueDecoder::Base64String => {
+            let s = std::str::from_utf8(bytes).map_err(|e| ClError::Utf8Error(e.to_string()))?;
+            Ok(Value::String(s.to_string()))
+        }
+        ValueDecoder::JsonValidate | ValueDecoder::JsonString | ValueDecoder::JsonValue => {
+            Ok(serde_json::from_slice(bytes)?)
+        }
+    }
+}
+
+pub(crate) fn ensure_meta_id(mut meta: Value, key: &str) -> Value {
+    if let Value::Object(obj) = &mut meta {
+        if !obj.contains_key("id") {
+            obj.insert("id".to_string(), Value::String(key.to_string()));
+        }
+    }
+    meta
 }
 
 pub struct JsonPassthroughDecoder;
@@ -24,7 +88,6 @@ impl SchemaDecoder for JsonPassthroughDecoder {
     }
 }
 
-/// Merges missing fields from a target JSON template (defaults) into source JSON.
 pub struct AutoAdditiveDecoder {
     target_template: Value,
 }
