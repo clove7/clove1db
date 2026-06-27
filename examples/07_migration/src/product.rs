@@ -4,7 +4,7 @@ use serde_json::Value;
 use clove1db::{
     dto::{InputDto, OutputDto},
     entity::Entity,
-    migration::MigrateTo,
+    migration::{migrate_value, skip_record, MigrateOutcome, MigrateTo},
     units::Result,
 };
 
@@ -179,32 +179,38 @@ fn slug(name: &str) -> String {
 }
 
 impl MigrateTo<ProductV2> for ProductV1 {
-    fn migrate_json(value: Value) -> Result<Value> {
+    fn migrate_json(value: Value) -> Result<MigrateOutcome<Value>> {
         let v1: ProductV1 = serde_json::from_value(value)?;
-        Ok(serde_json::to_value(ProductV2 {
+        migrate_value(ProductV2 {
             id: v1.id,
             name: v1.name.clone(),
             sku: format!("SKU-{}", slug(&v1.name)),
             price_cents: 9_900,
-        })?)
+        })
     }
 }
 
 impl MigrateTo<ProductV2> for ExternalCatalogRow {
-    fn migrate_json(value: Value) -> Result<Value> {
+    fn migrate_json(value: Value) -> Result<MigrateOutcome<Value>> {
         let row: ExternalCatalogRow = serde_json::from_value(value)?;
+        if row.vendor_code.starts_with("SKIP-") {
+            return skip_record(format!(
+                "vendor_code {} marked as non-importable",
+                row.vendor_code
+            ));
+        }
         let price_cents = (row.price_usd * 100.0).round() as u64;
-        Ok(serde_json::to_value(ProductV2 {
+        migrate_value(ProductV2 {
             id: row.id,
             name: row.title,
             sku: row.vendor_code,
             price_cents,
-        })?)
+        })
     }
 }
 
 impl MigrateTo<ProductV3> for ProductV2 {
-    fn migrate_json(value: Value) -> Result<Value> {
+    fn migrate_json(value: Value) -> Result<MigrateOutcome<Value>> {
         let v2: ProductV2 = serde_json::from_value(value)?;
         let category = if v2.name.to_lowercase().contains("mouse") {
             "peripherals"
@@ -213,14 +219,14 @@ impl MigrateTo<ProductV3> for ProductV2 {
         } else {
             "accessories"
         };
-        Ok(serde_json::to_value(ProductV3 {
+        migrate_value(ProductV3 {
             id: v2.id,
             name: v2.name,
             sku: v2.sku,
             price_cents: v2.price_cents,
             category: category.into(),
             stock: 50,
-        })?)
+        })
     }
 }
 

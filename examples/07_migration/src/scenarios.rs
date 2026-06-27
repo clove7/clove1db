@@ -445,6 +445,14 @@ pub fn example_external_redb_import(base: &PathBuf) -> Result<()> {
 
     log::kv("migration_id", &result.migration_id);
     log::kv("records_migrated", result.records_migrated);
+    log::kv("source_skipped", result.report.source_skipped);
+    for s in &result.report.skipped_entries {
+        log::line(format!(
+            "skipped {} — {}",
+            s.key,
+            s.reason.as_deref().unwrap_or("(no reason)")
+        ));
+    }
 
     let idx = storage.migration_index("imported")?;
     log::subsection("migration chain on import DB");
@@ -487,6 +495,15 @@ pub fn example_external_redb_import(base: &PathBuf) -> Result<()> {
     assert_eq!(ext_after.len(), seeded.len());
 
     for row in &seeded {
+        if row.vendor_code.starts_with("SKIP-") {
+            if domain.get::<ProductV2Response>(&row.id).is_ok() {
+                return Err(ClError::Validation(format!(
+                    "skipped row {} should not be imported",
+                    row.id
+                )));
+            }
+            continue;
+        }
         let imported = domain.get::<ProductV2Response>(&row.id)?;
         let expected_cents = (row.price_usd * 100.0).round() as u64;
         if imported.name != row.title

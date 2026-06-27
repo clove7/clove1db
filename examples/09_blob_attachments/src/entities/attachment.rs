@@ -1,7 +1,7 @@
 use clove1db::{
     dto::{InputDto, OutputDto},
     entity::Entity,
-    migration::MigrateTo,
+    migration::{migrate_value, MigrateOutcome, MigrateTo},
     units::{ClError, Result},
 };
 use serde::{Deserialize, Serialize};
@@ -78,18 +78,18 @@ impl Entity for LegacyAttachmentInline {
 }
 
 impl MigrateTo<AttachmentMeta> for LegacyAttachmentInline {
-    fn migrate_json(value: Value) -> Result<Value> {
+    fn migrate_json(value: Value) -> Result<MigrateOutcome<Value>> {
         let inline: LegacyAttachmentInline = serde_json::from_value(value)?;
-        Ok(serde_json::to_value(AttachmentMeta {
+        migrate_value(AttachmentMeta {
             id: inline.id,
             filename: inline.filename,
             account_id: inline.account_id,
             size_bytes: inline.data.len(),
             mime: inline.mime,
-        })?)
+        })
     }
 
-    fn migrate_blob(value: Value) -> Result<(Vec<u8>, Option<Value>)> {
+    fn migrate_blob(value: Value) -> Result<MigrateOutcome<(Vec<u8>, Option<Value>)>> {
         let inline: LegacyAttachmentInline = serde_json::from_value(value)?;
         let payload = inline.data;
         let meta = AttachmentMeta {
@@ -99,7 +99,7 @@ impl MigrateTo<AttachmentMeta> for LegacyAttachmentInline {
             size_bytes: payload.len(),
             mime: inline.mime,
         };
-        Ok((payload, Some(serde_json::to_value(meta)?)))
+        Ok(MigrateOutcome::Migrate((payload, Some(serde_json::to_value(meta)?))))
     }
 }
 
@@ -107,7 +107,7 @@ impl MigrateTo<AttachmentMeta> for LegacyAttachmentInline {
 pub struct ExternalAttachmentRow;
 
 impl MigrateTo<AttachmentMeta> for ExternalAttachmentRow {
-    fn migrate_blob(value: Value) -> Result<(Vec<u8>, Option<Value>)> {
+    fn migrate_blob(value: Value) -> Result<MigrateOutcome<(Vec<u8>, Option<Value>)>> {
         let raw = value_from_external(&value)?;
         let (account_id, payload) = extract_fb_payload(&raw)?;
         let mime = infer_mime(&payload);
@@ -118,7 +118,7 @@ impl MigrateTo<AttachmentMeta> for ExternalAttachmentRow {
             "size_bytes": payload.len(),
             "mime": mime,
         });
-        Ok((payload, Some(meta)))
+        Ok(MigrateOutcome::Migrate((payload, Some(meta))))
     }
 }
 

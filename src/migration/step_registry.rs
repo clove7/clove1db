@@ -6,10 +6,11 @@ use serde_json::Value;
 
 use crate::metadata::types::TableStorageMode;
 use crate::migration::decoder::{
-    ensure_meta_id, row_bytes_to_value, MigratedRecord, MigrationRecordContext, SchemaDecoder,
+    ensure_meta_id, row_bytes_to_value, MigratedRecord, MigrationRecordContext,
+    MigrationRecordResult, SchemaDecoder,
 };
 use crate::migration::layout::FieldLayout;
-use crate::migration::migrate_to::{MigrateTo, MigrationSourceType, MigrationTargetType};
+use crate::migration::migrate_to::{MigrateOutcome, MigrateTo, MigrationSourceType, MigrationTargetType};
 use crate::units::{ClError, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -123,44 +124,56 @@ where
 
     fn migrate_bytes(&self, bytes: &[u8]) -> Result<Vec<u8>> {
         let value: Value = serde_json::from_slice(bytes)?;
-        let migrated = F::migrate_json(value)?;
-        Ok(serde_json::to_vec(&migrated)?)
+        match F::migrate_json(value)? {
+            MigrateOutcome::Migrate(migrated) => Ok(serde_json::to_vec(&migrated)?),
+            MigrateOutcome::Skip(reason) => Err(ClError::MigrationError(format!(
+                "migrate_json returned Skip during migrate_bytes: {reason:?}"
+            ))),
+        }
     }
 
     fn migrate_record(
         &self,
         ctx: &MigrationRecordContext,
         bytes: &[u8],
-    ) -> Result<MigratedRecord> {
+    ) -> Result<MigrationRecordResult> {
         use TableStorageMode::*;
 
         let use_json_path = ctx.from_storage == BlobSidecar && !ctx.is_external;
 
         if use_json_path {
             let value: Value = serde_json::from_slice(bytes)?;
-            let migrated = F::migrate_json(value)?;
-            let meta = ensure_meta_id(migrated, &ctx.key);
-            return Ok(MigratedRecord {
-                metadata_bytes: serde_json::to_vec(&meta)?,
-                blob: None,
-            });
+            return match F::migrate_json(value)? {
+                MigrateOutcome::Skip(reason) => Ok(MigrationRecordResult::Skip { reason }),
+                MigrateOutcome::Migrate(migrated) => {
+                    let meta = ensure_meta_id(migrated, &ctx.key);
+                    Ok(MigrationRecordResult::Migrated(MigratedRecord {
+                        metadata_bytes: serde_json::to_vec(&meta)?,
+                        blob: None,
+                    }))
+                }
+            };
         }
 
         let value = row_bytes_to_value(bytes, ctx.is_external, ctx.value_decoder)?;
-        let (payload, meta_opt) = F::migrate_blob(value)?;
-        let meta = meta_opt.ok_or_else(|| {
-            ClError::MigrationError("migrate_blob returned None metadata".into())
-        })?;
-        let meta = ensure_meta_id(meta, &ctx.key);
-        let blob = if payload.is_empty() {
-            None
-        } else {
-            Some(payload)
-        };
-        Ok(MigratedRecord {
-            metadata_bytes: serde_json::to_vec(&meta)?,
-            blob,
-        })
+        match F::migrate_blob(value)? {
+            MigrateOutcome::Skip(reason) => Ok(MigrationRecordResult::Skip { reason }),
+            MigrateOutcome::Migrate((payload, meta_opt)) => {
+                let meta = meta_opt.ok_or_else(|| {
+                    ClError::MigrationError("migrate_blob returned None metadata".into())
+                })?;
+                let meta = ensure_meta_id(meta, &ctx.key);
+                let blob = if payload.is_empty() {
+                    None
+                } else {
+                    Some(payload)
+                };
+                Ok(MigrationRecordResult::Migrated(MigratedRecord {
+                    metadata_bytes: serde_json::to_vec(&meta)?,
+                    blob,
+                }))
+            }
+        }
     }
 }
 
@@ -168,7 +181,7 @@ where
 mod tests {
     use super::*;
     use crate::entity::Entity;
-    use crate::migration::migrate_to::auto_migrate_json;
+    use crate::migration::migrate_to::{auto_migrate_json, migrate_value, skip_record, MigrateOutcome};
     use crate::migration::types::ValueDecoder;
     use serde::{Deserialize, Serialize};
 
@@ -198,7 +211,7 @@ mod tests {
     }
 
     impl MigrateTo<V2> for V1 {
-        fn migrate_json(value: Value) -> Result<Value> {
+        fn migrate_json(value: Value) -> Result<MigrateOutcome<Value>> {
             auto_migrate_json::<V1, V2>(value)
         }
     }
@@ -234,8 +247,64 @@ mod tests {
         let rec = decoder
             .migrate_record(&ctx, &serde_json::to_vec(&input).unwrap())
             .unwrap();
-        assert!(rec.blob.is_none());
-        let v: serde_json::Value = serde_json::from_slice(&rec.metadata_bytes).unwrap();
+        let migrated = match rec {
+            MigrationRecordResult::Migrated(m) => m,
+            MigrationRecordResult::Skip { .. } => panic!("unexpected skip"),
+        };
+        assert!(migrated.blob.is_none());
+        let v: serde_json::Value = serde_json::from_slice(&migrated.metadata_bytes).unwrap();
         assert_eq!(v["sku"], "");
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    struct SkipV1 {
+        id: String,
+        name: String,
+    }
+
+    impl Entity for SkipV1 {
+        fn entity_id(&self) -> &str {
+            &self.id
+        }
+    }
+
+    impl MigrateTo<V2> for SkipV1 {
+        fn migrate_json(value: Value) -> Result<MigrateOutcome<Value>> {
+            let row: SkipV1 = serde_json::from_value(value)?;
+            if row.name == "skip-me" {
+                return skip_record("filtered by name");
+            }
+            migrate_value(V2 {
+                id: row.id,
+                name: row.name,
+                sku: String::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn migrate_record_skips_source_row() {
+        let reg = MigrationStepRegistry::new();
+        let key = reg.register::<SkipV1, V2>().unwrap();
+        let decoder = reg
+            .get_by_layout(&key.from_layout_hash, &key.to_layout_hash)
+            .unwrap();
+        let ctx = MigrationRecordContext {
+            key: "skip".into(),
+            from_storage: TableStorageMode::InlineJson,
+            to_storage: TableStorageMode::InlineJson,
+            is_external: false,
+            value_decoder: ValueDecoder::JsonValidate,
+        };
+        let input = serde_json::json!({"id":"skip","name":"skip-me"});
+        let rec = decoder
+            .migrate_record(&ctx, &serde_json::to_vec(&input).unwrap())
+            .unwrap();
+        match rec {
+            MigrationRecordResult::Skip { reason } => {
+                assert_eq!(reason.as_deref(), Some("filtered by name"));
+            }
+            MigrationRecordResult::Migrated(_) => panic!("expected skip"),
+        }
     }
 }

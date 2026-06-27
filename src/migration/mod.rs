@@ -16,12 +16,16 @@ pub mod types;
 pub use batch::MigrationBatch;
 pub use chain::{DbMigrationIndex, MigrationChain, TableMigrationChain};
 pub use decoder::{
-    row_bytes_to_value, MigratedRecord, MigrationRecordContext, SchemaDecoder,
+    row_bytes_to_value, MigratedRecord, MigrationRecordContext, MigrationRecordResult,
+    SchemaDecoder,
 };
 pub use layout::{FieldLayout, LayoutDiff, LayoutDiffKind};
-pub use migrate_to::{auto_migrate_json, register_step, MigrateTo, MigrationSourceType, MigrationTargetType};
+pub use migrate_to::{
+    auto_migrate_json, migrate_value, register_step, skip_record, skip_record_silent, MigrateOutcome,
+    MigrateTo, MigrationSourceType, MigrationTargetType,
+};
 pub use plan::{MigrationPlan, MigrationSource, ResolvedEndpoint, resolve_plan};
-pub use report::{ConflictEntry, MigrationReport, MigrationResult};
+pub use report::{ConflictEntry, MigrationReport, MigrationResult, SkippedEntry};
 pub use redb_external::{list_external_tables, read_external_table, scan_external_table};
 pub use runner::MigrationRun;
 pub use scan::{scan_record, MigrationScanReport};

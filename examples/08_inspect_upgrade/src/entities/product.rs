@@ -1,7 +1,7 @@
 use clove1db::{
     dto::{InputDto, OutputDto},
     entity::Entity,
-    migration::MigrateTo,
+    migration::{migrate_value, MigrateOutcome, MigrateTo},
     units::Result,
 };
 use serde::{Deserialize, Serialize};
@@ -82,14 +82,14 @@ impl OutputDto<ProductV2> for ProductV2Response {
 }
 
 impl MigrateTo<ProductV2> for ProductV1 {
-    fn migrate_json(value: Value) -> Result<Value> {
+    fn migrate_json(value: Value) -> Result<MigrateOutcome<Value>> {
         let v1: ProductV1 = serde_json::from_value(value)?;
         let sku = format!("SKU-{}", &v1.id[..8.min(v1.id.len())]);
-        Ok(serde_json::to_value(ProductV2 {
+        migrate_value(ProductV2 {
             id: v1.id,
             name: v1.name,
             sku,
             price_cents: 1000,
-        })?)
+        })
     }
 }

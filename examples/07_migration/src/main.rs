@@ -17,7 +17,7 @@ fn main() -> Result<()> {
     log::banner("clove1db — Product Migration Examples");
     log::line("Schema upgrades, cross-DB moves, external redb import, history & restore");
     log::kv("data_dir", BASE_DIR);
-    log::kv("framework", "clove1db 0.0.70");
+    log::kv("framework", "clove1db 0.0.84");
 
     // 1–3: Legacy catalog → ProductV2
     let (storage_v1, seed) = scenarios::example_seed_legacy_catalog(&base)?;

@@ -8,7 +8,7 @@ mod blob_tests {
     use crate::blob::BlobStore;
     use crate::entity::Entity;
     use crate::metadata::types::TableStorageMode;
-    use crate::migration::decoder::{row_bytes_to_value, MigrationRecordContext};
+    use crate::migration::decoder::{row_bytes_to_value, MigrationRecordContext, MigrationRecordResult};
     use crate::migration::migrate_to::MigrateTo;
     use crate::migration::step_registry::MigrationStepRegistry;
     use crate::migration::types::ValueDecoder;
@@ -42,23 +42,23 @@ mod blob_tests {
     }
 
     impl MigrateTo<DocMeta> for DocInline {
-        fn migrate_json(value: Value) -> crate::units::Result<Value> {
+        fn migrate_json(value: Value) -> crate::units::Result<crate::migration::MigrateOutcome<Value>> {
             let row: DocInline = serde_json::from_value(value)?;
-            Ok(serde_json::to_value(DocMeta {
+            Ok(crate::migration::MigrateOutcome::Migrate(serde_json::to_value(DocMeta {
                 id: row.id,
                 title: row.title,
                 size_bytes: row.data.len(),
-            })?)
+            })?))
         }
 
-        fn migrate_blob(value: Value) -> crate::units::Result<(Vec<u8>, Option<Value>)> {
+        fn migrate_blob(value: Value) -> crate::units::Result<crate::migration::MigrateOutcome<(Vec<u8>, Option<Value>)>> {
             let mut v = value;
             let data = v["data"].take();
             let payload: Vec<u8> = serde_json::from_value(data)?;
             if let Some(obj) = v.as_object_mut() {
                 obj.remove("data");
             }
-            Ok((payload, Some(v)))
+            Ok(crate::migration::MigrateOutcome::Migrate((payload, Some(v))))
         }
     }
 
@@ -137,8 +137,12 @@ mod blob_tests {
         let out = decoder
             .migrate_record(&ctx, &serde_json::to_vec(&inline).unwrap())
             .unwrap();
-        assert_eq!(out.blob, Some(vec![10, 20, 30]));
-        let meta: serde_json::Value = serde_json::from_slice(&out.metadata_bytes).unwrap();
+        let migrated = match out {
+            MigrationRecordResult::Migrated(m) => m,
+            MigrationRecordResult::Skip { .. } => panic!("unexpected skip"),
+        };
+        assert_eq!(migrated.blob, Some(vec![10, 20, 30]));
+        let meta: serde_json::Value = serde_json::from_slice(&migrated.metadata_bytes).unwrap();
         assert!(meta.get("data").is_none());
     }
 

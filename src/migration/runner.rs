@@ -5,12 +5,13 @@ use uuid::Uuid;
 
 use crate::migration::batch::MigrationBatch;
 use crate::migration::decoder::MigrationRecordContext;
+use crate::migration::decoder::MigrationRecordResult;
 use crate::migration::guard::{assert_target_available, check_compatible_overwrite};
 use crate::migration::layout::FieldLayout;
 use crate::migration::migrate_to::{MigrateTo, MigrationSourceType, MigrationTargetType};
 use crate::migration::plan::{MigrationPlan, MigrationSource, resolve_plan};
 use crate::migration::redb_external::read_external_table;
-use crate::migration::report::{ConflictEntry, MigrationReport, MigrationResult};
+use crate::migration::report::{ConflictEntry, MigrationReport, MigrationResult, SkippedEntry};
 use crate::migration::scan::{scan_record, MigrationScanReport};
 use crate::migration::step_registry::MigrationStepRegistry;
 use crate::migration::types::{
@@ -202,7 +203,18 @@ where
                     is_external,
                     value_decoder,
                 };
-            let migrated = decoder.migrate_record(&ctx, bytes)?;
+            let record_result = decoder.migrate_record(&ctx, bytes)?;
+            let migrated = match record_result {
+                MigrationRecordResult::Skip { reason } => {
+                    report.source_skipped += 1;
+                    report.skipped_entries.push(SkippedEntry {
+                        key: key.clone(),
+                        reason,
+                    });
+                    continue;
+                }
+                MigrationRecordResult::Migrated(migrated) => migrated,
+            };
             let exists = target_db.get_raw(&plan.to.table, key)?.is_some();
 
             if exists && !in_place {

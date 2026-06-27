@@ -16,6 +16,12 @@ pub struct MigratedRecord {
 }
 
 #[derive(Debug, Clone)]
+pub enum MigrationRecordResult {
+    Migrated(MigratedRecord),
+    Skip { reason: Option<String> },
+}
+
+#[derive(Debug, Clone)]
 pub struct MigrationRecordContext {
     pub key: String,
     pub from_storage: TableStorageMode,
@@ -32,12 +38,12 @@ pub trait SchemaDecoder: Send + Sync {
         &self,
         _ctx: &MigrationRecordContext,
         bytes: &[u8],
-    ) -> Result<MigratedRecord> {
+    ) -> Result<MigrationRecordResult> {
         let metadata_bytes = self.migrate_bytes(bytes)?;
-        Ok(MigratedRecord {
+        Ok(MigrationRecordResult::Migrated(MigratedRecord {
             metadata_bytes,
             blob: None,
-        })
+        }))
     }
 }
 

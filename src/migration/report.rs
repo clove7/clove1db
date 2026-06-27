@@ -9,6 +9,14 @@ pub struct ConflictEntry {
     pub policy: TargetConflictPolicy,
 }
 
+/// A source row skipped inside [`MigrateTo::migrate_json`] / [`MigrateTo::migrate_blob`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkippedEntry {
+    pub key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MigrationReport {
     pub dry_run: bool,
@@ -16,7 +24,13 @@ pub struct MigrationReport {
     pub source_count: usize,
     pub would_insert: usize,
     pub would_overwrite: usize,
+    /// Rows skipped because the target key already exists (`TargetConflictPolicy::Skip`).
     pub would_skip: usize,
+    /// Rows skipped by the migration transform (`MigrateOutcome::Skip`).
+    #[serde(default)]
+    pub source_skipped: usize,
+    #[serde(default)]
+    pub skipped_entries: Vec<SkippedEntry>,
     pub conflicts: Vec<ConflictEntry>,
     pub would_delete_old_db: bool,
     pub errors: Vec<String>,
@@ -43,6 +57,8 @@ impl MigrationReport {
             would_insert: 0,
             would_overwrite: 0,
             would_skip: 0,
+            source_skipped: 0,
+            skipped_entries: Vec::new(),
             conflicts: Vec::new(),
             would_delete_old_db: false,
             errors: Vec::new(),

@@ -58,6 +58,14 @@ pub fn print_migration_report(label: &str, report: &MigrationReport) {
     kv("would_insert", report.would_insert);
     kv("would_overwrite", report.would_overwrite);
     kv("would_skip", report.would_skip);
+    kv("source_skipped", report.source_skipped);
+    for s in &report.skipped_entries {
+        line(format!(
+            "source_skip key={} reason={}",
+            s.key,
+            s.reason.as_deref().unwrap_or("(none)")
+        ));
+    }
     kv("conflicts", report.conflicts.len());
     for c in &report.conflicts {
         line(format!(

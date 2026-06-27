@@ -1,6 +1,6 @@
 [package]
 name = "clove1db"
-version = "0.0.77"
+version = "0.0.84"
 edition = "2024"
 license = "MIT"
 authors = ["clove7"]

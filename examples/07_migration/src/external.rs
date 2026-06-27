@@ -51,6 +51,12 @@ pub fn seed_vendor_inventory(base: &Path) -> Result<Vec<ExternalCatalogRow>> {
             price_usd: 34.50,
             vendor_code: "VND-LITE".into(),
         },
+        ExternalCatalogRow {
+            id: "ext-retired-04".into(),
+            title: "Discontinued Widget".into(),
+            price_usd: 0.0,
+            vendor_code: "SKIP-RETIRED".into(),
+        },
     ];
 
     let db = Database::create(&path).map_err(|e| clove1db::units::ClError::Database(e.into()))?;

@@ -20,7 +20,7 @@ An embedded database framework for Rust — built on [redb](https://github.com/c
 
 ```toml
 [dependencies]
-clove1db = "0.0.77"
+clove1db = "0.0.84"
 ```
 
 ## Quick Start
@@ -122,25 +122,39 @@ On-disk migration layout:
 
 Typed migrations use `MigrateTo` + `storage.migrate::<From, To>()`. Migration steps are keyed automatically by `layout_hash` pairs stored in each manifest (`from_layout_hash` / `to_layout_hash`).
 
-> **Breaking in 0.0.63:** `migration_runner()`, `.with_decoder()`, `field_map`, and string-keyed `decoder` manifests are removed. Re-seed or re-run migrations so manifests include `from_layout_hash` / `to_layout_hash`. Register steps at build via `.migration_step::<From, To>()` when you need backup history replay without calling `migrate()` in the same session.
+Each `migrate_json` / `migrate_blob` call returns `Result<MigrateOutcome<T>>`:
+
+| Outcome | Meaning |
+|---------|---------|
+| `MigrateOutcome::Migrate(value)` | Write the transformed row |
+| `MigrateOutcome::Skip(reason)` | Omit this source row and continue (recorded in `MigrationReport::source_skipped`) |
+| `Err(...)` | Hard failure — stops the migration run |
+
+`TargetConflictPolicy::Skip` is separate: it skips rows whose **key already exists in the target table**, not rows you reject inside the transform.
+
+> **Breaking in 0.0.84:** `migrate_json` / `migrate_blob` now return `Result<MigrateOutcome<T>>` instead of `Result<T>`. Wrap successful values with `MigrateOutcome::Migrate(...)` or use the `migrate_value` / `skip_record` helpers.
 
 ```rust
 use std::path::PathBuf;
 use clove1db::migration::{
-    ExternalFrom, KeyDecoder, MigrateTo, MigrationTo, TargetConflictPolicy, ValueDecoder,
+    migrate_value, skip_record, ExternalFrom, KeyDecoder, MigrateOutcome, MigrateTo,
+    MigrationTo, TargetConflictPolicy, ValueDecoder,
 };
 use serde_json::Value;
 
 // 1) Implement the transform once
 impl MigrateTo<ProductV2> for ProductV1 {
-    fn migrate_json(value: Value) -> clove1db::units::Result<Value> {
+    fn migrate_json(value: Value) -> clove1db::units::Result<MigrateOutcome<Value>> {
         let v1: ProductV1 = serde_json::from_value(value)?;
-        Ok(serde_json::to_value(ProductV2 {
+        if v1.name.is_empty() {
+            return skip_record("empty name");
+        }
+        migrate_value(ProductV2 {
             id: v1.id,
             name: v1.name,
             sku: "SKU-default".into(),
             price_cents: 0,
-        })?)
+        })
     }
 }
 
