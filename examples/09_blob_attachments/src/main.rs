@@ -9,7 +9,7 @@ fn main() -> clove1db::units::Result<()> {
     let base = PathBuf::from(BASE_DIR);
     std::fs::create_dir_all(&base)?;
 
-    log::banner("clove1db 0.0.84 — Blob Sidecar Example 09");
+    log::banner("clove1db 0.0.91 — Blob Sidecar Example 09");
 
     scenarios::scenario_crud(&base)?;
     scenarios::scenario_scan(&base)?;

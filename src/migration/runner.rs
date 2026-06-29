@@ -4,8 +4,9 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::migration::batch::MigrationBatch;
-use crate::migration::decoder::MigrationRecordContext;
-use crate::migration::decoder::MigrationRecordResult;
+use crate::migration::decoder::{
+    storage_key_for_metadata, MigrationRecordContext, MigrationRecordResult,
+};
 use crate::migration::guard::{assert_target_available, check_compatible_overwrite};
 use crate::migration::layout::FieldLayout;
 use crate::migration::migrate_to::{MigrateTo, MigrationSourceType, MigrationTargetType};
@@ -23,6 +24,38 @@ use crate::repository::DatabaseManager;
 use crate::storage::Storage;
 use crate::units::{ClError, Result};
 
+/// One row staged during [`MigrationRun::dry_run`] and committed by [`MigrationRun::execute`].
+struct StagedRecord {
+    source_key: String,
+    storage_key: String,
+    metadata_bytes: Vec<u8>,
+    blob: Option<Vec<u8>>,
+    blob_sidecar_copy: bool,
+}
+
+/// Cached migration plan produced by `dry_run` and replayed by the next `execute`.
+struct PreparedMigration {
+    migration_id: String,
+    plan: MigrationPlan,
+    report: MigrationReport,
+    staged: Vec<StagedRecord>,
+    snapshot: Vec<(String, Vec<u8>)>,
+    storage_keys: Vec<String>,
+    source_entries: Vec<(String, Vec<u8>)>,
+    from_version: u32,
+    to_version: u32,
+    from_layout_hash: String,
+    to_layout_hash: String,
+}
+
+impl PreparedMigration {
+    fn is_executable(&self) -> bool {
+        self.report.errors.is_empty()
+            && self.report.conflicts.is_empty()
+            && !self.staged.is_empty()
+    }
+}
+
 pub struct MigrationRun<'a, F, T> {
     storage: Storage,
     registry: Arc<MigrationStepRegistry>,
@@ -30,6 +63,7 @@ pub struct MigrationRun<'a, F, T> {
     target: Option<MigrationTo>,
     conflict_policy: TargetConflictPolicy,
     blob_policy: BlobMigrationPolicy,
+    prepared: Option<PreparedMigration>,
     _from: PhantomData<F>,
     _to: PhantomData<T>,
     _lifetime: PhantomData<&'a ()>,
@@ -50,6 +84,7 @@ where
             target: None,
             conflict_policy: TargetConflictPolicy::Fail,
             blob_policy: BlobMigrationPolicy::default(),
+            prepared: None,
             _from: PhantomData,
             _to: PhantomData,
             _lifetime: PhantomData,
@@ -59,6 +94,7 @@ where
     pub fn from(self, from: MigrationFrom) -> Self {
         Self {
             source: Some(MigrationSource::Clove(from)),
+            prepared: None,
             ..self
         }
     }
@@ -73,17 +109,23 @@ where
     pub fn from_external(self, external: ExternalFrom) -> Self {
         Self {
             source: Some(MigrationSource::External(external)),
+            prepared: None,
             ..self
         }
     }
 
     pub fn to(self, target: MigrationTo) -> Self {
-        Self { target: Some(target), ..self }
+        Self {
+            target: Some(target),
+            prepared: None,
+            ..self
+        }
     }
 
     pub fn on_target_conflict(self, policy: TargetConflictPolicy) -> Self {
         Self {
             conflict_policy: policy,
+            prepared: None,
             ..self
         }
     }
@@ -91,6 +133,7 @@ where
     pub fn blob_policy(self, policy: BlobMigrationPolicy) -> Self {
         Self {
             blob_policy: policy,
+            prepared: None,
             ..self
         }
     }
@@ -120,12 +163,40 @@ where
         Ok(report)
     }
 
-    pub fn dry_run(&self) -> Result<MigrationReport> {
-        self.run(true)
+    /// Simulates the migration, caches staged rows, and returns a report.
+    ///
+    /// The next [`execute`](Self::execute) on the **same** [`MigrationRun`] commits the cached
+    /// rows without re-reading the source or re-running transforms.
+    pub fn dry_run(&mut self) -> Result<MigrationReport> {
+        let prepared = self.prepare()?;
+        let report = prepared.report.clone();
+        if prepared.is_executable() {
+            self.prepared = Some(prepared);
+        }
+        Ok(report)
     }
 
-    pub fn execute(&self) -> Result<MigrationResult> {
-        let report = self.run(false)?;
+    /// Commits the migration. Reuses rows staged by [`dry_run`](Self::dry_run) when present;
+    /// otherwise reads the source and migrates in one pass.
+    pub fn execute(&mut self) -> Result<MigrationResult> {
+        let report = if let Some(prepared) = self.prepared.take() {
+            if !prepared.is_executable() {
+                return Err(ClError::MigrationError(
+                    "cached dry_run cannot be executed (conflicts or errors)".into(),
+                ));
+            }
+            self.commit_prepared(prepared)?
+        } else {
+            let prepared = self.prepare()?;
+            if !prepared.is_executable() {
+                return Ok(MigrationResult {
+                    migration_id: prepared.migration_id,
+                    records_migrated: 0,
+                    report: prepared.report,
+                });
+            }
+            self.commit_prepared(prepared)?
+        };
         Ok(MigrationResult {
             migration_id: report.migration_id.clone(),
             records_migrated: report.would_insert + report.would_overwrite,
@@ -144,7 +215,7 @@ where
         plan.to.storage = target_db.table_storage_mode(&plan.to.table);
     }
 
-    fn run(&self, dry_run: bool) -> Result<MigrationReport> {
+    fn prepare(&self) -> Result<PreparedMigration> {
         let source = self
             .source
             .as_ref()
@@ -153,7 +224,7 @@ where
         let mut plan = resolve_plan(source, self.target.as_ref())?;
         self.enrich_plan_storage(&mut plan);
         let migration_id = format!("mig-{}", &Uuid::new_v4().to_string()[..8]);
-        let mut report = MigrationReport::new(migration_id.clone(), dry_run);
+        let mut report = MigrationReport::new(migration_id.clone(), true);
         report.from_storage = Some(plan.from.storage);
         report.to_storage = Some(plan.to.storage);
 
@@ -184,25 +255,19 @@ where
             .as_ref()
             .map(|e| e.value_decoder)
             .unwrap_or(crate::migration::types::ValueDecoder::JsonValidate);
-        let source_db = if plan.from.db != "external" {
-            Some(self.storage.db_manager(&plan.from.db).clone())
-        } else {
-            None
-        };
 
-        let mut batch = MigrationBatch::new();
+        let mut staged = Vec::new();
         let mut snapshot = Vec::new();
-        let mut pending_blobs: Vec<(String, Vec<u8>)> = Vec::new();
-        let mut pending_copies: Vec<(String, String)> = Vec::new();
+        let mut storage_keys = Vec::new();
 
         for (key, bytes) in &entries {
-                let ctx = MigrationRecordContext {
-                    key: key.clone(),
-                    from_storage: plan.from.storage,
-                    to_storage: plan.to.storage,
-                    is_external,
-                    value_decoder,
-                };
+            let ctx = MigrationRecordContext {
+                key: key.clone(),
+                from_storage: plan.from.storage,
+                to_storage: plan.to.storage,
+                is_external,
+                value_decoder,
+            };
             let record_result = decoder.migrate_record(&ctx, bytes)?;
             let migrated = match record_result {
                 MigrationRecordResult::Skip { reason } => {
@@ -215,14 +280,16 @@ where
                 }
                 MigrationRecordResult::Migrated(migrated) => migrated,
             };
-            let exists = target_db.get_raw(&plan.to.table, key)?.is_some();
+            let storage_key = storage_key_for_metadata(&migrated.metadata_bytes, key);
+
+            let exists = target_db.get_raw(&plan.to.table, &storage_key)?.is_some();
 
             if exists && !in_place {
                 match self.conflict_policy {
                     TargetConflictPolicy::Fail => {
                         report.conflicts.push(ConflictEntry {
                             table: plan.to.table.clone(),
-                            key: key.clone(),
+                            key: storage_key.clone(),
                             policy: self.conflict_policy,
                         });
                         continue;
@@ -236,7 +303,7 @@ where
                     }
                     TargetConflictPolicy::OverwriteIfCompatible => {
                         let existing = target_db
-                            .get_raw(&plan.to.table, key)?
+                            .get_raw(&plan.to.table, &storage_key)?
                             .unwrap_or_default();
                         if !check_compatible_overwrite(
                             &existing,
@@ -245,7 +312,7 @@ where
                         )? {
                             report.conflicts.push(ConflictEntry {
                                 table: plan.to.table.clone(),
-                                key: key.clone(),
+                                key: storage_key.clone(),
                                 policy: self.conflict_policy,
                             });
                             continue;
@@ -259,56 +326,109 @@ where
                 report.would_insert += 1;
             }
 
-            if !dry_run {
-                snapshot.push((key.clone(), migrated.metadata_bytes.clone()));
-            }
+            snapshot.push((storage_key.clone(), migrated.metadata_bytes.clone()));
+            storage_keys.push(storage_key.clone());
 
-            batch.stage_write(&plan.to.table, key, migrated.metadata_bytes);
-
-            if plan.from.storage == TableStorageMode::BlobSidecar
-                && plan.to.storage == TableStorageMode::BlobSidecar
-            {
-                if !dry_run {
-                    pending_copies.push((key.clone(), key.clone()));
-                }
+            let blob_sidecar_copy = plan.from.storage == TableStorageMode::BlobSidecar
+                && plan.to.storage == TableStorageMode::BlobSidecar;
+            if blob_sidecar_copy {
                 report.blobs_copied += 1;
             } else if plan.to.storage == TableStorageMode::BlobSidecar {
-                if let Some(blob) = migrated.blob {
-                    if !dry_run {
-                        pending_blobs.push((key.clone(), blob));
-                    }
+                if migrated.blob.is_some() {
                     report.blobs_written += 1;
                 }
             }
 
-            if !dry_run && batch.write_count() >= self.blob_policy.batch_size {
-                Self::flush_batch(
-                    &mut batch,
-                    &target_db,
-                    source_db.as_ref(),
-                    &plan,
-                    &mut pending_blobs,
-                    &mut pending_copies,
-                )?;
-            }
+            staged.push(StagedRecord {
+                source_key: key.clone(),
+                storage_key,
+                metadata_bytes: migrated.metadata_bytes,
+                blob: migrated.blob,
+                blob_sidecar_copy,
+            });
         }
 
         if !report.conflicts.is_empty()
             && matches!(self.conflict_policy, TargetConflictPolicy::Fail)
         {
-            return Ok(report);
+            report.would_delete_old_db = plan.effective_delete_source;
+            return Ok(PreparedMigration {
+                migration_id,
+                plan,
+                report,
+                staged,
+                snapshot,
+                storage_keys,
+                source_entries: entries,
+                from_version,
+                to_version,
+                from_layout_hash,
+                to_layout_hash,
+            });
         }
 
-        if batch.write_count() == 0 && report.would_skip == report.source_count {
+        if staged.is_empty() && report.would_skip == report.source_count {
             report
                 .errors
                 .push("no records to migrate after conflict resolution".into());
-            return Ok(report);
         }
 
-        if dry_run {
-            report.would_delete_old_db = plan.effective_delete_source;
-            return Ok(report);
+        report.would_delete_old_db = plan.effective_delete_source;
+        Ok(PreparedMigration {
+            migration_id,
+            plan,
+            report,
+            staged,
+            snapshot,
+            storage_keys,
+            source_entries: entries,
+            from_version,
+            to_version,
+            from_layout_hash,
+            to_layout_hash,
+        })
+    }
+
+    fn commit_prepared(&self, mut prepared: PreparedMigration) -> Result<MigrationReport> {
+        if prepared.staged.is_empty() {
+            prepared.report.dry_run = false;
+            return Ok(prepared.report);
+        }
+
+        let plan = &prepared.plan;
+        let target_db = self.storage.db_manager(&plan.to.db).clone();
+        let source_db = if plan.from.db != "external" {
+            Some(self.storage.db_manager(&plan.from.db).clone())
+        } else {
+            None
+        };
+
+        let mut batch = MigrationBatch::new();
+        let mut pending_blobs: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut pending_copies: Vec<(String, String)> = Vec::new();
+
+        for record in &prepared.staged {
+            batch.stage_write(
+                &plan.to.table,
+                &record.storage_key,
+                record.metadata_bytes.clone(),
+            );
+            if record.blob_sidecar_copy {
+                pending_copies.push((record.source_key.clone(), record.storage_key.clone()));
+            } else if let Some(blob) = &record.blob {
+                pending_blobs.push((record.storage_key.clone(), blob.clone()));
+            }
+
+            if batch.write_count() >= self.blob_policy.batch_size {
+                Self::flush_batch(
+                    &mut batch,
+                    &target_db,
+                    source_db.as_ref(),
+                    plan,
+                    &mut pending_blobs,
+                    &mut pending_copies,
+                )?;
+            }
         }
 
         if batch.write_count() > 0 {
@@ -316,14 +436,17 @@ where
                 &mut batch,
                 &target_db,
                 source_db.as_ref(),
-                &plan,
+                plan,
                 &mut pending_blobs,
                 &mut pending_copies,
             )?;
         }
 
-        let keys: Vec<String> = entries.iter().map(|(k, _)| k.clone()).collect();
-        let max_version = self.max_backup_version(&target_db, &plan.to.table, &keys)?;
+        let max_version = self.max_backup_version(
+            &target_db,
+            &plan.to.table,
+            &prepared.storage_keys,
+        )?;
 
         let table_rename = if plan.from.table != plan.to.table && plan.from.db == plan.to.db {
             Some(TableRenameInfo {
@@ -335,6 +458,7 @@ where
             None
         };
 
+        let migration_id = prepared.migration_id.clone();
         let manifest = MigrationManifest {
             migration_id: migration_id.clone(),
             parent_migration_id: target_db.migration_index().ok().and_then(|i| {
@@ -348,13 +472,13 @@ where
                 db: plan.from.db.clone(),
                 table: plan.from.table.clone(),
                 schema_id: plan.from.table.clone(),
-                schema_version: from_version,
+                schema_version: prepared.from_version,
             },
             to: SchemaRef {
                 db: plan.to.db.clone(),
                 table: plan.to.table.clone(),
                 schema_id: plan.to.table.clone(),
-                schema_version: to_version,
+                schema_version: prepared.to_version,
             },
             version_scope: VersionScope {
                 backup_versions_from: 1,
@@ -362,14 +486,15 @@ where
                 scope_table: plan.from.table.clone(),
                 primary_snapshot_ref: Some(format!("primary_before_{migration_id}")),
             },
-            from_layout_hash,
-            to_layout_hash,
+            from_layout_hash: prepared.from_layout_hash.clone(),
+            to_layout_hash: prepared.to_layout_hash.clone(),
             target_conflict_policy: self.conflict_policy,
             table_rename,
             field_diff: None,
         };
 
-        let new_layout = snapshot
+        let new_layout = prepared
+            .snapshot
             .first()
             .and_then(|(_, bytes)| FieldLayout::capture_from_sample_json(bytes).ok())
             .or_else(|| FieldLayout::capture_from_sample_json(&[]).ok());
@@ -377,13 +502,13 @@ where
         target_db.append_migration(
             &plan.to.table,
             manifest,
-            Some(&snapshot),
+            Some(&prepared.snapshot),
             new_layout.as_ref(),
         )?;
 
         if plan.effective_delete_source {
             if let Some(source_db) = source_db {
-                for (key, _) in &entries {
+                for (key, _) in &prepared.source_entries {
                     if self.blob_policy.delete_source_blobs
                         && plan.from.storage == TableStorageMode::BlobSidecar
                     {
@@ -397,8 +522,9 @@ where
             }
         }
 
-        report.would_delete_old_db = plan.effective_delete_source;
-        Ok(report)
+        prepared.report.dry_run = false;
+        prepared.report.would_delete_old_db = plan.effective_delete_source;
+        Ok(prepared.report)
     }
 
     fn resolve_from_version(&self, plan: &MigrationPlan) -> Result<u32> {
@@ -484,5 +610,180 @@ where
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::entity::Entity;
+    use crate::migration::migrate_to::{migrate_value, MigrateOutcome, MigrateTo};
+    use crate::storage::{DatabaseConfig, Storage, StorageConfig};
+    use serde::{Deserialize, Serialize};
+    use serde_json::Value;
+    use std::path::PathBuf;
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    struct LegacyWalletRow {
+        profit: f64,
+    }
+
+    impl Entity for LegacyWalletRow {
+        fn entity_id(&self) -> &str {
+            "legacy"
+        }
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    struct WalletRow {
+        id: String,
+        product_id: String,
+        profit: f64,
+    }
+
+    impl Entity for WalletRow {
+        fn entity_id(&self) -> &str {
+            &self.id
+        }
+    }
+
+    impl MigrateTo<WalletRow> for LegacyWalletRow {
+        fn migrate_json(value: Value) -> Result<MigrateOutcome<Value>> {
+            let row: LegacyWalletRow = serde_json::from_value(value)?;
+            migrate_value(WalletRow {
+                id: "30657".into(),
+                product_id: "13152".into(),
+                profit: row.profit,
+            })
+        }
+    }
+
+    /// Regression: migration must write under entity `id`, not the legacy source key.
+    #[test]
+    fn migration_uses_entity_id_as_storage_key() {
+        let dir = PathBuf::from("./target/test_migration_storage_key");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let storage = Storage::builder(StorageConfig::default())
+            .migration_step::<LegacyWalletRow, WalletRow>()
+            .add_database(
+                DatabaseConfig::new("legacy", "legacy")
+                    .dir_path(dir.join("legacy"))
+                    .has_cache(false)
+                    .register::<LegacyWalletRow>("products"),
+            )
+            .add_database(
+                DatabaseConfig::new("wallets", "wallets")
+                    .dir_path(dir.join("wallets"))
+                    .has_cache(false)
+                    .register::<WalletRow>("wallets"),
+            )
+            .build()
+            .unwrap();
+
+        let legacy_db = storage.db_manager("legacy");
+        let legacy_bytes =
+            serde_json::to_vec(&LegacyWalletRow { profit: 945.0 }).unwrap();
+        legacy_db
+            .commit_batch(
+                &[(
+                    "products".to_string(),
+                    "13152".to_string(),
+                    legacy_bytes,
+                )],
+                &[],
+            )
+            .unwrap();
+
+        let mut run = storage
+            .migrate::<LegacyWalletRow, WalletRow>()
+            .from_db("legacy", "products")
+            .to(MigrationTo::new("wallets").table("wallets"))
+            .on_target_conflict(TargetConflictPolicy::Skip);
+
+        run.dry_run().unwrap();
+        run.execute().unwrap();
+
+        let wallets_db = storage.db_manager("wallets");
+        assert!(
+            wallets_db.get_raw("wallets", "30657").unwrap().is_some(),
+            "row must be stored under wallet.id"
+        );
+        assert!(
+            wallets_db.get_raw("wallets", "13152").unwrap().is_none(),
+            "legacy product_id must not be used as redb key"
+        );
+
+        let entries = wallets_db.list_entries("wallets").unwrap();
+        assert_eq!(entries.len(), 1);
+        let meta: WalletRow = serde_json::from_slice(&entries[0].1).unwrap();
+        assert_eq!(meta.id, "30657");
+        assert_eq!(entries[0].0, "30657");
+
+        storage
+            .domain::<WalletRow>()
+            .repo()
+            .set(
+                "30657",
+                &WalletRow {
+                    id: "30657".into(),
+                    product_id: "13152".into(),
+                    profit: 0.0,
+                },
+            )
+            .unwrap();
+
+        let entries = wallets_db.list_entries("wallets").unwrap();
+        assert_eq!(entries.len(), 1, "update must replace in place, not duplicate");
+    }
+
+    #[test]
+    fn dry_run_then_execute_reuses_same_migration_id() {
+        let dir = PathBuf::from("./target/test_migration_dry_run_execute");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let storage = Storage::builder(StorageConfig::default())
+            .migration_step::<LegacyWalletRow, WalletRow>()
+            .add_database(
+                DatabaseConfig::new("legacy", "legacy")
+                    .dir_path(dir.join("legacy"))
+                    .has_cache(false)
+                    .register::<LegacyWalletRow>("products"),
+            )
+            .add_database(
+                DatabaseConfig::new("wallets", "wallets")
+                    .dir_path(dir.join("wallets"))
+                    .has_cache(false)
+                    .register::<WalletRow>("wallets"),
+            )
+            .build()
+            .unwrap();
+
+        let legacy_db = storage.db_manager("legacy");
+        legacy_db
+            .commit_batch(
+                &[(
+                    "products".to_string(),
+                    "13152".to_string(),
+                    serde_json::to_vec(&LegacyWalletRow { profit: 1.0 }).unwrap(),
+                )],
+                &[],
+            )
+            .unwrap();
+
+        let mut run = storage
+            .migrate::<LegacyWalletRow, WalletRow>()
+            .from_db("legacy", "products")
+            .to(MigrationTo::new("wallets").table("wallets"))
+            .on_target_conflict(TargetConflictPolicy::Skip);
+
+        let dry = run.dry_run().unwrap();
+        assert!(dry.dry_run);
+        assert_eq!(dry.would_insert, 1);
+
+        let result = run.execute().unwrap();
+        assert_eq!(result.migration_id, dry.migration_id);
+        assert!(!result.report.dry_run);
+        assert_eq!(result.records_migrated, 1);
     }
 }

@@ -82,6 +82,54 @@ pub(crate) fn ensure_meta_id(mut meta: Value, key: &str) -> Value {
     meta
 }
 
+/// redb storage key for a migrated row: `id` from metadata when present (matches
+/// `Domain::create` / `update`), otherwise the legacy source key.
+pub(crate) fn storage_key_for_metadata(metadata_bytes: &[u8], source_key: &str) -> String {
+    serde_json::from_slice::<Value>(metadata_bytes)
+        .ok()
+        .and_then(|v| v.as_object().cloned())
+        .and_then(|obj| {
+            obj.get("id").and_then(|id| match id {
+                Value::String(s) if !s.is_empty() => Some(s.clone()),
+                _ => None,
+            })
+        })
+        .unwrap_or_else(|| source_key.to_string())
+}
+
+#[cfg(test)]
+mod storage_key_tests {
+    use super::*;
+
+    #[test]
+    fn uses_entity_id_when_present() {
+        let meta = serde_json::json!({"id": "30657", "product_id": "13152"});
+        let key = storage_key_for_metadata(&serde_json::to_vec(&meta).unwrap(), "13152");
+        assert_eq!(key, "30657");
+    }
+
+    #[test]
+    fn falls_back_to_source_key_when_id_missing() {
+        let meta = serde_json::json!({"name": "test"});
+        let key = storage_key_for_metadata(&serde_json::to_vec(&meta).unwrap(), "13152");
+        assert_eq!(key, "13152");
+    }
+
+    #[test]
+    fn falls_back_when_id_empty() {
+        let meta = serde_json::json!({"id": ""});
+        let key = storage_key_for_metadata(&serde_json::to_vec(&meta).unwrap(), "13152");
+        assert_eq!(key, "13152");
+    }
+
+    #[test]
+    fn uses_source_key_when_ids_match() {
+        let meta = serde_json::json!({"id": "13152", "product_id": "13152"});
+        let key = storage_key_for_metadata(&serde_json::to_vec(&meta).unwrap(), "13152");
+        assert_eq!(key, "13152");
+    }
+}
+
 pub struct JsonPassthroughDecoder;
 
 impl SchemaDecoder for JsonPassthroughDecoder {

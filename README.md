@@ -20,7 +20,7 @@ An embedded database framework for Rust — built on [redb](https://github.com/c
 
 ```toml
 [dependencies]
-clove1db = "0.0.84"
+clove1db = "0.0.91"
 ```
 
 ## Quick Start

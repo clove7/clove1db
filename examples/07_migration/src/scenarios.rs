@@ -108,10 +108,10 @@ pub fn example_dry_run_v1_to_v2(storage: &Storage) -> Result<()> {
     log::banner("Example 2 — dry_run: ProductV1 → ProductV2");
 
     log::step("migrate::<ProductV1, ProductV2>: InPlace products@1 → @2");
-    let report = storage
+    let mut run = storage
         .migrate::<ProductV1, crate::product::ProductV2>()
-        .from_db("legacy", "products")
-        .dry_run()?;
+        .from_db("legacy", "products");
+    let report = run.dry_run()?;
 
     log::print_migration_report("dry_run report", &report);
     log::line("decoder adds: sku (from name slug), price_cents=9900");
@@ -366,12 +366,13 @@ pub fn example_conflict_skip(base: &PathBuf) -> Result<()> {
     log::kv("conflicting key", &imported.id);
     log::line("shop floor already owns this key with different ProductV2 JSON");
 
-    let report = storage
+    let mut run = storage
         .migrate::<ProductV1, crate::product::ProductV2>()
         .from_db("legacy_wh", "warehouse_products")
         .to(MigrationTo::new("shop").table("floor_products"))
-        .on_target_conflict(TargetConflictPolicy::Skip)
-        .dry_run()?;
+        .on_target_conflict(TargetConflictPolicy::Skip);
+
+    let report = run.dry_run()?;
 
     log::print_migration_report("Skip policy dry_run", &report);
 
@@ -429,19 +430,16 @@ pub fn example_external_redb_import(base: &PathBuf) -> Result<()> {
 
     log::step("dry_run: migrate::<ExternalCatalogRow, ProductV2> from external redb");
 
-    let dry = storage
-        .migrate::<ExternalCatalogRow, crate::product::ProductV2>()
-        .from_external(external.clone())
-        .to(MigrationTo::new("imported").table("products"))
-        .dry_run()?;
-    log::print_migration_report("external dry_run", &dry);
-
-    log::step("execute ExternalImport migration");
-    let result = storage
+    let mut run = storage
         .migrate::<ExternalCatalogRow, crate::product::ProductV2>()
         .from_external(external)
-        .to(MigrationTo::new("imported").table("products"))
-        .execute()?;
+        .to(MigrationTo::new("imported").table("products"));
+
+    let dry = run.dry_run()?;
+    log::print_migration_report("external dry_run", &dry);
+
+    log::step("execute ExternalImport migration (reuses staged dry_run rows)");
+    let result = run.execute()?;
 
     log::kv("migration_id", &result.migration_id);
     log::kv("records_migrated", result.records_migrated);
