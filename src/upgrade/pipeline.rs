@@ -11,8 +11,9 @@ use crate::migration::chain::DbMigrationIndex;
 use crate::migration::layout::FieldLayout;
 use crate::metadata::types::TableStorageMode;
 use crate::migration::types::migration_dir_name;
+use crate::durability::DurabilityMode;
 use crate::upgrade::backup_normalize::eager_normalize;
-use crate::upgrade::migration_refs::upgrade_migration_refs;
+use crate::upgrade::migration_refs::upgrade_migration_refs_with_durability;
 use crate::units::{ClError, Result};
 
 pub struct TableRegistration {
@@ -30,6 +31,7 @@ pub struct UpgradeInput<'a> {
     pub backup_enabled: bool,
     pub blob_enabled: bool,
     pub has_cache: bool,
+    pub durability: DurabilityMode,
 }
 
 pub struct UpgradeOutput {
@@ -95,7 +97,7 @@ impl OpenUpgradePipeline {
             if bp.exists() && input.backup_enabled && !meta.backup_upgraded {
                 let table_names: Vec<String> =
                     input.tables.iter().map(|t| t.name.to_string()).collect();
-                let result = eager_normalize(bp, &table_names, input.has_cache)?;
+                let result = eager_normalize(bp, &table_names, input.has_cache, input.durability)?;
                 if let Some(pre) = backup_path.as_ref().map(|p| pre_upgrade_path(p.as_path())) {
                     if pre.exists() && result.pre_upgrade_removed {
                         meta.backup_pre_upgrade_path = None;
@@ -117,7 +119,8 @@ impl OpenUpgradePipeline {
             }
         }
 
-        let refs_upgraded = upgrade_migration_refs(&migration_dir)?;
+        let refs_upgraded =
+            upgrade_migration_refs_with_durability(&migration_dir, input.durability)?;
         if refs_upgraded > 0 {
             meta.push_log(
                 "migration_refs_upgrade",
@@ -126,8 +129,12 @@ impl OpenUpgradePipeline {
         }
 
         let table_names: Vec<String> = input.tables.iter().map(|t| t.name.clone()).collect();
-        let mut migration_index =
-            DbMigrationIndex::load(&db_dir, input.db_name, &table_names)?;
+        let mut migration_index = DbMigrationIndex::load_with_durability(
+            &db_dir,
+            input.db_name,
+            &table_names,
+            input.durability,
+        )?;
 
         let mut table_layouts = HashMap::new();
         for reg in input.tables {

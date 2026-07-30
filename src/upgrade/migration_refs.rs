@@ -1,10 +1,19 @@
 use std::fs;
 use std::path::Path;
 
+use crate::durability::DurabilityMode;
+use crate::fsutil::write_atomic;
 use crate::units::{ClError, Result};
 
 /// Ensures `.migration/*/refs/*.json` snapshot files are valid JSON arrays of (key, hex-bytes).
 pub fn upgrade_migration_refs(migration_dir: &Path) -> Result<usize> {
+    upgrade_migration_refs_with_durability(migration_dir, DurabilityMode::Strict)
+}
+
+pub fn upgrade_migration_refs_with_durability(
+    migration_dir: &Path,
+    durability: DurabilityMode,
+) -> Result<usize> {
     if !migration_dir.exists() {
         return Ok(0);
     }
@@ -33,7 +42,7 @@ pub fn upgrade_migration_refs(migration_dir: &Path) -> Result<usize> {
             let normalized = normalize_ref_json(&parsed)?;
             let out = serde_json::to_string_pretty(&normalized)?;
             if out != data {
-                fs::write(&path, out)?;
+                write_atomic(&path, out.as_bytes(), durability)?;
                 upgraded += 1;
             }
         }

@@ -27,6 +27,9 @@ pub enum ClError {
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 
+    #[error("corrupt migration index at '{path}': {detail}")]
+    CorruptMigrationIndex { path: String, detail: String },
+
     #[error("Not found: {0}")]
     NotFound(String),
 

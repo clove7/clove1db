@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use crate::{
     domain::Domain,
+    durability::{DurabilityMode, DEFAULT_MAX_COMMIT_BATCH_ENTRIES},
     entity::Entity,
     metadata::types::TableStorageMode,
 
@@ -224,6 +225,11 @@ pub struct DatabaseConfig {
     backup_enabled: bool,
 
     blob_enabled: bool,
+
+    /// `None` means inherit from [`StorageConfig::durability`] at `add_database` time.
+    durability: Option<DurabilityMode>,
+
+    max_commit_batch_entries: usize,
 }
 
 
@@ -256,6 +262,10 @@ impl DatabaseConfig {
 
             blob_enabled: false,
 
+            durability: None,
+
+            max_commit_batch_entries: DEFAULT_MAX_COMMIT_BATCH_ENTRIES,
+
         }
 
     }
@@ -271,6 +281,16 @@ impl DatabaseConfig {
 
         self
 
+    }
+
+    pub fn durability(mut self, mode: DurabilityMode) -> Self {
+        self.durability = Some(mode);
+        self
+    }
+
+    pub fn max_commit_batch_entries(mut self, max: usize) -> Self {
+        self.max_commit_batch_entries = max.max(1);
+        self
     }
 
 
@@ -377,6 +397,8 @@ pub struct StorageConfig {
 
     dir_path: PathBuf,
 
+    durability: DurabilityMode,
+
 }
 
 
@@ -402,6 +424,8 @@ impl StorageConfig {
             name: "storage".to_string(),
 
             dir_path,
+
+            durability: DurabilityMode::Strict,
 
         }
 
@@ -435,6 +459,11 @@ impl StorageConfig {
 
         self
 
+    }
+
+    pub fn durability(mut self, mode: DurabilityMode) -> Self {
+        self.durability = mode;
+        self
     }
 
 }
@@ -512,6 +541,10 @@ impl StorageBuilder {
 
             config.backup_dir_path = Some(config.dir_path.clone());
 
+        }
+
+        if config.durability.is_none() {
+            config.durability = Some(self.storage_config.durability);
         }
 
         self.database_configs.push(config);
@@ -599,6 +632,8 @@ impl StorageBuilder {
 
                 has_cache: config.has_cache,
 
+                durability: config.durability.unwrap_or(DurabilityMode::Strict),
+
             })?;
 
 
@@ -618,6 +653,8 @@ impl StorageBuilder {
                 .iter()
                 .map(|f| (f.table_name().to_string(), f.storage()))
                 .collect();
+
+            let durability = config.durability.unwrap_or(DurabilityMode::Strict);
 
             let db_manager = DatabaseManager::open(
 
@@ -646,6 +683,10 @@ impl StorageBuilder {
                 upgrade.table_layouts,
 
                 migration_registry.clone(),
+
+                durability,
+
+                config.max_commit_batch_entries,
 
             )?;
 

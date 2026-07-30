@@ -15,13 +15,48 @@ An embedded database framework for Rust — built on [redb](https://github.com/c
 - 🔄 **Migrations**: In-place evolve, cross-DB transfer, external redb import, per-table migration chains
 - 🏷️ **Metadata & Auto-Upgrade**: `_clove_meta` inside `.cldb`, automatic upgrade from legacy eras on `build()`
 - 🔍 **Inspect**: Classify `.cldb` files (`Legacy042`, `Clove049`, `Authenticated`, `ExternalRedb`, …) without opening `Storage`
+- 🛡️ **Durability**: Default `DurabilityMode::Strict` — atomic sidecar writes (tmp→rename), `fsync` in Strict, `redb::Durability::Immediate`, corrupt migration-index recovery, chunked commit batches
 
 ## Install
 
 ```toml
 [dependencies]
-clove1db = "0.0.91"
+clove1db = "0.0.98"
 ```
+
+## Durability
+
+By default clove1db runs in **Strict** mode:
+
+- Sidecar files (`*.migration/**/index.json`, layouts, manifests, blobs) are always written via atomic tmp→rename (both Strict and Fast), so a crash never leaves a final path half-filled with NULs.
+- **Strict** also `sync_all`s sidecar files and sets `redb::Durability::Immediate` on commits (independent of cache).
+- **Fast** skips fsync / Immediate for throughput; still atomic.
+- Corrupt / zeroed migration indexes are quarantined and rebuilt on open (not a fatal `Serialization` panic).
+- Large `commit_batch` calls are split by `max_commit_batch_entries` (default 512).
+
+```rust
+use clove1db::{storage::{DatabaseConfig, Storage, StorageConfig}, DurabilityMode};
+
+// Default: Strict for every database
+Storage::builder(StorageConfig::default())
+    .add_database(DatabaseConfig::new("app_db", "app").register::<User>("users"))
+    .build()?;
+
+// Whole storage on Fast
+Storage::builder(StorageConfig::default().durability(DurabilityMode::Fast))
+    ...
+
+// One database Fast, others Strict
+Storage::builder(StorageConfig::default())
+    .add_database(DatabaseConfig::new("hot", "hot").durability(DurabilityMode::Fast).register::<User>("users"))
+    .add_database(DatabaseConfig::new("cold", "cold").register::<User>("users"))
+    .build()?;
+```
+
+**Guarantees:** crash-consistent sidecar files; last successfully committed redb transaction survives Strict flush; open succeeds after NUL index corruption.  
+**Not guaranteed:** uncommitted in-flight work after sudden power loss; absolute immunity without UPS/hardware.
+
+Extreme crash / pressure scenarios: `examples/10_crash_durability` (`cargo run --manifest-path examples/10_crash_durability/Cargo.toml`).
 
 ## Quick Start
 
@@ -297,7 +332,7 @@ cd clove1db/examples/01_basic_crud && cargo run
 | `07_migration` | In-place evolve, cross-DB move, external import, restore guards |
 | `08_inspect_upgrade` | Era fixtures (0.0.42 / 0.0.49 / 0.0.70), upgrade pipeline |
 | `09_blob_attachments` | Blob sidecar CRUD, migration scan, external→blob, inline→blob |
-| `09_blob_attachments` | Blob sidecar CRUD, migration scan, external→blob, inline→blob |
+| `10_crash_durability` | Strict durability: crash inject, NUL index recovery, RAM pressure |
 
 ## Contributing
 

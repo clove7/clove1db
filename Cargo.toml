@@ -1,6 +1,6 @@
 [package]
 name = "clove1db"
-version = "0.0.91"
+version = "0.0.98"
 edition = "2024"
 license = "MIT"
 authors = ["clove7"]
@@ -11,13 +11,17 @@ categories = ["database", "database-implementations", "caching"]
 readme = "README.md"
 exclude = ["examples/**"]
 
+[features]
+default = []
+# Process-exit crash points for durability examples/tests (CLOVE_CRASH_POINT=...).
+crash-inject = []
 
 [dependencies]
 chrono = "0.4.45"
 itertools = "0.15.0"
 moka = { version = "0.12.15", features = ["sync"] }
 redb = "4.1.0"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
-thiserror = "2.0.18"
-uuid = { version = "1.23.3", features = ["v4"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.19"
+uuid = { version = "1.24.0", features = ["v4"] }

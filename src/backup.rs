@@ -3,12 +3,13 @@
 pub mod view;
 
 use crate::backup::view::{BackupRecordView, HistoryDisplayMode, RecordData};
+use crate::durability::DurabilityMode;
 use crate::migration::chain::DbMigrationIndex;
 use crate::migration::step_registry::MigrationStepRegistry;
 use crate::units::ClError;
 use crate::units::Result;
 use chrono::Local;
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -60,10 +61,11 @@ pub struct BulkRecord {
 pub struct BackupManager {
     pub db: Arc<Database>,
     has_cache: bool,
+    durability: DurabilityMode,
 }
 
 impl BackupManager {
-    pub fn new(path: &PathBuf, has_cache: bool) -> Result<Self> {
+    pub fn new(path: &PathBuf, has_cache: bool, durability: DurabilityMode) -> Result<Self> {
         // Last version in any table — we will search later when using
         // The tables are created in DatabaseManager::new() ✅
         let db =
@@ -71,7 +73,15 @@ impl BackupManager {
         Ok(Self {
             db: db.clone(),
             has_cache,
+            durability,
         })
+    }
+
+    fn apply_txn_durability(&self, write_txn: &mut redb::WriteTransaction) -> Result<()> {
+        if self.durability.is_strict() {
+            write_txn.set_durability(Durability::Immediate)?;
+        }
+        Ok(())
     }
 
     pub fn init_table(&self, table_name: &str) -> Result<()> {
@@ -220,7 +230,8 @@ impl BackupManager {
 
             let rk = format!("{}:{}", entry.key, new_version);
             let rdata = serde_json::to_vec(&restore_record)?;
-            let write_txn = self.db.begin_write()?;
+            let mut write_txn = self.db.begin_write()?;
+            self.apply_txn_durability(&mut write_txn)?;
             {
                 if self.has_cache {
                     let mut tbl = write_txn.open_table(table)?;
@@ -335,7 +346,8 @@ impl BackupManager {
 
         let ver_table: TableDefinition<&str, u64> = TableDefinition::new(ver_name.as_str());
 
-        let write_txn = self.db.begin_write()?;
+        let mut write_txn = self.db.begin_write()?;
+        self.apply_txn_durability(&mut write_txn)?;
         let new_version = {
             let mut tbl = write_txn.open_table(ver_table)?;
             let current = tbl.get(key)?.map(|v| v.value()).unwrap_or(0);
@@ -359,7 +371,8 @@ impl BackupManager {
         let backup_key = format!("{}:{}", key, version);
         let data = serde_json::to_vec(record)?;
 
-        let write_txn = self.db.begin_write()?;
+        let mut write_txn = self.db.begin_write()?;
+        self.apply_txn_durability(&mut write_txn)?;
         {
             if self.has_cache {
                 let mut tbl = write_txn.open_table(table)?;
@@ -399,7 +412,8 @@ impl BackupManager {
             let bulk_name = bulk_table_name(table_name);
             let bulk_table: TableDefinition<&str, &[u8]> = TableDefinition::new(bulk_name.as_str());
             let data = serde_json::to_vec(&record)?;
-            let write_txn = self.db.begin_write()?;
+            let mut write_txn = self.db.begin_write()?;
+            self.apply_txn_durability(&mut write_txn)?;
             {
                 if self.has_cache {
                     let mut btbl = write_txn.open_table(bulk_table)?;

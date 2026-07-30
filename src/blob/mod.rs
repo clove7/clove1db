@@ -4,7 +4,6 @@ mod paths;
 mod tests;
 
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub use paths::{blob_path, blob_root, blob_table_dir};
@@ -14,6 +13,8 @@ pub fn blobs_root(db_dir: &Path, db_name: &str) -> PathBuf {
     blob_root(db_dir, db_name)
 }
 
+use crate::durability::DurabilityMode;
+use crate::fsutil::write_atomic;
 use crate::units::{ClError, Result};
 
 /// Per-database blob sidecar store rooted at `{db_dir}/{db_name}.blobs/`.
@@ -52,20 +53,18 @@ impl BlobStore {
     }
 
     pub fn write_atomic(&self, table: &str, id: &str, data: &[u8]) -> Result<()> {
+        self.write_atomic_with_mode(table, id, data, DurabilityMode::Strict)
+    }
+
+    pub fn write_atomic_with_mode(
+        &self,
+        table: &str,
+        id: &str,
+        data: &[u8],
+        mode: DurabilityMode,
+    ) -> Result<()> {
         let path = self.path(table, id);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| ClError::IoError(e.to_string()))?;
-        }
-        let tmp = path.with_extension("tmp");
-        {
-            let mut file = File::create(&tmp).map_err(|e| ClError::IoError(e.to_string()))?;
-            file.write_all(data)
-                .map_err(|e| ClError::IoError(e.to_string()))?;
-            file.sync_all()
-                .map_err(|e| ClError::IoError(e.to_string()))?;
-        }
-        fs::rename(&tmp, &path).map_err(|e| ClError::IoError(e.to_string()))?;
-        Ok(())
+        write_atomic(&path, data, mode)
     }
 
     pub fn open_read(&self, table: &str, id: &str) -> Result<File> {

@@ -53,6 +53,7 @@ mod tests {
             backup_enabled: false,
             blob_enabled: false,
             has_cache: true,
+            durability: crate::durability::DurabilityMode::Strict,
         })
         .unwrap();
 

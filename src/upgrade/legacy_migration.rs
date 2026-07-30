@@ -5,6 +5,8 @@ use std::path::Path;
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::durability::DurabilityMode;
+use crate::fsutil::write_atomic_json;
 use crate::migration::layout::FieldLayout;
 use crate::migration::types::{
     layout_path, migration_dir_name, table_chain_dir, DbMigrationRootIndex, MigrationIndexEntry,
@@ -62,6 +64,7 @@ pub fn upgrade_legacy_migration_index(
     db_dir: &Path,
     db_name: &str,
     registered_tables: &[String],
+    durability: DurabilityMode,
 ) -> Result<()> {
     let migration_dir = db_dir.join(migration_dir_name(db_name));
     let root_path = migration_dir.join("index.json");
@@ -128,9 +131,10 @@ pub fn upgrade_legacy_migration_index(
             fs::remove_dir_all(&new_mig_dir)?;
         }
         fs::rename(&old_mig_dir, &new_mig_dir)?;
-        fs::write(
-            new_mig_dir.join("manifest.json"),
-            serde_json::to_string_pretty(&new_manifest)?,
+        write_atomic_json(
+            &new_mig_dir.join("manifest.json"),
+            &new_manifest,
+            durability,
         )?;
 
         let chain = table_chains.get_mut(&table).ok_or_else(|| {
@@ -152,10 +156,7 @@ pub fn upgrade_legacy_migration_index(
         let chain = table_chains.get(table).unwrap();
         let table_dir = table_chain_dir(&migration_dir, table);
         fs::create_dir_all(&table_dir)?;
-        fs::write(
-            table_dir.join("index.json"),
-            serde_json::to_string_pretty(chain)?,
-        )?;
+        write_atomic_json(&table_dir.join("index.json"), chain, durability)?;
     }
 
     let mut summaries = HashMap::new();
@@ -176,7 +177,7 @@ pub fn upgrade_legacy_migration_index(
         db_name: legacy.db_name,
         tables: summaries,
     };
-    fs::write(root_path, serde_json::to_string_pretty(&root)?)?;
+    write_atomic_json(&root_path, &root, durability)?;
     Ok(())
 }
 
@@ -310,6 +311,7 @@ mod tests {
             &tmp,
             "retail",
             &["products".into(), "buyers".into()],
+            DurabilityMode::Strict,
         )
         .unwrap();
 

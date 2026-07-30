@@ -5,6 +5,8 @@ use crate::{
         BackupManager, BackupOperation, BackupRecord,
     },
     blob::BlobStore,
+    durability::{DurabilityMode, DEFAULT_MAX_COMMIT_BATCH_ENTRIES},
+    fsutil::maybe_crash,
     metadata::types::{TableStorageMode, META_TABLE},
     migration::chain::DbMigrationIndex,
     migration::layout::FieldLayout,
@@ -54,6 +56,12 @@ pub struct DatabaseManager {
     // Has cache
     has_cache: bool,
 
+    // Durability policy (independent of cache)
+    durability: DurabilityMode,
+
+    // Max entries per commit_batch chunk
+    max_commit_batch_entries: usize,
+
     // Blob sidecar storage
     blob_enabled: bool,
     table_storage: std::collections::HashMap<String, TableStorageMode>,
@@ -81,6 +89,8 @@ impl DatabaseManager {
         table_storage: std::collections::HashMap<String, TableStorageMode>,
         table_layouts: std::collections::HashMap<String, FieldLayout>,
         migration_registry: Arc<MigrationStepRegistry>,
+        durability: DurabilityMode,
+        max_commit_batch_entries: usize,
     ) -> Result<Self> {
         let dir = dir_path.join(dir_name);
         let backup_dir = if let Some(backup_dir_path) = backup_dir_path {
@@ -105,7 +115,7 @@ impl DatabaseManager {
         });
 
         let backup_manager = if let Some(backup_db_path) = backup_db_path {
-            let backup_manager = BackupManager::new(&backup_db_path, has_cache);
+            let backup_manager = BackupManager::new(&backup_db_path, has_cache, durability);
             if backup_manager.is_ok() {
                 Some(backup_manager.unwrap())
             } else {
@@ -147,8 +157,12 @@ impl DatabaseManager {
             year: now.year() as u32,
         };
 
-        let mut migration_index =
-            DbMigrationIndex::load(&dir_local.dir, db_name, &tables)?;
+        let mut migration_index = DbMigrationIndex::load_with_durability(
+            &dir_local.dir,
+            db_name,
+            &tables,
+            durability,
+        )?;
         for (table, layout) in &table_layouts {
             migration_index.ensure_table(table, layout)?;
         }
@@ -177,6 +191,8 @@ impl DatabaseManager {
             db_name: db_name.to_string(),
             tables_names: tables,
             has_cache,
+            durability,
+            max_commit_batch_entries: max_commit_batch_entries.max(1),
             blob_enabled,
             table_storage,
             blob_store,
@@ -215,6 +231,8 @@ impl DatabaseManager {
             table_storage,
             table_layouts,
             migration_registry,
+            DurabilityMode::Strict,
+            DEFAULT_MAX_COMMIT_BATCH_ENTRIES,
         )
     }
 
@@ -240,7 +258,22 @@ impl DatabaseManager {
     }
 
     pub fn write_blob(&self, table: &str, id: &str, data: &[u8]) -> Result<()> {
-        self.blob_store()?.write_atomic(table, id, data)
+        self.blob_store()?
+            .write_atomic_with_mode(table, id, data, self.durability)
+    }
+
+    pub fn durability(&self) -> DurabilityMode {
+        self.durability
+    }
+
+    fn apply_txn_durability(
+        &self,
+        write_txn: &mut redb::WriteTransaction,
+    ) -> Result<()> {
+        if self.durability.is_strict() {
+            write_txn.set_durability(Durability::Immediate)?;
+        }
+        Ok(())
     }
 
     pub fn open_blob(&self, table: &str, id: &str) -> Result<File> {
@@ -368,10 +401,34 @@ impl DatabaseManager {
         writes: &[(String, String, Vec<u8>)],
         deletes: &[(String, String)],
     ) -> Result<()> {
-        let mut write_txn = self.db.begin_write()?;
-        if !self.has_cache {
-            write_txn.set_durability(Durability::Immediate)?;
+        let limit = self.max_commit_batch_entries;
+        let total = writes.len() + deletes.len();
+        if total > limit {
+            let mut w_offset = 0usize;
+            while w_offset < writes.len() {
+                let end = (w_offset + limit).min(writes.len());
+                self.commit_batch_chunk(&writes[w_offset..end], &[])?;
+                w_offset = end;
+            }
+            let mut d_offset = 0usize;
+            while d_offset < deletes.len() {
+                let end = (d_offset + limit).min(deletes.len());
+                self.commit_batch_chunk(&[], &deletes[d_offset..end])?;
+                d_offset = end;
+            }
+            return Ok(());
         }
+        self.commit_batch_chunk(writes, deletes)
+    }
+
+    fn commit_batch_chunk(
+        &self,
+        writes: &[(String, String, Vec<u8>)],
+        deletes: &[(String, String)],
+    ) -> Result<()> {
+        let mut write_txn = self.db.begin_write()?;
+        self.apply_txn_durability(&mut write_txn)?;
+        maybe_crash("before_commit");
 
         for (table_name, key, value) in writes {
             let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(table_name.as_str());
@@ -391,6 +448,7 @@ impl DatabaseManager {
         }
 
         write_txn.commit()?;
+        maybe_crash("after_commit");
 
         if self.has_cache {
             for (table_name, key, value) in writes {
@@ -414,32 +472,26 @@ impl DatabaseManager {
         key: &str,
         value: Vec<u8>,
     ) -> Result<()> {
-        if self.has_cache {
-            // Write to database (L2)
-            let write_txn = self.db.begin_write()?;
-            {
-                let mut table_ref = write_txn.open_table(table)?;
+        // Disk first (write-through), then cache.
+        let mut write_txn = self.db.begin_write()?;
+        self.apply_txn_durability(&mut write_txn)?;
+        {
+            let mut table_ref = write_txn.open_table(table)?;
+            if self.has_cache {
                 table_ref.insert(key, value.as_slice())?;
-            }
-            write_txn.commit()?;
-
-            // Write to cache (L1) - only after DB success
-            let cache_key = format!("{}:{}", table_name, key);
-            self.memory_cache.insert(cache_key, value.clone());
-        } else {
-            // Write to database (L2)
-            let mut write_txn = self.db.begin_write()?;
-            write_txn.set_durability(Durability::Immediate)?;
-            {
-                let mut table_ref = write_txn.open_table(table)?;
+            } else {
                 let mut slot = table_ref.insert_reserve(key, value.len())?;
                 slot.as_mut().copy_from_slice(&value);
             }
-            write_txn.commit()?;
+        }
+        write_txn.commit()?;
+
+        if self.has_cache {
+            let cache_key = format!("{}:{}", table_name, key);
+            self.memory_cache.insert(cache_key, value.clone());
         }
 
         if let Some(ref bm) = self.backup_manager {
-            // Step 3: Record write to backup (L3)
             bm.record_set(table, table_name, key, value)?;
         }
 
@@ -515,7 +567,8 @@ impl DatabaseManager {
 
         if found {
             // Step 1: Delete from database (L2)
-            let write_txn = self.db.begin_write()?;
+            let mut write_txn = self.db.begin_write()?;
+            self.apply_txn_durability(&mut write_txn)?;
             {
                 let mut table_ref = write_txn.open_table(table)?;
                 table_ref.remove(key)?;
@@ -582,12 +635,12 @@ impl DatabaseManager {
                     let data = data.clone().ok_or_else(|| ClError::OptionNone)?;
                     // Primary DB
                     let mut write_txn = self.db.begin_write()?;
-                    if self.has_cache {
-                        write_txn.open_table(table)?.insert(key, data.as_slice())?;
-                    } else {
-                        write_txn.set_durability(Durability::Immediate)?;
-                        {
-                            let mut table_ref = write_txn.open_table(table)?;
+                    self.apply_txn_durability(&mut write_txn)?;
+                    {
+                        let mut table_ref = write_txn.open_table(table)?;
+                        if self.has_cache {
+                            table_ref.insert(key, data.as_slice())?;
+                        } else {
                             let mut slot = table_ref.insert_reserve(key, data.len())?;
                             slot.as_mut().copy_from_slice(&data);
                         }
@@ -607,7 +660,8 @@ impl DatabaseManager {
 
             // Delete → Delete from Primary + Cache + log restore with None
             BackupOperation::Delete => {
-                let write_txn = self.db.begin_write()?;
+                let mut write_txn = self.db.begin_write()?;
+                self.apply_txn_durability(&mut write_txn)?;
                 {
                     write_txn.open_table(table)?.remove(key)?;
                 }
@@ -740,14 +794,12 @@ impl DatabaseManager {
             match data {
                 Some(d) => {
                     let mut write_txn = self.db.begin_write()?;
-                    if self.has_cache {
-                        write_txn
-                            .open_table(table)?
-                            .insert(key.as_str(), d.as_slice())?;
-                    } else {
-                        write_txn.set_durability(Durability::Immediate)?;
-                        {
-                            let mut table_ref = write_txn.open_table(table)?;
+                    self.apply_txn_durability(&mut write_txn)?;
+                    {
+                        let mut table_ref = write_txn.open_table(table)?;
+                        if self.has_cache {
+                            table_ref.insert(key.as_str(), d.as_slice())?;
+                        } else {
                             let mut slot = table_ref.insert_reserve(key.as_str(), d.len())?;
                             slot.as_mut().copy_from_slice(&d);
                         }
@@ -759,7 +811,8 @@ impl DatabaseManager {
                     }
                 }
                 None => {
-                    let write_txn = self.db.begin_write()?;
+                    let mut write_txn = self.db.begin_write()?;
+                    self.apply_txn_durability(&mut write_txn)?;
                     {
                         write_txn.open_table(table)?.remove(key.as_str())?;
                     }

@@ -4,6 +4,7 @@ use std::path::Path;
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::backup::{BackupRecord, BulkRecord};
+use crate::durability::DurabilityMode;
 use crate::metadata::inspect::{pre_upgrade_path, upgrading_path};
 use crate::upgrade::legacy_record::{canonical_bytes, parse_backup_value};
 use crate::units::{ClError, Result};
@@ -21,6 +22,7 @@ pub fn eager_normalize(
     backup_path: &Path,
     data_tables: &[String],
     has_cache: bool,
+    durability: DurabilityMode,
 ) -> Result<BackupNormalizeResult> {
     if !backup_path.exists() {
         return Ok(BackupNormalizeResult {
@@ -51,7 +53,7 @@ pub fn eager_normalize(
     }
     fs::copy(backup_path, &upgrading)?;
 
-    let (converted, skipped) = transform_database(&upgrading, data_tables, has_cache)?;
+    let (converted, skipped) = transform_database(&upgrading, data_tables, has_cache, durability)?;
 
     verify_normalized(&upgrading, data_tables)?;
 
@@ -119,6 +121,7 @@ fn transform_database(
     path: &Path,
     data_tables: &[String],
     has_cache: bool,
+    durability: DurabilityMode,
 ) -> Result<(usize, usize)> {
     let db = Database::open(path).map_err(|e| ClError::Database(redb::Error::from(e)))?;
     let mut converted = 0usize;
@@ -145,15 +148,15 @@ fn transform_database(
                 batch.push((key, bytes));
             }
             if batch.len() >= BATCH_SIZE {
-                write_batch(&db, table_name, &batch, has_cache)?;
+                write_batch(&db, table_name, &batch, has_cache, durability)?;
                 batch.clear();
             }
         }
         if !batch.is_empty() {
-            write_batch(&db, table_name, &batch, has_cache)?;
+            write_batch(&db, table_name, &batch, has_cache, durability)?;
         }
 
-        normalize_bulk_table(&db, &bulk_name, has_cache)?;
+        normalize_bulk_table(&db, &bulk_name, has_cache, durability)?;
         let _ = ver_name;
     }
 
@@ -180,10 +183,11 @@ fn write_batch(
     table_name: &str,
     batch: &[(String, Vec<u8>)],
     has_cache: bool,
+    durability: DurabilityMode,
 ) -> Result<()> {
     let table: TableDefinition<&str, &[u8]> = TableDefinition::new(table_name);
     let mut write_txn = db.begin_write()?;
-    if !has_cache {
+    if durability.is_strict() {
         write_txn.set_durability(Durability::Immediate)?;
     }
     {
@@ -201,7 +205,12 @@ fn write_batch(
     Ok(())
 }
 
-fn normalize_bulk_table(db: &Database, bulk_table_name: &str, has_cache: bool) -> Result<()> {
+fn normalize_bulk_table(
+    db: &Database,
+    bulk_table_name: &str,
+    has_cache: bool,
+    durability: DurabilityMode,
+) -> Result<()> {
     let read_txn = db.begin_read()?;
     let table: TableDefinition<&str, &[u8]> = TableDefinition::new(bulk_table_name);
     let Ok(table_ref) = read_txn.open_table(table) else {
@@ -229,7 +238,7 @@ fn normalize_bulk_table(db: &Database, bulk_table_name: &str, has_cache: bool) -
             });
         }
     }
-    write_batch(db, bulk_table_name, &batch, has_cache)
+    write_batch(db, bulk_table_name, &batch, has_cache, durability)
 }
 
 fn verify_normalized(backup_path: &Path, data_tables: &[String]) -> Result<()> {
