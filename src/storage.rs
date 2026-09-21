@@ -42,7 +42,14 @@ use crate::{
 
 
 
-const DEFAULT_CACHE_CAPACITY: u64 = 10_000;
+/// Default cache budget, in **bytes**.
+///
+/// This was `10_000` and meant *entries*, which is a number that cannot bound
+/// memory: the value is a `Vec<u8>` of whatever the caller stored. A production
+/// database whose rows carried a serialized snapshot each filled that cache with
+/// ~100 MiB. 32 MiB is a budget an operator can reason about without knowing
+/// how big a row happens to be.
+const DEFAULT_CACHE_BYTES: u64 = 32 * 1024 * 1024;
 
 const DEFAULT_CACHE_TTL: u64 = 300;
 
@@ -125,6 +132,46 @@ impl Storage {
         self.0.database_managers.values().collect()
 
     }
+
+
+    /// Reclaim expired cache entries across every database.
+    ///
+    /// `moka` expires entries on a clock but frees them during maintenance, and
+    /// maintenance runs when a cache is *used*. A database nobody has read since
+    /// its entries expired therefore still holds them — in one production run,
+    /// ~100 MiB outlived a five-minute TTL by thirteen hours, until the next
+    /// read happened to trigger housekeeping.
+    ///
+    /// Call this from an idle tick, a maintenance job, or before reporting
+    /// process memory, when "expired" should mean "gone".
+    pub fn run_cache_maintenance(&self) {
+
+        for db in self.db_list() {
+
+            db.run_cache_maintenance();
+
+        }
+
+    }
+
+
+
+    /// Total `(bytes, entries)` cached across every database.
+    ///
+    /// Call [`Self::run_cache_maintenance`] first for a figure that excludes
+    /// entries which have expired but not yet been reclaimed.
+    pub fn cache_stats(&self) -> (u64, u64) {
+
+        self.db_list().iter().fold((0, 0), |(b, e), db| {
+
+            let (db_b, db_e) = db.cache_stats();
+
+            (b + db_b, e + db_e)
+
+        })
+
+    }
+
 
 
 
@@ -214,7 +261,7 @@ pub struct DatabaseConfig {
 
     db_name: String,
 
-    cache_capacity: u64,
+    cache_bytes: u64,
 
     cache_ttl: u64,
 
@@ -250,7 +297,7 @@ impl DatabaseConfig {
 
             db_name: db_name.to_string(),
 
-            cache_capacity: DEFAULT_CACHE_CAPACITY,
+            cache_bytes: DEFAULT_CACHE_BYTES,
 
             cache_ttl: DEFAULT_CACHE_TTL,
 
@@ -340,9 +387,24 @@ impl DatabaseConfig {
 
 
 
-    pub fn cache(mut self, capacity: u64, ttl_secs: u64, idle_secs: u64) -> Self {
+    /// Cache this database, with a budget in **bytes**.
+    ///
+    /// Renamed from `cache(capacity, ..)`, which took a number of *entries*.
+    /// That rename is the point: the two arguments look identical at a call
+    /// site, so leaving the old name would have turned every `cache(10_000, ..)`
+    /// into a 10 KB cache without a word from the compiler. This way each call
+    /// site has to say what it meant.
+    ///
+    /// An entry count cannot bound memory. `10_000` entries of an unknown size
+    /// is an unknown, and in one production database it was ~100 MiB of run-log
+    /// rows that were read once during a range scan and never again.
+    ///
+    /// `ttl_secs` and `idle_secs` decide when an entry *expires*. They do not
+    /// decide when its memory comes back — see
+    /// [`DatabaseManager::run_cache_maintenance`].
+    pub fn cache_bytes(mut self, max_bytes: u64, ttl_secs: u64, idle_secs: u64) -> Self {
 
-        self.cache_capacity = capacity;
+        self.cache_bytes = max_bytes;
 
         self.cache_ttl = ttl_secs;
 
@@ -668,7 +730,7 @@ impl StorageBuilder {
 
                 tables,
 
-                config.cache_capacity,
+                config.cache_bytes,
 
                 config.cache_ttl,
 

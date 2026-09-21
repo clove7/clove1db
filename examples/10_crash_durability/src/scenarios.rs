@@ -111,7 +111,7 @@ fn report_dir(label: &str, dir: &Path) {
 fn orders_v1_storage(dir: PathBuf, backup: bool) -> Result<Storage> {
     let mut db = DatabaseConfig::new("orders_db", "orders")
         .dir_path(dir)
-        .cache(5_000, 120, 60)
+        .cache_bytes(16 * 1024 * 1024, 120, 60)
         .max_commit_batch_entries(128)
         .register::<OrderV1>("orders");
     if backup {
@@ -283,7 +283,7 @@ pub fn run_child(scenario: &str, base: &Path) -> Result<()> {
                     DatabaseConfig::new("compound_db", "compound")
                         .dir_path(dir)
                         .backup_enabled(true)
-                        .cache(256, 30, 10)
+                        .cache_bytes(1024 * 1024, 30, 10)
                         .max_commit_batch_entries(64)
                         .blob_enabled(false)
                         .register::<OrderV1>("orders"),
@@ -461,7 +461,7 @@ pub fn scenario_03_kill_multi_table_layout(base: &Path) -> Result<Duration> {
             DatabaseConfig::new("multi_db", "multi")
                 .dir_path(dir.clone())
                 .backup_enabled(true)
-                .cache(4_000, 90, 45)
+                .cache_bytes(16 * 1024 * 1024, 90, 45)
                 .max_commit_batch_entries(100)
                 .register::<OrderV1>("orders")
                 .register::<Device>("devices")
@@ -633,7 +633,7 @@ pub fn scenario_06_memory_pressure(base: &Path) -> Result<Duration> {
             DatabaseConfig::new("press_db", "press")
                 .dir_path(dir.clone())
                 .backup_enabled(true)
-                .cache(48, 15, 8)
+                .cache_bytes(256 * 1024, 15, 8)
                 .max_commit_batch_entries(24)
                 .register::<OrderV1>("orders"),
         )
@@ -665,7 +665,7 @@ pub fn scenario_06_memory_pressure(base: &Path) -> Result<Duration> {
             DatabaseConfig::new("press_db", "press")
                 .dir_path(dir.clone())
                 .backup_enabled(true)
-                .cache(48, 15, 8)
+                .cache_bytes(256 * 1024, 15, 8)
                 .max_commit_batch_entries(24)
                 .register::<OrderV1>("orders"),
         )
@@ -815,7 +815,7 @@ pub fn scenario_08_kill_during_migrate(base: &Path) -> Result<Duration> {
             DatabaseConfig::new("orders_db", "orders")
                 .dir_path(dir.clone())
                 .backup_enabled(true)
-                .cache(5_000, 120, 60)
+                .cache_bytes(16 * 1024 * 1024, 120, 60)
                 .max_commit_batch_entries(128)
                 .register::<OrderV2>("orders"),
         )
@@ -885,14 +885,14 @@ pub fn scenario_09_multi_db_kill(base: &Path) -> Result<Duration> {
             DatabaseConfig::new("devices_db", "devices")
                 .dir_path(dir.clone())
                 .backup_enabled(true)
-                .cache(2_000, 60, 30)
+                .cache_bytes(8 * 1024 * 1024, 60, 30)
                 .register::<Device>("devices"),
         )
         .add_database(
             DatabaseConfig::new("dashboard_db", "dashboard")
                 .dir_path(dir.clone())
                 .backup_enabled(true)
-                .cache(3_000, 60, 30)
+                .cache_bytes(8 * 1024 * 1024, 60, 30)
                 .max_commit_batch_entries(100)
                 .register::<FeedEvent>("events"),
         )
@@ -954,7 +954,7 @@ pub fn scenario_10_compound_worst(base: &Path) -> Result<Duration> {
             DatabaseConfig::new("compound_db", "compound")
                 .dir_path(dir.clone())
                 .backup_enabled(true)
-                .cache(96, 20, 10)
+                .cache_bytes(512 * 1024, 20, 10)
                 .max_commit_batch_entries(48)
                 .register::<OrderV1>("orders"),
         )
@@ -990,7 +990,7 @@ pub fn scenario_10_compound_worst(base: &Path) -> Result<Duration> {
             DatabaseConfig::new("compound_db", "compound")
                 .dir_path(dir.clone())
                 .backup_enabled(true)
-                .cache(96, 20, 10)
+                .cache_bytes(512 * 1024, 20, 10)
                 .max_commit_batch_entries(48)
                 .register::<OrderV1>("orders"),
         )

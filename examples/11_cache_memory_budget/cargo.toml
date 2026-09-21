@@ -1,0 +1,10 @@
+[package]
+name = "example_11_cache_memory_budget"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+uuid = { version = "1.23.1", features = ["v4"] }
+chrono = "0.4.45"
+clove1db = { path = "../.." }

@@ -1,13 +1,22 @@
 # clove1db
 
-An embedded database framework for Rust — built on [redb](https://github.com/cberner/redb) with layered cache, versioned backup, per-table schema migrations, and domain-driven storage.
+An embedded database framework for Rust, built on [redb](https://github.com/cberner/redb).
 
-> **Work in progress.** The API and internals are still evolving. We welcome contributions, issue reports, and real-world feedback — see [Contributing](#contributing) below.
+redb gives you an ordered map of bytes to bytes. clove1db is the layer most applications end up writing on top of that: typed entities with DTOs at the edges, a cache with a memory budget you can state, a history of every write so any row can be restored to any earlier version, schema migrations per table, and durability settings that survive a crash mid-commit.
+
+Everything lives in `.cldb` files next to your binary. No server, no daemon, no connection string.
+
+```toml
+[dependencies]
+clove1db = "0.0.105"
+```
+
+> **Work in progress.** The API and internals are still evolving, and versions before 1.0 may break. Contributions, issue reports and real-world feedback are all welcome — see [Contributing](#contributing).
 
 ## Features
 
 - 🗄️ **Embedded Storage**: Built on [redb](https://github.com/cberner/redb) — no external server needed
-- ⚡ **Layered Cache**: In-memory cache via [moka](https://github.com/moka-rs/moka) with TTL and idle expiry
+- ⚡ **Budgeted Cache**: In-memory cache via [moka](https://github.com/moka-rs/moka), sized in **bytes** with TTL and idle expiry — plus uncached reads for bulk scans
 - 🔁 **Versioned Backup**: Every write/delete is recorded — restore any entity to any previous version
 - 📦 **Bulk Operations**: Update and restore multiple entities at once with a single `bulk_id`
 - 🧩 **Domain-Driven**: Clean separation via `Entity`, `InputDto`, `OutputDto`, `Repository`, `Domain`
@@ -17,12 +26,30 @@ An embedded database framework for Rust — built on [redb](https://github.com/c
 - 🔍 **Inspect**: Classify `.cldb` files (`Legacy042`, `Clove049`, `Authenticated`, `ExternalRedb`, …) without opening `Storage`
 - 🛡️ **Durability**: Default `DurabilityMode::Strict` — atomic sidecar writes (tmp→rename), `fsync` in Strict, `redb::Durability::Immediate`, corrupt migration-index recovery, chunked commit batches
 
-## Install
+## Upgrading to 0.0.105
 
-```toml
-[dependencies]
-clove1db = "0.0.98"
+**`cache(capacity, ttl, idle)` is now `cache_bytes(max_bytes, ttl, idle)`.**
+
+The old argument was a number of *entries*, which cannot bound memory: the value
+is whatever you stored, so `10_000` entries is ten thousand times a number the
+cache does not know. In one production database each row carried a serialized
+snapshot and a "10,000 entry" cache held about 100 MiB.
+
+The rename is deliberate. Both signatures are `(u64, u64, u64)`, so keeping the
+name would have silently turned every `cache(10_000, ..)` into a 10 KB cache with
+nothing from the compiler. Instead the call fails to compile and you state a
+budget:
+
+```diff
+- .cache(10_000, 300, 60)
++ .cache_bytes(32 * 1024 * 1024, 300, 60)   // 32 MiB
 ```
+
+Also new: `get_uncached()`, `cache_stats()`, `run_cache_maintenance()` and
+`clear_cache()` — see [Cache budget](#cache-budget).
+
+**No data migration.** The on-disk format is unchanged; existing `.cldb` files
+open as they are.
 
 ## Durability
 
@@ -109,7 +136,7 @@ fn main() -> Result<()> {
         .add_database(
             DatabaseConfig::new("users_db", "users")
                 .backup_enabled(true)
-                .cache(10_000, 300, 60)
+                .cache_bytes(32 * 1024 * 1024, 300, 60)
                 .register::<User>("users"),
         )
         .build()?;
@@ -122,6 +149,42 @@ fn main() -> Result<()> {
     domain.delete(&user.id)?;
     Ok(())
 }
+```
+
+### Cache budget
+
+`cache_bytes(max_bytes, ttl_secs, idle_secs)` sizes the in-memory cache in
+**bytes**, not entries.
+
+An entry count cannot bound memory: the cached value is whatever you stored, so
+`10_000` entries is ten thousand times a number the cache does not know. In one
+production database each row carried a serialized snapshot and a "10,000 entry"
+cache held roughly 100 MiB. `examples/11_cache_memory_budget` measures this —
+the same 2,000 entries come to 2 MiB or 125 MiB depending only on the row.
+
+Three things are worth knowing:
+
+- **`get_uncached()`** reads a key without reading or writing the cache. Use it
+  when walking many keys once — a range scan, a report, an export — so the walk
+  does not spend the whole budget on rows it will never read again.
+- **Expiry is not reclamation.** `ttl_secs` and `idle_secs` decide when an entry
+  *expires*; `moka` frees it during maintenance, and maintenance runs when the
+  cache is used. A database nobody reads keeps expired entries resident — in the
+  case above, for thirteen hours. Call `storage.run_cache_maintenance()` from an
+  idle tick when "expired" should mean "gone".
+- **`cache_stats()`** returns `(bytes, entries)`, per database or for the whole
+  `Storage`, so the budget can be checked instead of assumed.
+
+```rust
+DatabaseConfig::new("logs_db", "logs")
+    .cache_bytes(8 * 1024 * 1024, 300, 60)   // 8 MiB, 5 min TTL
+    .register::<RunLog>("run_logs");
+
+// walking a range: do not fill the cache with rows read once
+let row: RunLog = storage.domain::<RunLog>().get_uncached(&id)?;
+
+storage.run_cache_maintenance();
+let (bytes, entries) = storage.cache_stats();
 ```
 
 ## Schema & Migrations
@@ -333,6 +396,7 @@ cd clove1db/examples/01_basic_crud && cargo run
 | `08_inspect_upgrade` | Era fixtures (0.0.42 / 0.0.49 / 0.0.70), upgrade pipeline |
 | `09_blob_attachments` | Blob sidecar CRUD, migration scan, external→blob, inline→blob |
 | `10_crash_durability` | Strict durability: crash inject, NUL index recovery, RAM pressure |
+| `11_cache_memory_budget` | What the cache costs: byte budgets, uncached reads, expiry vs reclamation |
 
 ## Contributing
 

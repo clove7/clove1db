@@ -81,7 +81,7 @@ impl DatabaseManager {
         dir_name: &str,
         db_name: &str,
         tables: Vec<String>,
-        cache_max_capacity: u64,
+        cache_max_bytes: u64,
         cache_ttl_seconds: u64,
         cache_idle_seconds: u64,
         has_cache: bool,
@@ -144,8 +144,28 @@ impl DatabaseManager {
         }
         write_txn.commit()?;
 
+        // Capacity is **bytes**, not entries.
+        //
+        // An entry count cannot bound memory: the value is a `Vec<u8>` of
+        // whatever the caller stored, so "10,000 entries" is 10,000 times an
+        // unknown. A production database of run logs carrying a serialized
+        // snapshot per row filled a 10,000-entry cache with roughly 100 MiB and
+        // held it for thirteen hours. The number the operator wrote was a count;
+        // the number that mattered was a size, and nothing connected the two.
+        //
+        // A weigher connects them. `max_capacity` then means what an operator
+        // actually wants to control, and a row being large costs proportionally
+        // more of the budget instead of exactly as much as an empty one.
         let memory_cache = Cache::builder()
-            .max_capacity(cache_max_capacity)
+            .max_capacity(cache_max_bytes)
+            .weigher(|key: &String, value: &Vec<u8>| -> u32 {
+                // Key included: a cache of tiny values under long keys is still
+                // memory. Saturating, because the weight type is `u32` and a
+                // single value may legitimately be larger than that — such an
+                // entry simply costs the whole budget, which is the correct
+                // outcome for something that big.
+                key.len().saturating_add(value.len()).min(u32::MAX as usize) as u32
+            })
             .time_to_live(Duration::from_secs(cache_ttl_seconds))
             .time_to_idle(Duration::from_secs(cache_idle_seconds))
             .build();
@@ -208,7 +228,7 @@ impl DatabaseManager {
         dir_name: &str,
         db_name: &str,
         tables: Vec<String>,
-        cache_max_capacity: u64,
+        cache_max_bytes: u64,
         cache_ttl_seconds: u64,
         cache_idle_seconds: u64,
         has_cache: bool,
@@ -223,7 +243,7 @@ impl DatabaseManager {
             dir_name,
             db_name,
             tables,
-            cache_max_capacity,
+            cache_max_bytes,
             cache_ttl_seconds,
             cache_idle_seconds,
             has_cache,
@@ -530,6 +550,67 @@ impl DatabaseManager {
                 Ok(Some(data))
             }
             None => Ok(None),
+        }
+    }
+
+    /// Read one key **without touching the cache** — no lookup, no insert.
+    ///
+    /// For bulk reads: a range scan, a report, an export. Those walk many keys
+    /// once and never read them again, so routing them through [`Self::get`]
+    /// does two kinds of damage. It fills the cache with rows that will not be
+    /// reused, and in doing so evicts the small hot rows that were the reason
+    /// to have a cache at all — the scan pays nothing and the workload that
+    /// follows pays for it.
+    ///
+    /// Use [`Self::get`] for a key you expect to read again, and this for a key
+    /// you are walking past.
+    pub fn get_uncached<'db>(
+        &self,
+        table: TableDefinition<'db, &str, &[u8]>,
+        key: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let read_txn = self.db.begin_read()?;
+        let table_ref = read_txn.open_table(table)?;
+        Ok(table_ref.get(key)?.map(|v| v.value().to_vec()))
+    }
+
+    /// Bytes currently held by the cache, and how many entries hold them.
+    ///
+    /// Returns `(bytes, entries)`, and `(0, 0)` when the database has no cache.
+    /// Call [`Self::run_cache_maintenance`] first if you want the figure to
+    /// exclude entries that have expired but not yet been reclaimed.
+    pub fn cache_stats(&self) -> (u64, u64) {
+        if !self.has_cache {
+            return (0, 0);
+        }
+        (
+            self.memory_cache.weighted_size(),
+            self.memory_cache.entry_count(),
+        )
+    }
+
+    /// Reclaim entries whose TTL or idle window has passed.
+    ///
+    /// `moka` expires entries on a clock but frees them during maintenance, and
+    /// maintenance runs when the cache is *used*. A cache nobody touches
+    /// therefore keeps every expired entry resident indefinitely — in one
+    /// production run, roughly 100 MiB survived a five-minute TTL for thirteen
+    /// hours, until the next read happened to run housekeeping.
+    ///
+    /// That is correct behaviour for a cache and surprising for an operator
+    /// watching a memory graph, so this makes it something a caller can ask for
+    /// — from a idle-time hook, a maintenance tick, or before reporting memory.
+    pub fn run_cache_maintenance(&self) {
+        if self.has_cache {
+            self.memory_cache.run_pending_tasks();
+        }
+    }
+
+    /// Drop every cached entry for this database.
+    pub fn clear_cache(&self) {
+        if self.has_cache {
+            self.memory_cache.invalidate_all();
+            self.memory_cache.run_pending_tasks();
         }
     }
 
@@ -915,6 +996,39 @@ impl<T: DeserializeOwned + Serialize + Clone + Entity> Repository<T> {
         } else {
             Err(ClError::NotFound(format!("{} not found", self.table)).into())
         }
+    }
+
+    /// [`Self::get`], but the cache is neither read nor written.
+    ///
+    /// The read for a key you are walking past rather than coming back to —
+    /// range scans, reports, exports. See
+    /// [`DatabaseManager::get_uncached`] for why routing a bulk walk through
+    /// the cache costs the workload that follows it.
+    pub fn get_uncached(&self, id: &str) -> Result<T> {
+        let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(self.table);
+        let data = self.database_manager.get_uncached(table, id)?;
+        if let Some(data) = data {
+            let value: T = serde_json::from_slice(&data)?;
+            Ok(value)
+        } else {
+            Err(ClError::NotFound(format!("{} not found", self.table)).into())
+        }
+    }
+
+    /// Bytes and entries currently cached for this repository's database.
+    pub fn cache_stats(&self) -> (u64, u64) {
+        self.database_manager.cache_stats()
+    }
+
+    /// Reclaim expired entries now. See
+    /// [`DatabaseManager::run_cache_maintenance`].
+    pub fn run_cache_maintenance(&self) {
+        self.database_manager.run_cache_maintenance();
+    }
+
+    /// Drop every cached entry for this repository's database.
+    pub fn clear_cache(&self) {
+        self.database_manager.clear_cache();
     }
 
     pub fn list(&self) -> Result<Vec<T>> {

@@ -37,6 +37,16 @@ impl<E: Entity> Domain<E> {
         Ok(O::from_entity(entity))
     }
 
+    /// [`Self::get`], but the cache is neither read nor written.
+    ///
+    /// Use it when walking many keys once — a range scan, a report, an export.
+    /// Those fill the cache with rows that are never reused and evict the small
+    /// hot rows that justified having one.
+    pub fn get_uncached<O: OutputDto<E>>(&self, id: &str) -> Result<O> {
+        let entity = self.repository.get_uncached(id)?;
+        Ok(O::from_entity(entity))
+    }
+
     pub fn list<O: OutputDto<E>>(&self) -> Result<Vec<O>> {
         let entities = self.repository.list()?;
         Ok(O::from_entities(entities))

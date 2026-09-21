@@ -143,7 +143,7 @@ fn main() -> Result<()> {
         .add_database(
             DatabaseConfig::new("catalog_db", "catalog")
                 .dir_path(base_dir.clone())
-                .cache(5_000, 600, 120) // custom cache settings
+                .cache_bytes(16 * 1024 * 1024, 600, 120) // custom cache settings
                 .register::<Product>("products"),
         )
         .build()?;

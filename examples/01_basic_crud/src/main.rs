@@ -92,7 +92,7 @@ fn main() -> Result<()> {
         .add_database(
             DatabaseConfig::new("users_db", "users")
                 .dir_path(base_dir)
-                .cache(10_000, 300, 60)
+                .cache_bytes(32 * 1024 * 1024, 300, 60)
                 .register::<User>("users"),
         )
         .build()?;
