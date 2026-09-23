@@ -7,11 +7,12 @@ use crate::{
     blob::BlobStore,
     durability::{DurabilityMode, DEFAULT_MAX_COMMIT_BATCH_ENTRIES},
     fsutil::maybe_crash,
-    metadata::types::{TableStorageMode, META_TABLE},
+    handle::{DbHandle, DbRef, RedbOptions},
+    metadata::types::{CloveMeta, TableStorageMode, META_TABLE},
     migration::chain::DbMigrationIndex,
     migration::layout::FieldLayout,
     migration::step_registry::MigrationStepRegistry,
-    metadata::store::{read_meta, write_meta},
+    metadata::store::{put_meta, read_meta},
     migration::types::MigrationManifest,
     units::{ClError, Result},
 };
@@ -19,7 +20,7 @@ use crate::{
 use chrono::{Datelike, Local};
 use itertools::Itertools;
 use moka::sync::Cache;
-use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 // use std::env;
 use crate::entity::Entity;
 use serde::de::DeserializeOwned;
@@ -35,8 +36,9 @@ pub struct DatabaseManager {
     // L1: In-memory cache (moka) for fast access
     pub memory_cache: Cache<String, Vec<u8>>,
 
-    // L2: Persistent database (redb) for long-term storage
-    pub db: Arc<Database>,
+    // L2: Persistent database (redb) for long-term storage. Shared by every
+    // clone, so `close` on one closes it for all of them.
+    db: Arc<DbHandle>,
 
     // L3: Backup manager (backup.rs) (optional)
     pub backup_manager: Option<BackupManager>,
@@ -75,7 +77,10 @@ pub struct DatabaseManager {
 }
 
 impl DatabaseManager {
+    /// Serve a primary that is already open — `Storage::build` opens each file
+    /// once, in the upgrade pipeline, and hands that handle over here.
     pub fn open(
+        db: DbHandle,
         dir_path: &PathBuf,
         backup_dir_path: Option<&PathBuf>,
         dir_name: &str,
@@ -91,6 +96,7 @@ impl DatabaseManager {
         migration_registry: Arc<MigrationStepRegistry>,
         durability: DurabilityMode,
         max_commit_batch_entries: usize,
+        redb: RedbOptions,
     ) -> Result<Self> {
         let dir = dir_path.join(dir_name);
         let backup_dir = if let Some(backup_dir_path) = backup_dir_path {
@@ -101,21 +107,16 @@ impl DatabaseManager {
 
         let dir_local = Arc::new(Dir::new(&dir, backup_dir.as_ref())?);
 
-        let db_path = dir_local.dir.join(format!("{}.cldb", db_name));
         let backup_db_path = if let Some(backup_dir) = &dir_local.backup_dir {
             Some(backup_dir.join(format!("{}.cldb.bak", db_name)))
         } else {
             None
         };
 
-        let db = Arc::new(if db_path.exists() {
-            Database::open(&db_path).map_err(|e| ClError::Database(redb::Error::from(e)))?
-        } else {
-            Database::create(&db_path).map_err(|e| ClError::Database(redb::Error::from(e)))?
-        });
+        let db = Arc::new(db);
 
         let backup_manager = if let Some(backup_db_path) = backup_db_path {
-            let backup_manager = BackupManager::new(&backup_db_path, has_cache, durability);
+            let backup_manager = BackupManager::new(&backup_db_path, has_cache, durability, redb);
             if backup_manager.is_ok() {
                 Some(backup_manager.unwrap())
             } else {
@@ -125,7 +126,8 @@ impl DatabaseManager {
             None
         };
 
-        let write_txn = db.begin_write()?;
+        let db_ref = db.get()?;
+        let write_txn = db_ref.begin_write()?;
         {
             let meta_table: TableDefinition<&str, &[u8]> = TableDefinition::new(META_TABLE);
             write_txn.open_table(meta_table)?;
@@ -143,6 +145,7 @@ impl DatabaseManager {
             }
         }
         write_txn.commit()?;
+        drop(db_ref);
 
         // Capacity is **bytes**, not entries.
         //
@@ -237,7 +240,13 @@ impl DatabaseManager {
         table_layouts: std::collections::HashMap<String, FieldLayout>,
         migration_registry: Arc<MigrationStepRegistry>,
     ) -> Result<Self> {
+        let dir = dir_path.join(dir_name);
+        fs::create_dir_all(&dir)?;
+        let db_path = dir.join(format!("{}.cldb", db_name));
+        let redb = RedbOptions::default();
+        let db = DbHandle::new(redb.create(&db_path)?, db_path, DurabilityMode::Strict, redb);
         Self::open(
+            db,
             dir_path,
             backup_dir_path,
             dir_name,
@@ -253,6 +262,7 @@ impl DatabaseManager {
             migration_registry,
             DurabilityMode::Strict,
             DEFAULT_MAX_COMMIT_BATCH_ENTRIES,
+            redb,
         )
     }
 
@@ -286,14 +296,49 @@ impl DatabaseManager {
         self.durability
     }
 
-    fn apply_txn_durability(
-        &self,
-        write_txn: &mut redb::WriteTransaction,
-    ) -> Result<()> {
-        if self.durability.is_strict() {
-            write_txn.set_durability(Durability::Immediate)?;
-        }
+    /// The open `.cldb`, or [`ClError::Closed`].
+    ///
+    /// Reads go through the returned guard as a `&Database`. Writes go through
+    /// its `begin_write`, which applies this database's durability and quick
+    /// repair — see [`DbRef::begin_write`]. Hold it for one operation; see
+    /// [`DbHandle::get`].
+    pub fn db(&self) -> Result<DbRef<'_>> {
+        self.db.get()
+    }
+
+    /// Read `_clove_meta`.
+    pub fn read_meta(&self) -> Result<Option<CloveMeta>> {
+        read_meta(&*self.db()?)
+    }
+
+    /// Write `_clove_meta` with this database's commit policy.
+    ///
+    /// Use this rather than `metadata::write_meta(&db, ..)`: that one commits
+    /// without quick repair, and redb judges the next open by the last commit.
+    pub fn write_meta(&self, meta: &CloveMeta) -> Result<()> {
+        let db = self.db()?;
+        let write_txn = db.begin_write()?;
+        put_meta(&write_txn, meta)?;
+        write_txn.commit()?;
         Ok(())
+    }
+
+    /// Close this database: the `.cldb` and, when backup is enabled, its
+    /// `.cldb.bak`. Every clone shares the files, so they are closed for all of
+    /// them, and every later call returns [`ClError::Closed`].
+    ///
+    /// Waits for operations already running. Returns `false` if the primary
+    /// was already closed.
+    pub fn close(&self) -> bool {
+        let was_open = self.db.close();
+        if let Some(bm) = &self.backup_manager {
+            bm.close();
+        }
+        was_open
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.db.is_closed()
     }
 
     pub fn open_blob(&self, table: &str, id: &str) -> Result<File> {
@@ -375,7 +420,7 @@ impl DatabaseManager {
             .map_err(|_| ClError::MigrationError("migration index lock poisoned".into()))?;
         index.append_manifest(table, manifest, snapshot, new_layout)?;
 
-        if let Ok(Some(mut meta)) = read_meta(&self.db) {
+        if let Ok(Some(mut meta)) = self.read_meta() {
             if let Some(tm) = meta.tables.iter_mut().find(|t| t.name == table) {
                 tm.schema_version = index.table_chain(table)?.current_version();
                 if let Some(layout) = new_layout {
@@ -383,23 +428,27 @@ impl DatabaseManager {
                 }
             }
             meta.framework_version = env!("CARGO_PKG_VERSION").to_string();
-            write_meta(&self.db, &meta)?;
+            self.write_meta(&meta)?;
         }
         Ok(())
     }
 
+    /// Every `(key, value)` in the table.
+    ///
+    /// A read error is returned, not skipped — see [`Self::list`] for why a
+    /// silently short list is the worst of the available outcomes.
     pub fn list_entries(&self, table_name: &str) -> Result<Vec<(String, Vec<u8>)>> {
         let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(table_name);
-        let read_txn = self.db.begin_read()?;
+        let db = self.db()?;
+        let read_txn = db.begin_read()?;
         let table_ref = read_txn.open_table(table)?;
-        Ok(table_ref
+        table_ref
             .iter()?
-            .filter_map(|entry| {
-                entry
-                    .ok()
-                    .map(|(k, v)| (k.value().to_string(), v.value().to_vec()))
+            .map(|row| {
+                let (k, v) = row?;
+                Ok((k.value().to_string(), v.value().to_vec()))
             })
-            .collect_vec())
+            .collect()
     }
 
     pub fn get_raw(&self, table_name: &str, key: &str) -> Result<Option<Vec<u8>>> {
@@ -446,8 +495,8 @@ impl DatabaseManager {
         writes: &[(String, String, Vec<u8>)],
         deletes: &[(String, String)],
     ) -> Result<()> {
-        let mut write_txn = self.db.begin_write()?;
-        self.apply_txn_durability(&mut write_txn)?;
+        let db = self.db()?;
+        let write_txn = db.begin_write()?;
         maybe_crash("before_commit");
 
         for (table_name, key, value) in writes {
@@ -493,18 +542,20 @@ impl DatabaseManager {
         value: Vec<u8>,
     ) -> Result<()> {
         // Disk first (write-through), then cache.
-        let mut write_txn = self.db.begin_write()?;
-        self.apply_txn_durability(&mut write_txn)?;
         {
-            let mut table_ref = write_txn.open_table(table)?;
-            if self.has_cache {
-                table_ref.insert(key, value.as_slice())?;
-            } else {
-                let mut slot = table_ref.insert_reserve(key, value.len())?;
-                slot.as_mut().copy_from_slice(&value);
+            let db = self.db()?;
+            let write_txn = db.begin_write()?;
+            {
+                let mut table_ref = write_txn.open_table(table)?;
+                if self.has_cache {
+                    table_ref.insert(key, value.as_slice())?;
+                } else {
+                    let mut slot = table_ref.insert_reserve(key, value.len())?;
+                    slot.as_mut().copy_from_slice(&value);
+                }
             }
+            write_txn.commit()?;
         }
-        write_txn.commit()?;
 
         if self.has_cache {
             let cache_key = format!("{}:{}", table_name, key);
@@ -527,6 +578,10 @@ impl DatabaseManager {
     ) -> Result<Option<Vec<u8>>> {
         let cache_key = format!("{}:{}", table_name, key);
 
+        // Taken before the cache, so a closed database is closed for cached
+        // keys too rather than answering some reads and failing others.
+        let db = self.db()?;
+
         // Step 1: Check memory cache first (L1)
         if self.has_cache
             && let Some(value) = self.memory_cache.get(&cache_key)
@@ -535,7 +590,7 @@ impl DatabaseManager {
         }
 
         // Step 2: Cache miss - read from database (L2)
-        let read_txn = self.db.begin_read()?;
+        let read_txn = db.begin_read()?;
         let table_ref = read_txn.open_table(table)?;
 
         match table_ref.get(key)? {
@@ -569,7 +624,8 @@ impl DatabaseManager {
         table: TableDefinition<'db, &str, &[u8]>,
         key: &str,
     ) -> Result<Option<Vec<u8>>> {
-        let read_txn = self.db.begin_read()?;
+        let db = self.db()?;
+        let read_txn = db.begin_read()?;
         let table_ref = read_txn.open_table(table)?;
         Ok(table_ref.get(key)?.map(|v| v.value().to_vec()))
     }
@@ -614,21 +670,36 @@ impl DatabaseManager {
         }
     }
 
+    /// Every value in the table.
+    ///
+    /// # A read error is returned, never skipped
+    ///
+    /// This used to `filter_map` the iterator and drop any `Err`, so a row that
+    /// could not be read simply was not in the result — a short list with no
+    /// indication that it was short. For a caller listing rows to count them,
+    /// display them, or decide what to migrate, that is silent data loss, and
+    /// the shape of the bug guarantees nobody notices: the failure mode is
+    /// *missing* data, not wrong data.
+    ///
+    /// It also interacted badly with redb. Before redb 4.3.0 an iterator that
+    /// yielded `Err(Corrupted)` could go on yielding the rest of the table,
+    /// skipping unreadable entries without erroring again; paired with a
+    /// `filter_map` that swallowed the error, a corrupted page turned into a
+    /// quietly incomplete list. redb now keeps returning the error, and so does
+    /// this.
     pub fn list<'db>(&self, table: TableDefinition<'db, &str, &[u8]>) -> Result<Vec<Vec<u8>>> {
         // read from database (L2)
-        let read_txn = self.db.begin_read()?;
+        let db = self.db()?;
+        let read_txn = db.begin_read()?;
         let table_ref = read_txn.open_table(table)?;
 
-        Ok(table_ref
+        table_ref
             .iter()?
-            .filter_map(|data| {
-                if data.is_ok() {
-                    Some(data.unwrap().1.value().to_vec())
-                } else {
-                    None
-                }
+            .map(|row| {
+                let (_key, value) = row?;
+                Ok(value.value().to_vec())
             })
-            .collect_vec())
+            .collect()
     }
 
     /// Delete from both cache and DB
@@ -640,22 +711,26 @@ impl DatabaseManager {
     ) -> Result<bool> {
         let cache_key = format!("{}:{}", table_name, key);
 
+        let db = self.db()?;
+
         // Check if exists
-        let read_txn = self.db.begin_read()?;
+        let read_txn = db.begin_read()?;
         let table_ref = read_txn.open_table(table)?;
         let found = table_ref.get(key)?.is_some();
+        drop(table_ref);
         drop(read_txn);
 
         if found {
             // Step 1: Delete from database (L2)
-            let mut write_txn = self.db.begin_write()?;
-            self.apply_txn_durability(&mut write_txn)?;
+            let write_txn = db.begin_write()?;
             {
                 let mut table_ref = write_txn.open_table(table)?;
                 table_ref.remove(key)?;
             }
             write_txn.commit()?;
         }
+        // Released before the backup takes its own file.
+        drop(db);
 
         // Step 2: Delete from cache (L1)
         if self.has_cache {
@@ -692,20 +767,14 @@ impl DatabaseManager {
 
         // Read the specified record directly
         let backup_key = format!("{}:{}", key, version);
-        let read_txn = self
-            .backup_manager
-            .as_ref()
-            .ok_or_else(|| ClError::OptionNone)?
-            .db
-            .begin_read()?;
-        let tbl = read_txn.open_table(table)?;
-
-        let record = tbl
-            .get(backup_key.as_str())?
-            .and_then(|v| serde_json::from_slice::<BackupRecord>(v.value()).ok())
-            .ok_or_else(|| ClError::NotFound(format!("version {} not found", version)))?;
-
-        drop(read_txn);
+        let record = {
+            let bdb = bm.db()?;
+            let read_txn = bdb.begin_read()?;
+            let tbl = read_txn.open_table(table)?;
+            tbl.get(backup_key.as_str())?
+                .and_then(|v| serde_json::from_slice::<BackupRecord>(v.value()).ok())
+                .ok_or_else(|| ClError::NotFound(format!("version {} not found", version)))?
+        };
 
         match record.operation {
             // Set or Restore → Write data to Primary + Cache + Backup
@@ -715,8 +784,8 @@ impl DatabaseManager {
                 if data.is_some() {
                     let data = data.clone().ok_or_else(|| ClError::OptionNone)?;
                     // Primary DB
-                    let mut write_txn = self.db.begin_write()?;
-                    self.apply_txn_durability(&mut write_txn)?;
+                    let db = self.db()?;
+                    let write_txn = db.begin_write()?;
                     {
                         let mut table_ref = write_txn.open_table(table)?;
                         if self.has_cache {
@@ -727,6 +796,7 @@ impl DatabaseManager {
                         }
                     }
                     write_txn.commit()?;
+                    drop(db);
 
                     // Cache
                     if self.has_cache {
@@ -741,12 +811,14 @@ impl DatabaseManager {
 
             // Delete → Delete from Primary + Cache + log restore with None
             BackupOperation::Delete => {
-                let mut write_txn = self.db.begin_write()?;
-                self.apply_txn_durability(&mut write_txn)?;
                 {
-                    write_txn.open_table(table)?.remove(key)?;
+                    let db = self.db()?;
+                    let write_txn = db.begin_write()?;
+                    {
+                        write_txn.open_table(table)?.remove(key)?;
+                    }
+                    write_txn.commit()?;
                 }
-                write_txn.commit()?;
 
                 if self.has_cache {
                     let cache_key = format!("{}:{}", table_name, key);
@@ -767,12 +839,12 @@ impl DatabaseManager {
         version: u64,
     ) -> Result<BackupRecord> {
         let backup_key = format!("{}:{}", key, version);
-        let read_txn = self
+        let bdb = self
             .backup_manager
             .as_ref()
             .ok_or_else(|| ClError::OptionNone)?
-            .db
-            .begin_read()?;
+            .db()?;
+        let read_txn = bdb.begin_read()?;
         let tbl = read_txn.open_table(table)?;
 
         let record = tbl
@@ -852,7 +924,8 @@ impl DatabaseManager {
         let bulk_entries = {
             let bulk_name = format!("{}_bulk", table_name);
             let bulk_table: TableDefinition<&str, &[u8]> = TableDefinition::new(bulk_name.as_str());
-            let read_txn = bm.db.begin_read()?;
+            let bdb = bm.db()?;
+            let read_txn = bdb.begin_read()?;
             let btbl = read_txn.open_table(bulk_table)?;
             let bulk_data = btbl
                 .get(bulk_id)?
@@ -872,10 +945,10 @@ impl DatabaseManager {
         let results = bm.restore_bulk(table, table_name, bulk_id)?;
 
         for (key, data) in results {
+            let db = self.db()?;
             match data {
                 Some(d) => {
-                    let mut write_txn = self.db.begin_write()?;
-                    self.apply_txn_durability(&mut write_txn)?;
+                    let write_txn = db.begin_write()?;
                     {
                         let mut table_ref = write_txn.open_table(table)?;
                         if self.has_cache {
@@ -892,8 +965,7 @@ impl DatabaseManager {
                     }
                 }
                 None => {
-                    let mut write_txn = self.db.begin_write()?;
-                    self.apply_txn_durability(&mut write_txn)?;
+                    let write_txn = db.begin_write()?;
                     {
                         write_txn.open_table(table)?.remove(key.as_str())?;
                     }
@@ -930,10 +1002,6 @@ impl DatabaseManager {
         bm.history(table, key)
     }
 
-    /// Get database reference (for repositories)
-    pub fn db(&self) -> &Arc<Database> {
-        &self.db
-    }
 }
 
 #[derive(Debug, Clone)]

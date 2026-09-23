@@ -157,10 +157,29 @@ pub fn inspect_database(
     }
 
     let db = Database::open(primary_path).map_err(|e| ClError::Database(redb::Error::from(e)))?;
+    inspect_open(&db, primary_path, backup_path, migration_dir)
+}
+
+/// [`inspect_database`] for a primary that exists, is a file, and is already
+/// open.
+///
+/// `Storage::build` inspects, upgrades and then serves one file. Opening it
+/// once per step cost three to four opens, and an open is not free: it may
+/// repair the file, and in a debug build redb walks every page of it on each
+/// one.
+pub(crate) fn inspect_open(
+    db: &Database,
+    primary_path: &Path,
+    backup_path: Option<&Path>,
+    migration_dir: &Path,
+) -> Result<DatabaseInspection> {
+    let backup_exists = backup_path.map(|p| p.exists()).unwrap_or(false);
+    let migration_exists = migration_dir.join("index.json").exists();
+
     let read_txn = db.begin_read()?;
 
     let tables = list_user_tables(&read_txn)?;
-    let meta = read_meta(&db)?;
+    let meta = read_meta(db)?;
     let file_era = meta.as_ref().map(|m| m.file_era);
 
     let kind = if meta.is_some() {

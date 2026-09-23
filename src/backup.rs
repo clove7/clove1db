@@ -9,7 +9,8 @@ use crate::migration::step_registry::MigrationStepRegistry;
 use crate::units::ClError;
 use crate::units::Result;
 use chrono::Local;
-use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
+use crate::handle::{DbHandle, DbRef, RedbOptions};
+use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -59,36 +60,40 @@ pub struct BulkRecord {
 
 #[derive(Clone, Debug)]
 pub struct BackupManager {
-    pub db: Arc<Database>,
+    db: Arc<DbHandle>,
     has_cache: bool,
-    durability: DurabilityMode,
 }
 
 impl BackupManager {
-    pub fn new(path: &PathBuf, has_cache: bool, durability: DurabilityMode) -> Result<Self> {
+    pub fn new(
+        path: &PathBuf,
+        has_cache: bool,
+        durability: DurabilityMode,
+        redb: RedbOptions,
+    ) -> Result<Self> {
         // Last version in any table — we will search later when using
         // The tables are created in DatabaseManager::new() ✅
-        let db =
-            Arc::new(Database::create(path).map_err(|e| ClError::Database(redb::Error::from(e)))?);
-        Ok(Self {
-            db: db.clone(),
-            has_cache,
-            durability,
-        })
+        let db = Arc::new(DbHandle::new(redb.create(path)?, path.clone(), durability, redb));
+        Ok(Self { db, has_cache })
     }
 
-    fn apply_txn_durability(&self, write_txn: &mut redb::WriteTransaction) -> Result<()> {
-        if self.durability.is_strict() {
-            write_txn.set_durability(Durability::Immediate)?;
-        }
-        Ok(())
+    /// The open backup file, or [`ClError::Closed`]. See [`DbHandle::get`]
+    /// for how long to hold it.
+    pub fn db(&self) -> Result<DbRef<'_>> {
+        self.db.get()
+    }
+
+    /// Close the backup file. See [`DbHandle::close`].
+    pub fn close(&self) -> bool {
+        self.db.close()
     }
 
     pub fn init_table(&self, table_name: &str) -> Result<()> {
         let ver_name = version_table_name(table_name);
         let bulk_name = bulk_table_name(table_name);
 
-        let write_txn = self.db.begin_write()?;
+        let db = self.db()?;
+        let write_txn = db.begin_write()?;
         {
             let data_table: TableDefinition<&str, &[u8]> = TableDefinition::new(table_name);
             write_txn.open_table(data_table)?;
@@ -185,7 +190,8 @@ impl BackupManager {
             let bulk_name = bulk_table_name(table_name);
             let bulk_table: TableDefinition<&str, &[u8]> = TableDefinition::new(bulk_name.as_str());
 
-            let read_txn = self.db.begin_read()?;
+            let db = self.db()?;
+            let read_txn = db.begin_read()?;
             let btbl = read_txn.open_table(bulk_table)?;
             let bulk_data = btbl
                 .get(bulk_id)?
@@ -199,14 +205,15 @@ impl BackupManager {
 
         for entry in &bulk.entries {
             let backup_key = format!("{}:{}", entry.key, entry.version);
-            let read_txn = self.db.begin_read()?;
-            let tbl = read_txn.open_table(table)?;
-
-            let record = tbl
-                .get(backup_key.as_str())?
-                .and_then(|v| serde_json::from_slice::<BackupRecord>(v.value()).ok());
-
-            drop(read_txn);
+            // Scoped: `next_version` below takes the handle itself, and a
+            // second guard while holding one can deadlock against `close`.
+            let record = {
+                let db = self.db()?;
+                let read_txn = db.begin_read()?;
+                let tbl = read_txn.open_table(table)?;
+                tbl.get(backup_key.as_str())?
+                    .and_then(|v| serde_json::from_slice::<BackupRecord>(v.value()).ok())
+            };
 
             let data = record.as_ref().and_then(|r| match r.operation {
                 BackupOperation::Set | BackupOperation::Restore | BackupOperation::RestoreBulk => {
@@ -230,8 +237,8 @@ impl BackupManager {
 
             let rk = format!("{}:{}", entry.key, new_version);
             let rdata = serde_json::to_vec(&restore_record)?;
-            let mut write_txn = self.db.begin_write()?;
-            self.apply_txn_durability(&mut write_txn)?;
+            let db = self.db()?;
+            let write_txn = db.begin_write()?;
             {
                 if self.has_cache {
                     let mut tbl = write_txn.open_table(table)?;
@@ -254,12 +261,21 @@ impl BackupManager {
         let bulk_name = bulk_table_name(table_name);
         let bulk_table: TableDefinition<&str, &[u8]> = TableDefinition::new(bulk_name.as_str());
 
-        let read_txn = self.db.begin_read()?;
+        let db = self.db()?;
+        let read_txn = db.begin_read()?;
         let btbl = read_txn.open_table(bulk_table)?;
 
+        // A read failure propagates; an unparseable record does not. The two are
+        // different problems: a storage error means the file cannot be trusted,
+        // while a record this build cannot parse is expected on databases
+        // written by an older era and is what `upgrade` exists to normalize.
+        // Failing the whole listing for one legacy record would make a database
+        // unreadable instead of upgradeable.
         let mut records: Vec<BulkRecord> = btbl
             .iter()?
-            .filter_map(|e| e.ok())
+            .map(|e| e.map_err(ClError::from))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
             .filter_map(|(_, v)| serde_json::from_slice::<BulkRecord>(v.value()).ok())
             .collect();
 
@@ -273,13 +289,18 @@ impl BackupManager {
         table: TableDefinition<'db, &str, &[u8]>,
         key: &str,
     ) -> Result<Vec<BackupRecord>> {
-        let read_txn = self.db.begin_read()?;
+        let db = self.db()?;
+        let read_txn = db.begin_read()?;
         let tbl = read_txn.open_table(table)?;
         let prefix = format!("{}:", key);
 
+        // Read errors propagate; unparseable legacy records are skipped. See
+        // `list_bulk` for why the two are treated differently.
         let mut records: Vec<BackupRecord> = tbl
             .iter()?
-            .filter_map(|e| e.ok())
+            .map(|e| e.map_err(ClError::from))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
             .filter(|(k, _)| k.value().starts_with(&prefix))
             .filter_map(|(_, v)| serde_json::from_slice::<BackupRecord>(v.value()).ok())
             .collect();
@@ -315,7 +336,8 @@ impl BackupManager {
         version: u64,
     ) -> Result<Option<Vec<u8>>> {
         let backup_key = format!("{}:{}", key, version);
-        let read_txn = self.db.begin_read()?;
+        let db = self.db()?;
+        let read_txn = db.begin_read()?;
         let tbl = read_txn.open_table(table)?;
 
         Ok(tbl
@@ -333,7 +355,8 @@ impl BackupManager {
         let ver_name = version_table_name(table_name);
         let ver_table: TableDefinition<&str, u64> = TableDefinition::new(ver_name.as_str());
 
-        let read_txn = self.db.begin_read()?;
+        let db = self.db()?;
+        let read_txn = db.begin_read()?;
         let tbl = read_txn.open_table(ver_table)?;
 
         Ok(tbl.get(key)?.map(|v| v.value()).unwrap_or(0))
@@ -346,8 +369,8 @@ impl BackupManager {
 
         let ver_table: TableDefinition<&str, u64> = TableDefinition::new(ver_name.as_str());
 
-        let mut write_txn = self.db.begin_write()?;
-        self.apply_txn_durability(&mut write_txn)?;
+        let db = self.db()?;
+        let write_txn = db.begin_write()?;
         let new_version = {
             let mut tbl = write_txn.open_table(ver_table)?;
             let current = tbl.get(key)?.map(|v| v.value()).unwrap_or(0);
@@ -371,8 +394,8 @@ impl BackupManager {
         let backup_key = format!("{}:{}", key, version);
         let data = serde_json::to_vec(record)?;
 
-        let mut write_txn = self.db.begin_write()?;
-        self.apply_txn_durability(&mut write_txn)?;
+        let db = self.db()?;
+        let write_txn = db.begin_write()?;
         {
             if self.has_cache {
                 let mut tbl = write_txn.open_table(table)?;
@@ -412,8 +435,8 @@ impl BackupManager {
             let bulk_name = bulk_table_name(table_name);
             let bulk_table: TableDefinition<&str, &[u8]> = TableDefinition::new(bulk_name.as_str());
             let data = serde_json::to_vec(&record)?;
-            let mut write_txn = self.db.begin_write()?;
-            self.apply_txn_durability(&mut write_txn)?;
+            let db = self.db()?;
+            let write_txn = db.begin_write()?;
             {
                 if self.has_cache {
                     let mut btbl = write_txn.open_table(bulk_table)?;
@@ -432,7 +455,8 @@ impl BackupManager {
     }
 
     pub fn rewrite_table_name(&self, from_table: &str, to_table: &str) -> Result<()> {
-        let read_txn = self.db.begin_read()?;
+        let db = self.db()?;
+        let read_txn = db.begin_read()?;
         let mut records: Vec<(String, BackupRecord)> = Vec::new();
         {
             let data_table: TableDefinition<&str, &[u8]> = TableDefinition::new(from_table);
@@ -451,7 +475,7 @@ impl BackupManager {
             return Ok(());
         }
 
-        let write_txn = self.db.begin_write()?;
+        let write_txn = db.begin_write()?;
         {
             let from_def: TableDefinition<&str, &[u8]> = TableDefinition::new(from_table);
             let to_def: TableDefinition<&str, &[u8]> = TableDefinition::new(to_table);

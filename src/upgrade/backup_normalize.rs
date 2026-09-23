@@ -5,6 +5,7 @@ use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinitio
 
 use crate::backup::{BackupRecord, BulkRecord};
 use crate::durability::DurabilityMode;
+use crate::handle::RedbOptions;
 use crate::metadata::inspect::{pre_upgrade_path, upgrading_path};
 use crate::upgrade::legacy_record::{canonical_bytes, parse_backup_value};
 use crate::units::{ClError, Result};
@@ -23,6 +24,7 @@ pub fn eager_normalize(
     data_tables: &[String],
     has_cache: bool,
     durability: DurabilityMode,
+    redb: RedbOptions,
 ) -> Result<BackupNormalizeResult> {
     if !backup_path.exists() {
         return Ok(BackupNormalizeResult {
@@ -33,11 +35,11 @@ pub fn eager_normalize(
         });
     }
 
-    if is_fully_normalized(backup_path, data_tables)? {
+    if is_fully_normalized(backup_path, data_tables, redb)? {
         return Ok(BackupNormalizeResult {
             upgraded: false,
             entries_converted: 0,
-            entries_skipped: count_data_entries(backup_path, data_tables)?,
+            entries_skipped: count_data_entries(backup_path, data_tables, redb)?,
             pre_upgrade_removed: false,
         });
     }
@@ -53,9 +55,10 @@ pub fn eager_normalize(
     }
     fs::copy(backup_path, &upgrading)?;
 
-    let (converted, skipped) = transform_database(&upgrading, data_tables, has_cache, durability)?;
+    let (converted, skipped) =
+        transform_database(&upgrading, data_tables, has_cache, durability, redb)?;
 
-    verify_normalized(&upgrading, data_tables)?;
+    verify_normalized(&upgrading, data_tables, redb)?;
 
     drop_open_handles();
 
@@ -80,8 +83,12 @@ pub fn eager_normalize(
     })
 }
 
-fn is_fully_normalized(backup_path: &Path, data_tables: &[String]) -> Result<bool> {
-    let db = Database::open(backup_path).map_err(|e| ClError::Database(redb::Error::from(e)))?;
+fn is_fully_normalized(
+    backup_path: &Path,
+    data_tables: &[String],
+    redb: RedbOptions,
+) -> Result<bool> {
+    let db = redb.open(backup_path)?;
     let read_txn = db.begin_read()?;
 
     for table_name in data_tables {
@@ -104,8 +111,12 @@ fn is_fully_normalized(backup_path: &Path, data_tables: &[String]) -> Result<boo
     Ok(true)
 }
 
-fn count_data_entries(backup_path: &Path, data_tables: &[String]) -> Result<usize> {
-    let db = Database::open(backup_path).map_err(|e| ClError::Database(redb::Error::from(e)))?;
+fn count_data_entries(
+    backup_path: &Path,
+    data_tables: &[String],
+    redb: RedbOptions,
+) -> Result<usize> {
+    let db = redb.open(backup_path)?;
     let read_txn = db.begin_read()?;
     let mut count = 0;
     for table_name in data_tables {
@@ -122,8 +133,9 @@ fn transform_database(
     data_tables: &[String],
     has_cache: bool,
     durability: DurabilityMode,
+    redb: RedbOptions,
 ) -> Result<(usize, usize)> {
-    let db = Database::open(path).map_err(|e| ClError::Database(redb::Error::from(e)))?;
+    let db = redb.open(path)?;
     let mut converted = 0usize;
     let mut skipped = 0usize;
 
@@ -171,11 +183,13 @@ fn read_table_entries(db: &Database, table_name: &str) -> Result<Vec<(String, Ve
             reason: format!("table '{}' not found in backup", table_name),
         }
     })?;
-    Ok(table_ref
+    table_ref
         .iter()?
-        .filter_map(|e| e.ok())
-        .map(|(k, v)| (k.value().to_string(), v.value().to_vec()))
-        .collect())
+        .map(|e| {
+            let (k, v) = e?;
+            Ok((k.value().to_string(), v.value().to_vec()))
+        })
+        .collect()
 }
 
 fn write_batch(
@@ -219,9 +233,11 @@ fn normalize_bulk_table(
 
     let entries: Vec<(String, Vec<u8>)> = table_ref
         .iter()?
-        .filter_map(|e| e.ok())
-        .map(|(k, v)| (k.value().to_string(), v.value().to_vec()))
-        .collect();
+        .map(|e| {
+            let (k, v) = e?;
+            Ok((k.value().to_string(), v.value().to_vec()))
+        })
+        .collect::<Result<Vec<_>>>()?;
     drop(read_txn);
 
     if entries.is_empty() {
@@ -241,14 +257,14 @@ fn normalize_bulk_table(
     write_batch(db, bulk_table_name, &batch, has_cache, durability)
 }
 
-fn verify_normalized(backup_path: &Path, data_tables: &[String]) -> Result<()> {
-    let before = count_data_entries(backup_path, data_tables)?;
-    if !is_fully_normalized(backup_path, data_tables)? {
+fn verify_normalized(backup_path: &Path, data_tables: &[String], redb: RedbOptions) -> Result<()> {
+    let before = count_data_entries(backup_path, data_tables, redb)?;
+    if !is_fully_normalized(backup_path, data_tables, redb)? {
         return Err(ClError::BackupNormalizeFailed {
             reason: "verify failed: not all entries parse as BackupRecord".into(),
         });
     }
-    let after = count_data_entries(backup_path, data_tables)?;
+    let after = count_data_entries(backup_path, data_tables, redb)?;
     if before != after {
         return Err(ClError::BackupNormalizeFailed {
             reason: format!("entry count mismatch: before {} after {}", before, after),

@@ -8,7 +8,7 @@ Everything lives in `.cldb` files next to your binary. No server, no daemon, no 
 
 ```toml
 [dependencies]
-clove1db = "0.0.105"
+clove1db = "0.0.112"
 ```
 
 > **Work in progress.** The API and internals are still evolving, and versions before 1.0 may break. Contributions, issue reports and real-world feedback are all welcome — see [Contributing](#contributing).
@@ -25,30 +25,66 @@ clove1db = "0.0.105"
 - 🏷️ **Metadata & Auto-Upgrade**: `_clove_meta` inside `.cldb`, automatic upgrade from legacy eras on `build()`
 - 🔍 **Inspect**: Classify `.cldb` files (`Legacy042`, `Clove049`, `Authenticated`, `ExternalRedb`, …) without opening `Storage`
 - 🛡️ **Durability**: Default `DurabilityMode::Strict` — atomic sidecar writes (tmp→rename), `fsync` in Strict, `redb::Durability::Immediate`, corrupt migration-index recovery, chunked commit batches
+- 🔌 **Open, close & recover**: each file opened once per `build()`, an explicit `Storage::close()`, a cap on redb's page cache, and quick repair after a kill or crash
 
-## Upgrading to 0.0.105
+## Upgrading to 0.0.112
 
-**`cache(capacity, ttl, idle)` is now `cache_bytes(max_bytes, ttl, idle)`.**
+**New, and all opt-in.** A database that sets none of them behaves as it did
+in 0.0.105, except that `build()` now opens each file once.
 
-The old argument was a number of *entries*, which cannot bound memory: the value
-is whatever you stored, so `10_000` entries is ten thousand times a number the
-cache does not know. In one production database each row carried a serialized
-snapshot and a "10,000 entry" cache held about 100 MiB.
+- **`DatabaseConfig::redb_cache_bytes(n)`** caps redb's page cache, per file.
+  Without it redb allows 1 GiB per file and keeps every page a scan reads: a
+  full scan of a 545 MB table left 528 MiB resident, where a 64 MiB cap left
+  65 MiB at the same speed.
+- **`DatabaseConfig::quick_repair(true)`** saves redb's allocator state on
+  every commit, so the open after a kill or a crash needs no full repair: 612 ms
+  and a 422 MiB peak for that table became 7 ms. Each commit costs more (0.94 →
+  2.02 ms in the same measurement).
+- **`Storage::close()`** closes every `.cldb` and `.cldb.bak` cleanly, so the
+  next open needs no repair. redb only closes a file when it is dropped, and a
+  `Storage` held in a `static` never is — not even on a clean Ctrl+C. After
+  `close()`, every clone gets `ClError::Closed`.
+- **`build()` opens each file once.** It opened the `.cldb` three to four times
+  (inspect, upgrade, serve), and every open may repair the file and, in a debug
+  build, walks all of it.
 
-The rename is deliberate. Both signatures are `(u64, u64, u64)`, so keeping the
-name would have silently turned every `cache(10_000, ..)` into a 10 KB cache with
-nothing from the compiler. Instead the call fails to compile and you state a
-budget:
+See [Open, close & recover](#open-close--recover) and
+`examples/12_open_close_repair`.
 
-```diff
-- .cache(10_000, 300, 60)
-+ .cache_bytes(32 * 1024 * 1024, 300, 60)   // 32 MiB
-```
+**Breaking — only for code below `Storage`:**
 
-Also new: `get_uncached()`, `cache_stats()`, `run_cache_maintenance()` and
-`clear_cache()` — see [Cache budget](#cache-budget).
+- **`DatabaseManager.db` is no longer a public field.** `close()` needs the file
+  behind a handle it can close while clones are still alive, so
+  `DatabaseManager::db()` now returns `Result<DbRef>` — a guard that reads as
+  `&redb::Database` and fails with `ClError::Closed` after `close()`. For
+  `_clove_meta`, use the manager's own methods; `write_meta` through the
+  manager also keeps quick repair, which a raw `write_meta(&db, ..)` does not:
 
-**No data migration.** The on-disk format is unchanged; existing `.cldb` files
+  ```diff
+  - match read_meta(dbm.db.as_ref()) {
+  + match dbm.read_meta() {
+  ...
+  - write_meta(dbm.db.as_ref(), &meta)
+  + dbm.write_meta(&meta)
+  ```
+
+- **`BackupManager.db`** likewise: `bm.db()?`.
+- **`ClError::Closed { path }`** is a new variant; an exhaustive `match` needs
+  an arm for it.
+- **Lower-level signatures**, for code that calls them directly instead of
+  going through `Storage::build()`: `DatabaseManager::open` takes the open
+  `DbHandle` first and `RedbOptions` last; `BackupManager::new` and
+  `upgrade::eager_normalize` take `RedbOptions`; `UpgradeInput` has a `redb`
+  field and `UpgradeOutput` a `db` field.
+
+**Read errors are returned, not skipped.** `DatabaseManager::list`,
+`list_entries` (and so `count_keys`), `BackupManager::list_bulk` and `history`,
+and the migration and backup-normalize readers used to drop any row redb failed
+to read, returning a short list with no sign that it was short. They now return
+the error. A backup record that reads fine but does not parse — expected in
+files from older eras — is still skipped.
+
+**No data migration.** The on-disk format is unchanged; files from 0.0.105
 open as they are.
 
 ## Durability
@@ -84,6 +120,37 @@ Storage::builder(StorageConfig::default())
 **Not guaranteed:** uncommitted in-flight work after sudden power loss; absolute immunity without UPS/hardware.
 
 Extreme crash / pressure scenarios: `examples/10_crash_durability` (`cargo run --manifest-path examples/10_crash_durability/Cargo.toml`).
+
+## Open, close & recover
+
+`Durability` above is about a commit surviving. This is about the *file*: what
+opening it costs, what an unclean exit costs the next open, and what redb keeps
+in memory in between. `examples/12_open_close_repair` measures all of it.
+
+- **`storage.close()`** — call it once, on the way out. It waits for operations
+  already running, then closes every file cleanly, so the next open needs no
+  repair. Any clone used afterwards gets `ClError::Closed`. It matters most for
+  a `Storage` kept in a `static`, which is never dropped: without `close()`,
+  even a clean shutdown leaves every file to be repaired.
+- **`.quick_repair(true)`** — for what `close()` cannot cover: a kill, a crash,
+  a power cut. Every commit saves redb's allocator state, so the next open
+  loads it instead of walking the whole file. Costs each commit more; worth it
+  for large files on machines that get killed.
+- **`.redb_cache_bytes(n)`** — redb's own page cache, per file, underneath
+  `cache_bytes` (which holds decoded rows). The default is 1 GiB per file, and
+  pages a scan reads stay resident up to that.
+
+```rust
+DatabaseConfig::new("logs_db", "logs")
+    .redb_cache_bytes(64 * 1024 * 1024)   // 64 MiB of redb pages per file
+    .quick_repair(true)
+    .register::<RunLog>("run_logs");
+
+// on shutdown, after the last request
+storage.close();
+```
+
+`build()` opens each file once — inspect, upgrade and serve share one handle.
 
 ## Quick Start
 
@@ -397,6 +464,7 @@ cd clove1db/examples/01_basic_crud && cargo run
 | `09_blob_attachments` | Blob sidecar CRUD, migration scan, external→blob, inline→blob |
 | `10_crash_durability` | Strict durability: crash inject, NUL index recovery, RAM pressure |
 | `11_cache_memory_budget` | What the cache costs: byte budgets, uncached reads, expiry vs reclamation |
+| `12_open_close_repair` | Between runs: redb cache cap, quick repair after a kill, `close()`, one open per build |
 
 ## Contributing
 

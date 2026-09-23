@@ -2,10 +2,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-use redb::Database;
-
-use crate::metadata::inspect::{inspect_database, pre_upgrade_path, FileKind};
-use crate::metadata::store::{ensure_meta_table, read_meta, write_meta};
+use crate::handle::{DbHandle, RedbOptions};
+use crate::metadata::inspect::{inspect_database, inspect_open, pre_upgrade_path, FileKind};
+use crate::metadata::store::{create_meta_table, put_meta, read_meta};
 use crate::metadata::types::{BackupFormat, CloveMeta, FileEra, TableMeta, BACKUP_FORMAT_JSON};
 use crate::migration::chain::DbMigrationIndex;
 use crate::migration::layout::FieldLayout;
@@ -32,11 +31,15 @@ pub struct UpgradeInput<'a> {
     pub blob_enabled: bool,
     pub has_cache: bool,
     pub durability: DurabilityMode,
+    pub redb: RedbOptions,
 }
 
 pub struct UpgradeOutput {
     pub meta: CloveMeta,
     pub table_layouts: HashMap<String, FieldLayout>,
+    /// The primary, still open. `Storage::build` serves from this handle
+    /// rather than opening the file again.
+    pub db: DbHandle,
 }
 
 pub struct OpenUpgradePipeline;
@@ -57,11 +60,31 @@ impl OpenUpgradePipeline {
         });
         let migration_dir = db_dir.join(migration_dir_name(input.db_name));
 
-        let inspection = inspect_database(
-            &primary_path,
-            backup_path.as_deref(),
-            &migration_dir,
-        )?;
+        // The primary is opened here and nowhere else: this handle is inspected,
+        // gets the meta written through it, and is handed to `DatabaseManager`.
+        // A missing file stays unopened until the end, so a build that fails
+        // validation does not leave an empty `.cldb` behind; a directory is
+        // left to `inspect_database`, which classifies it without opening it.
+        let handle = if primary_path.is_file() {
+            Some(DbHandle::new(
+                input.redb.open(&primary_path)?,
+                primary_path.clone(),
+                input.durability,
+                input.redb,
+            ))
+        } else {
+            None
+        };
+
+        let inspection = match &handle {
+            Some(handle) => inspect_open(
+                &*handle.get()?,
+                &primary_path,
+                backup_path.as_deref(),
+                &migration_dir,
+            )?,
+            None => inspect_database(&primary_path, backup_path.as_deref(), &migration_dir)?,
+        };
 
         match inspection.kind {
             FileKind::Invalid | FileKind::ExternalRedb => {
@@ -83,8 +106,8 @@ impl OpenUpgradePipeline {
         let mut meta = build_meta(input, file_era);
 
         if inspection.kind == FileKind::Authenticated {
-            if let Ok(db) = Database::open(&primary_path) {
-                if let Ok(Some(existing)) = read_meta(&db) {
+            if let Some(handle) = &handle {
+                if let Ok(Some(existing)) = read_meta(&*handle.get()?) {
                     if existing.meta_version == crate::metadata::types::META_VERSION {
                         meta = existing;
                         meta.framework_version = env!("CARGO_PKG_VERSION").to_string();
@@ -97,7 +120,13 @@ impl OpenUpgradePipeline {
             if bp.exists() && input.backup_enabled && !meta.backup_upgraded {
                 let table_names: Vec<String> =
                     input.tables.iter().map(|t| t.name.to_string()).collect();
-                let result = eager_normalize(bp, &table_names, input.has_cache, input.durability)?;
+                let result = eager_normalize(
+                    bp,
+                    &table_names,
+                    input.has_cache,
+                    input.durability,
+                    input.redb,
+                )?;
                 if let Some(pre) = backup_path.as_ref().map(|p| pre_upgrade_path(p.as_path())) {
                     if pre.exists() && result.pre_upgrade_removed {
                         meta.backup_pre_upgrade_path = None;
@@ -168,18 +197,31 @@ impl OpenUpgradePipeline {
             }
         }
 
-        let db = Database::create(&primary_path)
-            .map_err(|e| ClError::Database(redb::Error::from(e)))?;
-        ensure_meta_table(&db)?;
+        let handle = match handle {
+            Some(handle) => handle,
+            None => DbHandle::new(
+                input.redb.create(&primary_path)?,
+                primary_path.clone(),
+                input.durability,
+                input.redb,
+            ),
+        };
 
         meta.upgrade_complete = true;
         meta.framework_version = env!("CARGO_PKG_VERSION").to_string();
         meta.push_log("upgrade_complete", None);
-        write_meta(&db, &meta)?;
+        {
+            let db = handle.get()?;
+            let write_txn = db.begin_write()?;
+            create_meta_table(&write_txn)?;
+            put_meta(&write_txn, &meta)?;
+            write_txn.commit()?;
+        }
 
         Ok(UpgradeOutput {
             meta,
             table_layouts,
+            db: handle,
         })
     }
 }

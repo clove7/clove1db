@@ -109,6 +109,11 @@ pub enum ClError {
 
     #[error("upgrade incomplete for database '{db_name}'")]
     UpgradeIncomplete { db_name: String },
+
+    /// The database was closed by `Storage::close` (or `DatabaseManager::close`)
+    /// and cannot be used again. Build a new `Storage` to reopen it.
+    #[error("database is closed: {path}")]
+    Closed { path: String },
 }
 
 impl From<std::io::Error> for ClError {

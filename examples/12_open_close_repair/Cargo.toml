@@ -1,0 +1,11 @@
+[package]
+name = "example_12_open_close_repair"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+clove1db = { path = "../.." }
+# Only to ask redb, independently of clove1db, whether a file needs a repair.
+redb = "4.3.0"

@@ -18,6 +18,7 @@ use crate::{
     domain::Domain,
     durability::{DurabilityMode, DEFAULT_MAX_COMMIT_BATCH_ENTRIES},
     entity::Entity,
+    handle::RedbOptions,
     metadata::types::TableStorageMode,
 
     migration::chain::DbMigrationIndex,
@@ -130,6 +131,28 @@ impl Storage {
     pub fn db_list(&self) -> Vec<&DatabaseManager> {
 
         self.0.database_managers.values().collect()
+
+    }
+
+
+    /// Close every database, so the next open needs no repair.
+    ///
+    /// redb closes a file cleanly only when it is dropped, and a `Storage`
+    /// kept in a `static` is never dropped — not even on a clean Ctrl+C — so
+    /// without this every run leaves every file to be repaired on the next
+    /// boot, a walk of the whole file. Call it once, on the way out.
+    ///
+    /// Waits for operations already running, then closes each `.cldb` and
+    /// `.cldb.bak`. `Storage` is shared, so any clone used afterwards gets
+    /// [`ClError::Closed`] instead of writing to a file that is gone. It does
+    /// not cover a kill or a crash; [`DatabaseConfig::quick_repair`] does.
+    pub fn close(&self) {
+
+        for db in self.db_list() {
+
+            db.close();
+
+        }
 
     }
 
@@ -277,6 +300,8 @@ pub struct DatabaseConfig {
     durability: Option<DurabilityMode>,
 
     max_commit_batch_entries: usize,
+
+    redb: RedbOptions,
 }
 
 
@@ -313,6 +338,8 @@ impl DatabaseConfig {
 
             max_commit_batch_entries: DEFAULT_MAX_COMMIT_BATCH_ENTRIES,
 
+            redb: RedbOptions::default(),
+
         }
 
     }
@@ -337,6 +364,35 @@ impl DatabaseConfig {
 
     pub fn max_commit_batch_entries(mut self, max: usize) -> Self {
         self.max_commit_batch_entries = max.max(1);
+        self
+    }
+
+    /// Cap redb's page cache for this database's files, in **bytes**.
+    ///
+    /// This is redb's cache, underneath [`Self::cache_bytes`] — that one holds
+    /// decoded rows, this one holds file pages. Without a cap redb allows 1 GiB
+    /// per file, and pages read once stay resident: a full scan of a 545 MB
+    /// table left 528 MiB behind, where a 64 MiB cap left 65 MiB at the same
+    /// scan speed. It also bounds the peak of a repair after an unclean exit.
+    ///
+    /// The `.cldb` and the `.cldb.bak` each get this much.
+    pub fn redb_cache_bytes(mut self, max_bytes: usize) -> Self {
+        self.redb.cache_bytes = Some(max_bytes);
+        self
+    }
+
+    /// Make every commit save redb's allocator state, so reopening after a
+    /// kill or crash is near-instant instead of a full repair.
+    ///
+    /// Without it, a process that exits without closing — killed, crashed, or
+    /// simply never dropping a `Storage` held in a `static` — leaves each file
+    /// needing a repair that walks all of it: 612 ms with a 422 MiB peak for a
+    /// 545 MB table, against 7 ms with this on. The price is on every commit:
+    /// 0.94 → 2.02 ms in the same measurement. Applies to the `.cldb.bak` too.
+    ///
+    /// For the clean path, see [`Storage::close`], which needs no option.
+    pub fn quick_repair(mut self, enabled: bool) -> Self {
+        self.redb.quick_repair = enabled;
         self
     }
 
@@ -696,6 +752,8 @@ impl StorageBuilder {
 
                 durability: config.durability.unwrap_or(DurabilityMode::Strict),
 
+                redb: config.redb,
+
             })?;
 
 
@@ -719,6 +777,8 @@ impl StorageBuilder {
             let durability = config.durability.unwrap_or(DurabilityMode::Strict);
 
             let db_manager = DatabaseManager::open(
+
+                upgrade.db,
 
                 &config.dir_path,
 
@@ -749,6 +809,8 @@ impl StorageBuilder {
                 durability,
 
                 config.max_commit_batch_entries,
+
+                config.redb,
 
             )?;
 

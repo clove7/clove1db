@@ -54,6 +54,7 @@ mod tests {
             blob_enabled: false,
             has_cache: true,
             durability: crate::durability::DurabilityMode::Strict,
+            redb: crate::handle::RedbOptions::default(),
         })
         .unwrap();
 
@@ -61,6 +62,8 @@ mod tests {
         assert_eq!(out.meta.tables[0].schema_id, "users");
         assert_eq!(out.meta.tables[0].schema_version, 1);
 
+        // The pipeline hands the primary over open; close it to reopen below.
+        drop(out.db);
         let primary = dir.join("t").join("users.cldb");
         let db = Database::open(&primary).unwrap();
         let meta = read_meta(&db).unwrap().unwrap();

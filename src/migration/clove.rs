@@ -1,6 +1,5 @@
 use std::path::Path;
 
-use itertools::Itertools;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, TableHandle};
 
 use crate::units::{ClError, Result};
@@ -13,12 +12,16 @@ pub fn read_clove_table(path: &Path, table_name: &str) -> Result<Vec<(String, Ve
         ClError::MigrationError(format!("table '{}' not found in {:?}", table_name, path))
     })?;
 
-    Ok(table_ref
+    // Every row, or an error. This feeds a migration, and a migration that
+    // silently drops the rows it could not read writes a truncated copy and
+    // reports success — the one outcome worse than failing.
+    table_ref
         .iter()?
-        .filter_map(|entry| {
-            entry.ok().map(|(k, v)| (k.value().to_string(), v.value().to_vec()))
+        .map(|entry| {
+            let (k, v) = entry?;
+            Ok((k.value().to_string(), v.value().to_vec()))
         })
-        .collect_vec())
+        .collect()
 }
 
 pub fn list_clove_tables(path: &Path) -> Result<Vec<String>> {
