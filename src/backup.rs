@@ -9,7 +9,7 @@ use crate::migration::step_registry::MigrationStepRegistry;
 use crate::units::ClError;
 use crate::units::Result;
 use chrono::Local;
-use crate::handle::{DbHandle, DbRef, RedbOptions};
+use crate::handle::{DbHandle, DbRef, FileOpen, RedbOptions};
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -73,7 +73,7 @@ impl BackupManager {
     ) -> Result<Self> {
         // Last version in any table — we will search later when using
         // The tables are created in DatabaseManager::new() ✅
-        let db = Arc::new(DbHandle::new(redb.create(path)?, path.clone(), durability, redb));
+        let db = Arc::new(DbHandle::create(path, durability, redb)?);
         Ok(Self { db, has_cache })
     }
 
@@ -86,6 +86,11 @@ impl BackupManager {
     /// Close the backup file. See [`DbHandle::close`].
     pub fn close(&self) -> bool {
         self.db.close()
+    }
+
+    /// How the backup file's open went.
+    pub(crate) fn opened(&self) -> &FileOpen {
+        self.db.opened()
     }
 
     pub fn init_table(&self, table_name: &str) -> Result<()> {

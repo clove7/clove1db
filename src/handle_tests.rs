@@ -288,3 +288,121 @@ fn without_quick_repair_an_unclean_exit_needs_a_full_repair() {
     assert!(needs_full_repair(&primary(&dir)));
     assert!(needs_full_repair(&backup(&dir)));
 }
+
+// ─── open report ────────────────────────────────────────────────────────
+
+/// `(path, repaired)` for every file the build opened, in report order.
+fn opened(storage: &Storage) -> Vec<(PathBuf, bool)> {
+    storage
+        .open_report()
+        .into_iter()
+        .map(|r| (r.path, r.repaired))
+        .collect()
+}
+
+#[test]
+fn open_report_lists_each_served_file_once_primary_first() {
+    let dir = fresh_dir("report_files");
+    let storage = build(&dir, |c| c);
+    let report = storage.open_report();
+
+    assert_eq!(
+        report.iter().map(|r| (r.database.as_str(), r.path.clone())).collect::<Vec<_>>(),
+        vec![("rows", primary(&dir)), ("rows", backup(&dir))]
+    );
+    assert!(report.iter().all(|r| r.open_time > std::time::Duration::ZERO));
+    assert!(report.iter().all(|r| r.bytes > 0));
+    assert!(report.iter().all(|r| !r.repaired), "a new file is not a repair");
+}
+
+#[test]
+fn open_report_has_no_backup_line_without_backup() {
+    let dir = fresh_dir("report_no_backup");
+    let storage = Storage::builder(StorageConfig::default().change_dir_path(dir.clone()))
+        .add_database(
+            DatabaseConfig::new("rows", "rows")
+                .backup_enabled(false)
+                .register::<Row>("rows"),
+        )
+        .build()
+        .unwrap();
+    assert_eq!(opened(&storage), vec![(primary(&dir), false)]);
+}
+
+/// Several databases come back sorted by name, whatever order they were added in.
+#[test]
+fn open_report_is_sorted_by_database() {
+    let dir = fresh_dir("report_sorted");
+    let storage = Storage::builder(StorageConfig::default().change_dir_path(dir.clone()))
+        .add_database(DatabaseConfig::new("zeta", "zeta").register::<Row>("rows"))
+        .add_database(DatabaseConfig::new("alpha", "alpha").register::<Other>("others"))
+        .build()
+        .unwrap();
+    let names: Vec<String> = storage.open_report().into_iter().map(|r| r.database).collect();
+    assert_eq!(names, vec!["alpha", "zeta"]);
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct Other {
+    id: String,
+}
+
+impl Entity for Other {
+    fn entity_id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// An existing file reports its size as the open found it.
+#[test]
+fn open_report_bytes_is_the_file_size_at_open() {
+    let dir = fresh_dir("report_bytes");
+    let storage = build(&dir, |c| c);
+    storage.domain::<Row>().repo().set("a", &row("a", 256 * 1024)).unwrap();
+    storage.close();
+    drop(storage);
+    let size = std::fs::metadata(primary(&dir)).unwrap().len();
+
+    let storage = build(&dir, |c| c);
+    assert_eq!(storage.open_report()[0].bytes, size);
+}
+
+#[test]
+fn open_report_after_a_clean_close_is_not_repaired() {
+    let dir = fresh_dir("report_clean");
+    let storage = build(&dir, |c| c);
+    storage.domain::<Row>().repo().set("a", &row("a", 16)).unwrap();
+    storage.close();
+    drop(storage);
+
+    let storage = build(&dir, |c| c);
+    assert_eq!(opened(&storage), vec![(primary(&dir), false), (backup(&dir), false)]);
+}
+
+/// Two clean builds first: the second marks the new `.bak` upgraded, so the
+/// build after the exit opens each file only to serve it (see
+/// `build_opens_each_file_once`).
+fn settled(dir: &Path) {
+    for _ in 0..2 {
+        let storage = build(dir, |c| c);
+        storage.close();
+    }
+}
+
+#[test]
+fn open_report_after_an_unclean_exit_without_quick_repair_is_repaired() {
+    let dir = fresh_dir("report_killed");
+    settled(&dir);
+    run_child(&dir, "set", false);
+    let storage = build(&dir, |c| c);
+    assert_eq!(opened(&storage), vec![(primary(&dir), true), (backup(&dir), true)]);
+}
+
+#[test]
+fn open_report_after_an_unclean_exit_with_quick_repair_is_not_repaired() {
+    let dir = fresh_dir("report_killed_qr");
+    settled(&dir);
+    run_child(&dir, "set", true);
+    let storage = build(&dir, |c| c.quick_repair(true));
+    assert_eq!(opened(&storage), vec![(primary(&dir), false), (backup(&dir), false)]);
+}

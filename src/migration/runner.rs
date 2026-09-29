@@ -624,36 +624,36 @@ mod tests {
     use std::path::PathBuf;
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-    struct LegacyWalletRow {
-        profit: f64,
+    struct LegacyItem {
+        price: f64,
     }
 
-    impl Entity for LegacyWalletRow {
+    impl Entity for LegacyItem {
         fn entity_id(&self) -> &str {
             "legacy"
         }
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-    struct WalletRow {
+    struct Item {
         id: String,
-        product_id: String,
-        profit: f64,
+        legacy_id: String,
+        price: f64,
     }
 
-    impl Entity for WalletRow {
+    impl Entity for Item {
         fn entity_id(&self) -> &str {
             &self.id
         }
     }
 
-    impl MigrateTo<WalletRow> for LegacyWalletRow {
+    impl MigrateTo<Item> for LegacyItem {
         fn migrate_json(value: Value) -> Result<MigrateOutcome<Value>> {
-            let row: LegacyWalletRow = serde_json::from_value(value)?;
-            migrate_value(WalletRow {
-                id: "30657".into(),
-                product_id: "13152".into(),
-                profit: row.profit,
+            let row: LegacyItem = serde_json::from_value(value)?;
+            migrate_value(Item {
+                id: "item-1".into(),
+                legacy_id: "legacy-1".into(),
+                price: row.price,
             })
         }
     }
@@ -665,30 +665,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         let storage = Storage::builder(StorageConfig::default())
-            .migration_step::<LegacyWalletRow, WalletRow>()
+            .migration_step::<LegacyItem, Item>()
             .add_database(
                 DatabaseConfig::new("legacy", "legacy")
                     .dir_path(dir.join("legacy"))
                     .has_cache(false)
-                    .register::<LegacyWalletRow>("products"),
+                    .register::<LegacyItem>("legacy_items"),
             )
             .add_database(
-                DatabaseConfig::new("wallets", "wallets")
-                    .dir_path(dir.join("wallets"))
+                DatabaseConfig::new("items", "items")
+                    .dir_path(dir.join("items"))
                     .has_cache(false)
-                    .register::<WalletRow>("wallets"),
+                    .register::<Item>("items"),
             )
             .build()
             .unwrap();
 
         let legacy_db = storage.db_manager("legacy");
         let legacy_bytes =
-            serde_json::to_vec(&LegacyWalletRow { profit: 945.0 }).unwrap();
+            serde_json::to_vec(&LegacyItem { price: 12.5 }).unwrap();
         legacy_db
             .commit_batch(
                 &[(
-                    "products".to_string(),
-                    "13152".to_string(),
+                    "legacy_items".to_string(),
+                    "legacy-1".to_string(),
                     legacy_bytes,
                 )],
                 &[],
@@ -696,44 +696,44 @@ mod tests {
             .unwrap();
 
         let mut run = storage
-            .migrate::<LegacyWalletRow, WalletRow>()
-            .from_db("legacy", "products")
-            .to(MigrationTo::new("wallets").table("wallets"))
+            .migrate::<LegacyItem, Item>()
+            .from_db("legacy", "legacy_items")
+            .to(MigrationTo::new("items").table("items"))
             .on_target_conflict(TargetConflictPolicy::Skip);
 
         run.dry_run().unwrap();
         run.execute().unwrap();
 
-        let wallets_db = storage.db_manager("wallets");
+        let items_db = storage.db_manager("items");
         assert!(
-            wallets_db.get_raw("wallets", "30657").unwrap().is_some(),
-            "row must be stored under wallet.id"
+            items_db.get_raw("items", "item-1").unwrap().is_some(),
+            "row must be stored under item.id"
         );
         assert!(
-            wallets_db.get_raw("wallets", "13152").unwrap().is_none(),
-            "legacy product_id must not be used as redb key"
+            items_db.get_raw("items", "legacy-1").unwrap().is_none(),
+            "legacy id must not be used as redb key"
         );
 
-        let entries = wallets_db.list_entries("wallets").unwrap();
+        let entries = items_db.list_entries("items").unwrap();
         assert_eq!(entries.len(), 1);
-        let meta: WalletRow = serde_json::from_slice(&entries[0].1).unwrap();
-        assert_eq!(meta.id, "30657");
-        assert_eq!(entries[0].0, "30657");
+        let meta: Item = serde_json::from_slice(&entries[0].1).unwrap();
+        assert_eq!(meta.id, "item-1");
+        assert_eq!(entries[0].0, "item-1");
 
         storage
-            .domain::<WalletRow>()
+            .domain::<Item>()
             .repo()
             .set(
-                "30657",
-                &WalletRow {
-                    id: "30657".into(),
-                    product_id: "13152".into(),
-                    profit: 0.0,
+                "item-1",
+                &Item {
+                    id: "item-1".into(),
+                    legacy_id: "legacy-1".into(),
+                    price: 0.0,
                 },
             )
             .unwrap();
 
-        let entries = wallets_db.list_entries("wallets").unwrap();
+        let entries = items_db.list_entries("items").unwrap();
         assert_eq!(entries.len(), 1, "update must replace in place, not duplicate");
     }
 
@@ -743,18 +743,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         let storage = Storage::builder(StorageConfig::default())
-            .migration_step::<LegacyWalletRow, WalletRow>()
+            .migration_step::<LegacyItem, Item>()
             .add_database(
                 DatabaseConfig::new("legacy", "legacy")
                     .dir_path(dir.join("legacy"))
                     .has_cache(false)
-                    .register::<LegacyWalletRow>("products"),
+                    .register::<LegacyItem>("legacy_items"),
             )
             .add_database(
-                DatabaseConfig::new("wallets", "wallets")
-                    .dir_path(dir.join("wallets"))
+                DatabaseConfig::new("items", "items")
+                    .dir_path(dir.join("items"))
                     .has_cache(false)
-                    .register::<WalletRow>("wallets"),
+                    .register::<Item>("items"),
             )
             .build()
             .unwrap();
@@ -763,18 +763,18 @@ mod tests {
         legacy_db
             .commit_batch(
                 &[(
-                    "products".to_string(),
-                    "13152".to_string(),
-                    serde_json::to_vec(&LegacyWalletRow { profit: 1.0 }).unwrap(),
+                    "legacy_items".to_string(),
+                    "legacy-1".to_string(),
+                    serde_json::to_vec(&LegacyItem { price: 1.0 }).unwrap(),
                 )],
                 &[],
             )
             .unwrap();
 
         let mut run = storage
-            .migrate::<LegacyWalletRow, WalletRow>()
-            .from_db("legacy", "products")
-            .to(MigrationTo::new("wallets").table("wallets"))
+            .migrate::<LegacyItem, Item>()
+            .from_db("legacy", "legacy_items")
+            .to(MigrationTo::new("items").table("items"))
             .on_target_conflict(TargetConflictPolicy::Skip);
 
         let dry = run.dry_run().unwrap();

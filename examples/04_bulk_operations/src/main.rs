@@ -86,7 +86,7 @@ fn main() -> Result<()> {
     println!("━━━ Building Storage ━━━");
     let storage = Storage::builder(StorageConfig::default())
         .add_database(
-            DatabaseConfig::new("devices_db", "devices")
+            DatabaseConfig::new("sensors_db", "devices")
                 .dir_path(base_dir)
                 .backup_enabled(true) // backup required for restore_bulk
                 .register::<Device>("devices"),

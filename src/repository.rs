@@ -7,7 +7,7 @@ use crate::{
     blob::BlobStore,
     durability::{DurabilityMode, DEFAULT_MAX_COMMIT_BATCH_ENTRIES},
     fsutil::maybe_crash,
-    handle::{DbHandle, DbRef, RedbOptions},
+    handle::{DbHandle, DbRef, FileOpen, RedbOptions},
     metadata::types::{CloveMeta, TableStorageMode, META_TABLE},
     migration::chain::DbMigrationIndex,
     migration::layout::FieldLayout,
@@ -20,7 +20,7 @@ use crate::{
 use chrono::{Datelike, Local};
 use itertools::Itertools;
 use moka::sync::Cache;
-use redb::{ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 // use std::env;
 use crate::entity::Entity;
 use serde::de::DeserializeOwned;
@@ -151,10 +151,9 @@ impl DatabaseManager {
         //
         // An entry count cannot bound memory: the value is a `Vec<u8>` of
         // whatever the caller stored, so "10,000 entries" is 10,000 times an
-        // unknown. A production database of run logs carrying a serialized
-        // snapshot per row filled a 10,000-entry cache with roughly 100 MiB and
-        // held it for thirteen hours. The number the operator wrote was a count;
-        // the number that mattered was a size, and nothing connected the two.
+        // unknown: rows of 10 KB each make it 100 MiB. The number the operator
+        // wrote would be a count; the number that matters is a size, and
+        // nothing connects the two.
         //
         // A weigher connects them. `max_capacity` then means what an operator
         // actually wants to control, and a row being large costs proportionally
@@ -244,7 +243,7 @@ impl DatabaseManager {
         fs::create_dir_all(&dir)?;
         let db_path = dir.join(format!("{}.cldb", db_name));
         let redb = RedbOptions::default();
-        let db = DbHandle::new(redb.create(&db_path)?, db_path, DurabilityMode::Strict, redb);
+        let db = DbHandle::create(&db_path, DurabilityMode::Strict, redb)?;
         Self::open(
             db,
             dir_path,
@@ -341,6 +340,14 @@ impl DatabaseManager {
         self.db.is_closed()
     }
 
+    /// How this database's files opened: the `.cldb`, then its `.cldb.bak`
+    /// when backup is enabled.
+    pub(crate) fn opened_files(&self) -> Vec<&FileOpen> {
+        std::iter::once(self.db.opened())
+            .chain(self.backup_manager.as_ref().map(BackupManager::opened))
+            .collect()
+    }
+
     pub fn open_blob(&self, table: &str, id: &str) -> Result<File> {
         self.blob_store()?.open_read(table, id)
     }
@@ -380,8 +387,14 @@ impl DatabaseManager {
     }
 
 
+    /// Rows in the table, from redb's own count. It used to copy every key and
+    /// value (`list_entries`) only to take the length.
     pub fn count_keys(&self, table: &str) -> Result<usize> {
-        Ok(self.list_entries(table)?.len())
+        let definition: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(table);
+        let db = self.db()?;
+        let read_txn = db.begin_read()?;
+        let table_ref = read_txn.open_table(definition)?;
+        Ok(usize::try_from(table_ref.len()?).unwrap_or(usize::MAX))
     }
 
     pub fn table_layout(&self, table: &str) -> Result<FieldLayout> {
@@ -649,9 +662,8 @@ impl DatabaseManager {
     ///
     /// `moka` expires entries on a clock but frees them during maintenance, and
     /// maintenance runs when the cache is *used*. A cache nobody touches
-    /// therefore keeps every expired entry resident indefinitely — in one
-    /// production run, roughly 100 MiB survived a five-minute TTL for thirteen
-    /// hours, until the next read happened to run housekeeping.
+    /// therefore keeps every expired entry resident indefinitely — hours past
+    /// its TTL, until the next read happens to run housekeeping.
     ///
     /// That is correct behaviour for a cache and surprising for an operator
     /// watching a memory graph, so this makes it something a caller can ask for
@@ -1099,18 +1111,56 @@ impl<T: DeserializeOwned + Serialize + Clone + Entity> Repository<T> {
         self.database_manager.clear_cache();
     }
 
+    /// Every row. [`Self::list_map`] with no map; see it for how the table is read.
     pub fn list(&self) -> Result<Vec<T>> {
-        let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(self.table);
-        let data = self.database_manager.list(table)?;
+        self.list_map(|row| row)
+    }
 
-        Ok(data
-            .iter()
-            .map(|data| {
-                serde_json::from_slice::<T>(&data)
-                    .map_err(|e| ClError::Serialization(e))
-                    .unwrap()
-            })
-            .collect_vec())
+    /// Every row, read one at a time and passed through `map` as it is read.
+    ///
+    /// # Why not copy the table first
+    ///
+    /// `list` used to copy every stored value into one `Vec<Vec<u8>>` and parse
+    /// them only once the whole table was in memory. On a table of a few
+    /// hundred megabytes that held it twice while it was read, and left much of
+    /// that heap freed but still committed to the process. Here each
+    /// value is parsed straight out of the read transaction, so nothing is held
+    /// but what `map` returns: a field `map` drops never outlives its row, and
+    /// the result is sized from the table instead of grown by doubling.
+    ///
+    /// A row that does not parse is an error. `list` used to `unwrap()` it,
+    /// which took the process down.
+    ///
+    /// Reads the file, not the cache, as `list` always has.
+    pub fn list_map<U>(&self, mut map: impl FnMut(T) -> U) -> Result<Vec<U>> {
+        let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(self.table);
+        let db = self.database_manager.db()?;
+        let read_txn = db.begin_read()?;
+        let table_ref = read_txn.open_table(table)?;
+        let mut out = Vec::with_capacity(usize::try_from(table_ref.len()?).unwrap_or(0));
+        for row in table_ref.iter()? {
+            let (_key, value) = row?;
+            out.push(map(serde_json::from_slice::<T>(value.value())?));
+        }
+        Ok(out)
+    }
+
+    /// [`Self::get_uncached`], read as `U` instead of `T`.
+    ///
+    /// `U` is any type whose fields are a subset of the stored row's. serde
+    /// passes over the stored fields `U` does not name without building them,
+    /// and the value is parsed straight out of the read transaction rather than
+    /// copied first. It is how a caller reads many large rows without their
+    /// bulky fields.
+    pub fn get_uncached_as<U: DeserializeOwned>(&self, id: &str) -> Result<U> {
+        let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(self.table);
+        let db = self.database_manager.db()?;
+        let read_txn = db.begin_read()?;
+        let table_ref = read_txn.open_table(table)?;
+        match table_ref.get(id)? {
+            Some(value) => Ok(serde_json::from_slice(value.value())?),
+            None => Err(ClError::NotFound(format!("{} not found", self.table))),
+        }
     }
 
     pub fn set(&self, id: &str, value: &T) -> Result<()> {

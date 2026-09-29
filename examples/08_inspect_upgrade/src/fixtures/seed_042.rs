@@ -258,7 +258,7 @@ pub fn create() -> Result<RetailManifest> {
         buyer_rows.push((b.id, b.name, b.email));
     }
 
-    let employee_inputs = [("Eve", "manager"), ("Dan", "cashier")];
+    let employee_inputs = [("Eve", "manager"), ("Dan", "clerk")];
     let mut employee_rows = Vec::new();
     for (name, role) in employee_inputs {
         let e = employees.create::<EmployeeDto, EmployeeOut>(EmployeeDto {

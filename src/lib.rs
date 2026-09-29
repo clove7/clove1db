@@ -11,6 +11,8 @@ mod handle_tests;
 pub mod metadata;
 pub mod migration;
 pub mod repository;
+#[cfg(test)]
+mod repository_tests;
 pub mod storage;
 pub mod units;
 pub mod upgrade;

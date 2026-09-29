@@ -33,7 +33,7 @@ fn main() -> clove1db::units::Result<()> {
                 scenarios::PARALLEL_THREADS,
                 scenarios::PARALLEL_PER_THREAD
             ),
-            "Focus: diverse sensitive cafe-like rows, backup history, heavy migrate V1→V2→V3, crash inject".into(),
+            "Focus: diverse sensitive-looking store rows, backup history, heavy migrate V1→V2→V3, crash inject".into(),
             "Every phase prints what it does — watch the terminal carefully.".into(),
         ],
     );

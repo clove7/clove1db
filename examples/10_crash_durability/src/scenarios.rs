@@ -109,7 +109,7 @@ fn report_dir(label: &str, dir: &Path) {
 }
 
 fn orders_v1_storage(dir: PathBuf, backup: bool) -> Result<Storage> {
-    let mut db = DatabaseConfig::new("orders_db", "orders")
+    let mut db = DatabaseConfig::new("sales_db", "orders")
         .dir_path(dir)
         .cache_bytes(16 * 1024 * 1024, 120, 60)
         .max_commit_batch_entries(128)
@@ -157,8 +157,8 @@ fn seed_orders_batch(
     let mid: OrderV1 = storage.domain::<OrderV1>().get(&ids[count / 2])?;
     let last: OrderV1 = storage.domain::<OrderV1>().get(&ids[count - 1])?;
     log::detail(format!(
-        "sample[0] customer={} branch={} total={}",
-        sample.customer_name, sample.branch_id, sample.total_halalas
+        "sample[0] customer={} store={} total={}",
+        sample.customer_name, sample.store_id, sample.total_cents
     ));
     log::detail(format!(
         "sample[mid] customer={} items_len={}",
@@ -180,7 +180,7 @@ pub fn run_child(scenario: &str, base: &Path) -> Result<()> {
     match scenario {
         "index_write" => {
             let dir = base.join("s01");
-            let mig = dir.join("orders_db").join("orders.migration");
+            let mig = dir.join("sales_db").join("orders.migration");
             let _ = fs::remove_file(mig.join("index.json"));
             let _ = fs::remove_file(mig.join("tables").join("orders").join("index.json"));
             let _ = orders_v1_storage(dir, true)?;
@@ -234,7 +234,7 @@ pub fn run_child(scenario: &str, base: &Path) -> Result<()> {
             let dir = base.join("s07");
             eprintln!("[crash-child] forcing migration index rewrite crash after parallel seed");
             let mig = dir
-                .join("orders_db")
+                .join("sales_db")
                 .join("orders.migration")
                 .join("index.json");
             let _ = fs::remove_file(&mig);
@@ -249,7 +249,7 @@ pub fn run_child(scenario: &str, base: &Path) -> Result<()> {
                 .migration_step::<OrderV1, OrderV2>()
                 .migration_step::<OrderV2, OrderV3>()
                 .add_database(
-                    DatabaseConfig::new("orders_db", "orders")
+                    DatabaseConfig::new("sales_db", "orders")
                         .dir_path(dir)
                         .backup_enabled(true)
                         .register::<OrderV1>("orders"),
@@ -263,7 +263,7 @@ pub fn run_child(scenario: &str, base: &Path) -> Result<()> {
             let dir = base.join("s09");
             let _ = Storage::builder(StorageConfig::default())
                 .add_database(
-                    DatabaseConfig::new("devices_db", "devices")
+                    DatabaseConfig::new("sensors_db", "devices")
                         .dir_path(dir.clone())
                         .backup_enabled(true)
                         .register::<Device>("devices"),
@@ -340,7 +340,7 @@ pub fn scenario_01_kill_during_index_write(base: &Path) -> Result<Duration> {
         for i in 0..200.min(ids.len()) {
             let mut o: OrderV1 = domain.get(&ids[i])?;
             o.notes = format!("{}|edit-round-{round}", o.notes);
-            o.total_halalas += 1;
+            o.total_cents += 1;
             let _: OrderV1 = domain.update(&ids[i], o)?;
         }
         log::detail(format!("round {round} complete"));
@@ -381,7 +381,7 @@ pub fn scenario_02_nul_index_recover(base: &Path) -> Result<Duration> {
     log::scenario_header(
         2,
         "Forced NUL index.json recovery",
-        "Reproduce the cafe power-loss artifact; open must quarantine + rebuild indexes",
+        "Reproduce a power-loss artifact; open must quarantine + rebuild indexes",
     );
     let wall = Instant::now();
     let dir = base.join("s02");
@@ -394,7 +394,7 @@ pub fn scenario_02_nul_index_recover(base: &Path) -> Result<Duration> {
     drop(storage);
 
     log::phase("Manually corrupt migration indexes to all-NUL (power-loss shape)");
-    let mig = dir.join("orders_db").join("orders.migration");
+    let mig = dir.join("sales_db").join("orders.migration");
     let root_index = mig.join("index.json");
     let table_index = mig.join("tables").join("orders").join("index.json");
     let root_len = fs::metadata(&root_index)?.len() as usize;
@@ -812,7 +812,7 @@ pub fn scenario_08_kill_during_migrate(base: &Path) -> Result<Duration> {
         .migration_step::<OrderV1, OrderV2>()
         .migration_step::<OrderV2, OrderV3>()
         .add_database(
-            DatabaseConfig::new("orders_db", "orders")
+            DatabaseConfig::new("sales_db", "orders")
                 .dir_path(dir.clone())
                 .backup_enabled(true)
                 .cache_bytes(16 * 1024 * 1024, 120, 60)
@@ -823,7 +823,7 @@ pub fn scenario_08_kill_during_migrate(base: &Path) -> Result<Duration> {
     let v2: OrderV2 = storage.domain::<OrderV2>().get(&ids[0])?;
     log::detail(format!(
         "V2 sample status={} cash={} card={}",
-        v2.status, v2.cash_halalas, v2.card_halalas
+        v2.status, v2.cash_cents, v2.card_cents
     ));
 
     let t = log::Timer::start("migrate V2→V3");
@@ -841,7 +841,7 @@ pub fn scenario_08_kill_during_migrate(base: &Path) -> Result<Duration> {
         .migration_step::<OrderV1, OrderV2>()
         .migration_step::<OrderV2, OrderV3>()
         .add_database(
-            DatabaseConfig::new("orders_db", "orders")
+            DatabaseConfig::new("sales_db", "orders")
                 .dir_path(dir.clone())
                 .backup_enabled(true)
                 .register::<OrderV3>("orders"),
@@ -851,7 +851,7 @@ pub fn scenario_08_kill_during_migrate(base: &Path) -> Result<Duration> {
     let v3_last: OrderV3 = storage.domain::<OrderV3>().get(ids.last().unwrap())?;
     log::detail(format!(
         "V3 sample tax={} loyalty={} audit_len={}",
-        v3.tax_halalas,
+        v3.tax_cents,
         v3.loyalty_points,
         v3.audit_trail.len()
     ));
@@ -867,7 +867,7 @@ pub fn scenario_09_multi_db_kill(base: &Path) -> Result<Duration> {
     log::scenario_header(
         9,
         "Multi-DB devices+dashboard kill",
-        "Cafe-like split DBs; crash on open metadata; then heavy seed + backup edits",
+        "Split DBs (orders, devices, feed); crash on open metadata; then heavy seed + backup edits",
     );
     let wall = Instant::now();
     let dir = base.join("s09");
@@ -882,7 +882,7 @@ pub fn scenario_09_multi_db_kill(base: &Path) -> Result<Duration> {
     log::phase("Reopen both DBs with backup and load operational traffic");
     let storage = Storage::builder(StorageConfig::default())
         .add_database(
-            DatabaseConfig::new("devices_db", "devices")
+            DatabaseConfig::new("sensors_db", "devices")
                 .dir_path(dir.clone())
                 .backup_enabled(true)
                 .cache_bytes(8 * 1024 * 1024, 60, 30)

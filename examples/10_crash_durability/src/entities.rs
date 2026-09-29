@@ -6,16 +6,16 @@ use clove1db::migration::MigrateTo;
 use clove1db::units::Result;
 use serde_json::Value;
 
-/// Heavy cafe-order-like V1 record (sensitive operational data).
+/// Heavy store-order V1 record (sensitive-looking operational data).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OrderV1 {
     pub id: String,
-    pub branch_id: String,
-    pub cashier_id: String,
+    pub store_id: String,
+    pub clerk_id: String,
     pub customer_name: String,
     pub items_json: String,
     pub notes: String,
-    pub total_halalas: i64,
+    pub total_cents: i64,
     pub created_at_ms: i64,
 }
 
@@ -39,16 +39,16 @@ impl OutputDto<OrderV1> for OrderV1 {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OrderV2 {
     pub id: String,
-    pub branch_id: String,
-    pub cashier_id: String,
+    pub store_id: String,
+    pub clerk_id: String,
     pub customer_name: String,
     pub items_json: String,
     pub notes: String,
-    pub total_halalas: i64,
+    pub total_cents: i64,
     pub created_at_ms: i64,
     pub status: String,
-    pub cash_halalas: i64,
-    pub card_halalas: i64,
+    pub cash_cents: i64,
+    pub card_cents: i64,
 }
 
 impl Entity for OrderV2 {
@@ -72,12 +72,12 @@ impl MigrateTo<OrderV2> for OrderV1 {
         let mut v = value;
         if let Some(obj) = v.as_object_mut() {
             let total = obj
-                .get("total_halalas")
+                .get("total_cents")
                 .and_then(|x| x.as_i64())
                 .unwrap_or(0);
             obj.insert("status".into(), Value::String("completed".into()));
-            obj.insert("cash_halalas".into(), Value::from(total / 2));
-            obj.insert("card_halalas".into(), Value::from(total - total / 2));
+            obj.insert("cash_cents".into(), Value::from(total / 2));
+            obj.insert("card_cents".into(), Value::from(total - total / 2));
         }
         Ok(clove1db::migration::MigrateOutcome::Migrate(v))
     }
@@ -87,17 +87,17 @@ impl MigrateTo<OrderV2> for OrderV1 {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OrderV3 {
     pub id: String,
-    pub branch_id: String,
-    pub cashier_id: String,
+    pub store_id: String,
+    pub clerk_id: String,
     pub customer_name: String,
     pub items_json: String,
     pub notes: String,
-    pub total_halalas: i64,
+    pub total_cents: i64,
     pub created_at_ms: i64,
     pub status: String,
-    pub cash_halalas: i64,
-    pub card_halalas: i64,
-    pub tax_halalas: i64,
+    pub cash_cents: i64,
+    pub card_cents: i64,
+    pub tax_cents: i64,
     pub loyalty_points: i64,
     pub audit_trail: String,
 }
@@ -123,11 +123,11 @@ impl MigrateTo<OrderV3> for OrderV2 {
         let mut v = value;
         if let Some(obj) = v.as_object_mut() {
             let total = obj
-                .get("total_halalas")
+                .get("total_cents")
                 .and_then(|x| x.as_i64())
                 .unwrap_or(0);
-            let tax = total * 15 / 100;
-            obj.insert("tax_halalas".into(), Value::from(tax));
+            let tax = total * 10 / 100;
+            obj.insert("tax_cents".into(), Value::from(tax));
             obj.insert("loyalty_points".into(), Value::from(total / 100));
             let id = obj
                 .get("id")
@@ -150,7 +150,7 @@ impl MigrateTo<OrderV3> for OrderV2 {
 pub struct Device {
     pub id: String,
     pub label: String,
-    pub branch_id: String,
+    pub store_id: String,
     pub firmware: String,
     pub meta_json: String,
 }
@@ -220,41 +220,41 @@ impl OutputDto<InvoiceBlob> for InvoiceBlob {
     }
 }
 
-/// Arabic + English customer names for diversity.
+/// Names in several scripts, so rows exercise multi-byte UTF-8.
 pub const CUSTOMER_NAMES: &[&str] = &[
-    "أحمد العتيبي",
-    "فاطمة الزهراني",
-    "محمد القحطاني",
-    "نورة الشمري",
-    "خالد الدوسري",
-    "Sara Al-Harbi",
-    "Omar Al-Ghamdi",
-    "Layla Hassan",
-    "Yousef Faris",
-    "Maha Alotaibi",
-    "عبدالله السبيعي",
-    "ريم الحربي",
+    "Alice Moore",
+    "José Álvarez",
+    "Zoë Müller",
+    "Ana Petrova",
+    "Αλέξης Παππάς",
+    "Иван Смирнов",
+    "李明",
+    "佐藤 花子",
+    "김민준",
+    "Priya Sharma",
+    "Tomás Ó Briain",
+    "Nguyễn Văn An",
 ];
 
-pub const BRANCHES: &[&str] = &["RYD-01", "JED-02", "DMM-03", "MED-04", "ABH-05"];
-pub const CASHIERS: &[&str] = &["csh-01", "csh-02", "csh-03", "csh-04", "csh-05", "csh-06"];
+pub const STORES: &[&str] = &["store-01", "store-02", "store-03", "store-04", "store-05"];
+pub const CLERKS: &[&str] = &["clerk-01", "clerk-02", "clerk-03", "clerk-04", "clerk-05", "clerk-06"];
 
 pub const MENU_ITEMS: &[&str] = &[
-    "قهوة عربية",
-    "كابتشينو",
-    "لاتيه",
-    "شاي كرك",
-    "كرواسون",
-    "تشيز كيك",
-    "ماء",
-    "عصير برتقال",
-    "آيس كوفي",
-    "ساندويش تونة",
+    "notebook",
+    "pencil set",
+    "desk lamp",
+    "stapler",
+    "paper ream",
+    "marker pack",
+    "sticky notes",
+    "folder",
+    "ruler",
+    "tape",
 ];
 
 pub fn make_order_v1(i: usize, now_ms: i64) -> OrderV1 {
-    let branch = BRANCHES[i % BRANCHES.len()];
-    let cashier = CASHIERS[i % CASHIERS.len()];
+    let store = STORES[i % STORES.len()];
+    let clerk = CLERKS[i % CLERKS.len()];
     let customer = CUSTOMER_NAMES[i % CUSTOMER_NAMES.len()];
     let n_lines = 2 + (i % 5);
     let mut lines = Vec::new();
@@ -264,22 +264,22 @@ pub fn make_order_v1(i: usize, now_ms: i64) -> OrderV1 {
         let qty = 1 + ((i + k) % 3) as i64;
         let price = 500 + ((i * 17 + k * 31) % 4500) as i64;
         total += qty * price;
-        lines.push(format!(r#"{{"name":"{name}","qty":{qty},"unit_halalas":{price}}}"#));
+        lines.push(format!(r#"{{"name":"{name}","qty":{qty},"unit_cents":{price}}}"#));
     }
     // Sensitive-looking notes + padding to grow row size.
     let notes = format!(
-        "order#{i}|vip={}|allergy=nuts|pad={}",
+        "order#{i}|priority={}|gift_wrap=yes|pad={}",
         i % 7 == 0,
         "N".repeat(128 + (i % 256))
     );
     OrderV1 {
         id: format!("ord-{i:06}"),
-        branch_id: branch.into(),
-        cashier_id: cashier.into(),
+        store_id: store.into(),
+        clerk_id: clerk.into(),
         customer_name: customer.into(),
         items_json: format!("[{}]", lines.join(",")),
         notes,
-        total_halalas: total,
+        total_cents: total,
         created_at_ms: now_ms + i as i64,
     }
 }
@@ -288,7 +288,7 @@ pub fn make_device(i: usize) -> Device {
     Device {
         id: format!("dev-{i:04}"),
         label: format!("POS-{}", i),
-        branch_id: BRANCHES[i % BRANCHES.len()].into(),
+        store_id: STORES[i % STORES.len()].into(),
         firmware: format!("1.{}.{}", i % 10, i % 100),
         meta_json: format!(
             r#"{{"mac":"AA:BB:CC:DD:{:02X}:{:02X}","serial":"SN{i:08}","pad":"{}"}}"#,

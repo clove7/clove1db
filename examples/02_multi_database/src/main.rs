@@ -141,7 +141,7 @@ fn main() -> Result<()> {
         )
         // Database 2: catalog (products, orders, etc.)
         .add_database(
-            DatabaseConfig::new("catalog_db", "catalog")
+            DatabaseConfig::new("inventory_db", "catalog")
                 .dir_path(base_dir.clone())
                 .cache_bytes(16 * 1024 * 1024, 600, 120) // custom cache settings
                 .register::<Product>("products"),
@@ -156,19 +156,19 @@ fn main() -> Result<()> {
     let user_domain = storage.domain::<User>();
 
     let user = user_domain.create::<CreateUserDto, UserResponse>(CreateUserDto {
-        username: "system_admin".into(),
+        username: "ops_user".into(),
     })?;
     println!("  ✅ Saved to users_db: {:?}", user);
 
     // ── 3. Interact with Database 2 (Catalog) ──────────────
-    println!("\n━━━ Operations on catalog_db ━━━");
+    println!("\n━━━ Operations on inventory_db ━━━");
     let product_domain = storage.domain::<Product>();
 
     let product = product_domain.create::<CreateProductDto, ProductResponse>(CreateProductDto {
         title: "Mechanical Keyboard".into(),
         price: 149.99,
     })?;
-    println!("  ✅ Saved to catalog_db: {:?}", product);
+    println!("  ✅ Saved to inventory_db: {:?}", product);
 
     // ── 4. Verify Isolation ────────────────────────────────
     println!("\n━━━ Data Isolation Check ━━━");

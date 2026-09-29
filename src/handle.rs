@@ -1,15 +1,15 @@
 //! One redb file: how it is opened, how it is written, and how it is closed.
 //!
-//! Three problems meet here, and all three were measured on a production
-//! server before this module existed:
+//! Three problems meet here:
 //!
-//! - **Memory.** redb caches pages up to 1 GiB *per file* unless told otherwise.
-//!   A full scan of a 545 MB table left 528 MiB resident; with a 64 MiB cap it
-//!   left 65 MiB, at the same speed. [`RedbOptions::cache_bytes`] is that cap.
+//! - **Memory.** redb caches pages up to 1 GiB *per file* unless told otherwise,
+//!   so a full scan of a large table leaves about as much of it resident as it
+//!   read. A 64 MiB cap bounds that at the same scan speed.
+//!   [`RedbOptions::cache_bytes`] is that cap.
 //! - **Repair.** A process killed after writing leaves every file needing a full
-//!   repair on the next open — a walk of the whole file, 612 ms and a 422 MiB
-//!   peak for that 545 MB table. [`RedbOptions::quick_repair`] makes each commit
-//!   save the allocator state, so the same open took 7 ms.
+//!   repair on the next open — a walk of the whole file, whose time and peak
+//!   memory grow with the file. [`RedbOptions::quick_repair`] makes each commit
+//!   save the allocator state, so that open loads it instead, in milliseconds.
 //! - **Closing.** redb closes a file cleanly only when its `Database` is dropped,
 //!   and an application that keeps its storage in a `static` never drops it — so
 //!   *every* run ended in a repair, even a clean Ctrl+C. [`DbHandle::close`]
@@ -17,7 +17,9 @@
 
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::sync::{PoisonError, RwLock, RwLockReadGuard};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard};
+use std::time::{Duration, Instant};
 
 use redb::{Builder, Database, Durability, WriteTransaction};
 
@@ -58,21 +60,62 @@ impl RedbOptions {
 
     /// Open an existing file.
     pub fn open(&self, path: &Path) -> Result<Database> {
-        #[cfg(test)]
-        opens::record(path);
-        self.builder()
-            .open(path)
-            .map_err(|e| ClError::Database(redb::Error::from(e)))
+        self.open_timed(path, false).map(|(db, _)| db)
     }
 
     /// Open a file, creating it if it does not exist.
     pub fn create(&self, path: &Path) -> Result<Database> {
+        self.open_timed(path, true).map(|(db, _)| db)
+    }
+
+    /// Open (or create) a file and say how the open went: how long it took,
+    /// whether redb had to repair the file, and how large the file is.
+    fn open_timed(&self, path: &Path, create: bool) -> Result<(Database, FileOpen)> {
         #[cfg(test)]
         opens::record(path);
-        self.builder()
-            .create(path)
-            .map_err(|e| ClError::Database(redb::Error::from(e)))
+        // redb calls this when it rebuilds the allocator state by walking the
+        // whole file — a full repair. Loading a saved state (quick repair) or
+        // opening a cleanly closed file never calls it. Initialising a new,
+        // empty file goes through the same path, so a file that did not exist
+        // before this open is never reported as repaired.
+        let existed = path.is_file();
+        let repaired = Arc::new(AtomicBool::new(false));
+        let seen = repaired.clone();
+        let mut builder = self.builder();
+        builder.set_repair_callback(move |_| seen.store(true, Ordering::Relaxed));
+
+        let start = Instant::now();
+        let opened = if create {
+            builder.create(path)
+        } else {
+            builder.open(path)
+        };
+        let open_time = start.elapsed();
+        let db = opened.map_err(|e| ClError::Database(redb::Error::from(e)))?;
+
+        let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        Ok((
+            db,
+            FileOpen {
+                path: path.to_path_buf(),
+                bytes,
+                open_time,
+                repaired: existed && repaired.load(Ordering::Relaxed),
+            },
+        ))
     }
+}
+
+/// How one file's open went. Kept by its [`DbHandle`] and read through
+/// `Storage::open_report`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FileOpen {
+    pub(crate) path: PathBuf,
+    /// The file's size right after the open.
+    pub(crate) bytes: u64,
+    pub(crate) open_time: Duration,
+    /// redb walked the whole file to rebuild its allocator state.
+    pub(crate) repaired: bool,
 }
 
 /// Every path opened through [`RedbOptions`], so a test can count the opens
@@ -105,21 +148,35 @@ pub struct DbHandle {
     path: PathBuf,
     durability: DurabilityMode,
     quick_repair: bool,
+    opened: FileOpen,
 }
 
 impl DbHandle {
-    pub(crate) fn new(
-        db: Database,
-        path: PathBuf,
-        durability: DurabilityMode,
-        options: RedbOptions,
-    ) -> Self {
+    /// Open an existing file.
+    pub(crate) fn open(path: &Path, durability: DurabilityMode, options: RedbOptions) -> Result<Self> {
+        let (db, opened) = options.open_timed(path, false)?;
+        Ok(Self::serve(db, opened, durability, options))
+    }
+
+    /// Open a file, creating it if it does not exist.
+    pub(crate) fn create(path: &Path, durability: DurabilityMode, options: RedbOptions) -> Result<Self> {
+        let (db, opened) = options.open_timed(path, true)?;
+        Ok(Self::serve(db, opened, durability, options))
+    }
+
+    fn serve(db: Database, opened: FileOpen, durability: DurabilityMode, options: RedbOptions) -> Self {
         Self {
             slot: RwLock::new(Some(db)),
-            path,
+            path: opened.path.clone(),
             durability,
             quick_repair: options.quick_repair,
+            opened,
         }
+    }
+
+    /// How this file's open went.
+    pub(crate) fn opened(&self) -> &FileOpen {
+        &self.opened
     }
 
     /// The open file, or [`ClError::Closed`].

@@ -3,16 +3,15 @@
 //! Six experiments on what the cache actually costs, each one printing numbers
 //! you can check rather than a claim you have to believe.
 //!
-//! They exist because of a real incident. A production database of launcher run
-//! logs was configured `cache(10_000, 300, 60)` — ten thousand entries, a
-//! five-minute TTL. Each row carried a serialized snapshot, so "ten thousand
-//! entries" was ten thousand times a number nobody had written down. A
-//! ninety-day range scan walked the whole history through that cache, the live
-//! heap rose by ~100 MiB, and it stayed there for **thirteen hours** despite the
-//! five-minute TTL.
+//! The scenario: a database of event rows configured `cache(10_000, 300, 60)` —
+//! ten thousand entries, a five-minute TTL. Each row carries a payload of
+//! unknown size, so "ten thousand entries" is ten thousand times a number
+//! nobody wrote down. A long range scan walks the whole history through that
+//! cache, the live heap rises by tens of MiB, and it can stay there for
+//! **hours** despite the five-minute TTL.
 //!
-//! Three separate things had to be true for that to happen, and each experiment
-//! below isolates one:
+//! Three separate things have to be true for that to happen, and each
+//! experiment below isolates one:
 //!
 //! | # | Question |
 //! |---|---|
@@ -40,30 +39,30 @@ use clove1db::{
 // A row whose size is the caller's business, not the cache's
 // ═══════════════════════════════════════════════════════════
 
-/// Modelled on the row that caused the incident: a handful of small fields and
-/// one unbounded blob. The cache cannot know how big `snapshot` is, which is the
+/// The row from the scenario: a handful of small fields and
+/// one unbounded blob. The cache cannot know how big `payload` is, which is the
 /// whole problem with counting entries.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct RunLog {
+struct Event {
     id: String,
-    device_id: String,
+    source_id: String,
     started_at: i64,
     /// The unbounded one.
-    snapshot: String,
+    payload: String,
 }
 
-impl Entity for RunLog {
+impl Entity for Event {
     fn entity_id(&self) -> &str {
         &self.id
     }
 }
 
-/// A small, genuinely hot row — the kind a cache is actually for. In the real
-/// database this was the per-day index of run ids.
+/// A small, genuinely hot row — the kind a cache is actually for: a per-day
+/// index of event ids.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct DayIndex {
     id: String,
-    run_ids: Vec<String>,
+    event_ids: Vec<String>,
 }
 
 impl Entity for DayIndex {
@@ -83,12 +82,12 @@ fn mib(bytes: u64) -> f64 {
     bytes as f64 / MIB as f64
 }
 
-fn run_log(i: usize, snapshot_bytes: usize) -> RunLog {
-    RunLog {
-        id: format!("run-{i:06}"),
-        device_id: format!("device-{}", i % 16),
+fn event(i: usize, payload_bytes: usize) -> Event {
+    Event {
+        id: format!("evt-{i:06}"),
+        source_id: format!("source-{}", i % 16),
         started_at: 1_700_000_000 + i as i64,
-        snapshot: "x".repeat(snapshot_bytes),
+        payload: "x".repeat(payload_bytes),
     }
 }
 
@@ -107,7 +106,7 @@ fn open(tag: &str, cache: impl FnOnce(DatabaseConfig) -> DatabaseConfig) -> (Sto
         .add_database(
             cache(DatabaseConfig::new("logs_db", "logs"))
                 .backup_enabled(false)
-                .register::<RunLog>("run_logs")
+                .register::<Event>("events")
                 .register::<DayIndex>("day_indexes"),
         )
         .build()
@@ -115,10 +114,10 @@ fn open(tag: &str, cache: impl FnOnce(DatabaseConfig) -> DatabaseConfig) -> (Sto
     (storage, dir)
 }
 
-fn seed(storage: &Storage, count: usize, snapshot_bytes: usize) -> Result<()> {
-    let repo = storage.domain::<RunLog>().repo();
+fn seed(storage: &Storage, count: usize, payload_bytes: usize) -> Result<()> {
+    let repo = storage.domain::<Event>().repo();
     for i in 0..count {
-        let row = run_log(i, snapshot_bytes);
+        let row = event(i, payload_bytes);
         repo.set(&row.id, &row)?;
     }
     Ok(())
@@ -152,9 +151,9 @@ fn experiment_1_entry_count_is_not_a_bound() -> Result<()> {
         let (storage, _dir) = open("e1", |c| c.cache_bytes(4096 * MIB, 300, 300));
         seed(&storage, ENTRIES as usize, size)?;
 
-        let repo = storage.domain::<RunLog>().repo();
+        let repo = storage.domain::<Event>().repo();
         for i in 0..ENTRIES as usize {
-            let _ = repo.get(&format!("run-{i:06}"))?;
+            let _ = repo.get(&format!("evt-{i:06}"))?;
         }
         repo.run_cache_maintenance();
         let (bytes, entries) = repo.cache_stats();
@@ -167,7 +166,7 @@ fn experiment_1_entry_count_is_not_a_bound() -> Result<()> {
     }
 
     println!(
-        "\n  Same count, ~64x the memory. This is the incident in one table:\n\
+        "\n  Same count, ~64x the memory. This is the scenario in one table:\n\
          the operator wrote a count, the machine paid a size, and nothing in\n\
          the API connected the two."
     );
@@ -200,9 +199,9 @@ fn experiment_2_a_byte_budget_holds() -> Result<()> {
         let (storage, _dir) = open("e2", |c| c.cache_bytes(BUDGET_MIB * MIB, 300, 300));
         seed(&storage, 2_000, size)?;
 
-        let repo = storage.domain::<RunLog>().repo();
+        let repo = storage.domain::<Event>().repo();
         for i in 0..2_000usize {
-            let _ = repo.get(&format!("run-{i:06}"))?;
+            let _ = repo.get(&format!("evt-{i:06}"))?;
         }
         repo.run_cache_maintenance();
         let (bytes, entries) = repo.cache_stats();
@@ -255,7 +254,7 @@ fn experiment_3_a_bulk_scan_does_not_evict_the_hot_set() -> Result<()> {
     for d in 0..64 {
         let row = DayIndex {
             id: format!("day-{d:03}"),
-            run_ids: (0..8).map(|i| format!("run-{i:06}")).collect(),
+            event_ids: (0..8).map(|i| format!("evt-{i:06}")).collect(),
         };
         idx.set(&row.id, &row)?;
     }
@@ -268,7 +267,7 @@ fn experiment_3_a_bulk_scan_does_not_evict_the_hot_set() -> Result<()> {
 
     // Now the scan: 4,000 heavy rows, walked once, never read again.
     seed(&storage, 4_000, 8 * KIB)?;
-    let logs = storage.domain::<RunLog>().repo();
+    let logs = storage.domain::<Event>().repo();
 
     // `set` populates the cache too, so the seeding just filled it. Clear and
     // re-warm only the hot set, so what follows measures the *scan*.
@@ -279,7 +278,7 @@ fn experiment_3_a_bulk_scan_does_not_evict_the_hot_set() -> Result<()> {
     idx.run_cache_maintenance();
 
     for i in 0..4_000usize {
-        let _ = logs.get(&format!("run-{i:06}"))?;
+        let _ = logs.get(&format!("evt-{i:06}"))?;
     }
     logs.run_cache_maintenance();
 
@@ -326,13 +325,13 @@ fn experiment_4_uncached_reads_leave_it_alone() -> Result<()> {
     for d in 0..64 {
         let row = DayIndex {
             id: format!("day-{d:03}"),
-            run_ids: (0..8).map(|i| format!("run-{i:06}")).collect(),
+            event_ids: (0..8).map(|i| format!("evt-{i:06}")).collect(),
         };
         idx.set(&row.id, &row)?;
         let _ = idx.get(&row.id)?;
     }
     seed(&storage, 4_000, 8 * KIB)?;
-    let logs = storage.domain::<RunLog>().repo();
+    let logs = storage.domain::<Event>().repo();
 
     // `set` populates the cache as well as `get`, so the seeding above just put
     // all 4,000 rows in it. Clear, then re-warm only the hot set, so what is
@@ -346,8 +345,8 @@ fn experiment_4_uncached_reads_leave_it_alone() -> Result<()> {
 
     let mut checksum = 0usize;
     for i in 0..4_000usize {
-        let row = logs.get_uncached(&format!("run-{i:06}"))?;
-        checksum += row.snapshot.len();
+        let row = logs.get_uncached(&format!("evt-{i:06}"))?;
+        checksum += row.payload.len();
     }
     logs.run_cache_maintenance();
     let (after, entries_after) = logs.cache_stats();
@@ -366,7 +365,7 @@ fn experiment_4_uncached_reads_leave_it_alone() -> Result<()> {
     println!("  hot set before scan       : {:.2} MiB in {entries_before} entries", mib(before));
     println!("  after 4,000 uncached reads: {:.2} MiB in {entries_after} entries", mib(after));
     println!("  hot rows still cached     : {survived} of 64");
-    println!("  rows really read          : {} bytes of snapshot", checksum);
+    println!("  rows really read          : {} bytes of payload", checksum);
     println!(
         "\n  Same data, same 4,000 reads, cache untouched. This is the read for a\n\
          key you are walking past rather than coming back to."
@@ -378,7 +377,7 @@ fn experiment_4_uncached_reads_leave_it_alone() -> Result<()> {
 // 5. Expired is not freed
 // ═══════════════════════════════════════════════════════════
 
-/// The thirteen hours. An entry expires on a clock; its memory comes back
+/// Hours past the TTL. An entry expires on a clock; its memory comes back
 /// during maintenance, and maintenance runs when the cache is used.
 fn experiment_5_expired_is_not_freed() -> Result<()> {
     header(5, "expired is not the same as freed");
@@ -387,9 +386,9 @@ fn experiment_5_expired_is_not_freed() -> Result<()> {
     let (storage, _dir) = open("e5", |c| c.cache_bytes(256 * MIB, 2, 2));
     seed(&storage, 1_500, 8 * KIB)?;
 
-    let repo = storage.domain::<RunLog>().repo();
+    let repo = storage.domain::<Event>().repo();
     for i in 0..1_500usize {
-        let _ = repo.get(&format!("run-{i:06}"))?;
+        let _ = repo.get(&format!("evt-{i:06}"))?;
     }
     repo.run_cache_maintenance();
     let (filled, n_filled) = repo.cache_stats();
@@ -408,8 +407,8 @@ fn experiment_5_expired_is_not_freed() -> Result<()> {
     println!(
         "\n  {}",
         if idle > swept {
-            "Expired entries were still resident until maintenance ran. In production\n  \
-             that gap was thirteen hours, because nothing read that database in between."
+            "Expired entries were still resident until maintenance ran. With no reads\n  \
+             in between, that gap lasts as long as nothing touches the database."
         } else {
             "This build reclaimed without an explicit sweep — timing-dependent, so read\n  \
              the numbers above rather than trusting the label."
@@ -429,9 +428,9 @@ fn experiment_6_what_it_costs_in_time() -> Result<f64> {
     header(6, "the other half of the trade");
     let (storage, _dir) = open("e6", |c| c.cache_bytes(256 * MIB, 300, 300));
     seed(&storage, 2_000, 8 * KIB)?;
-    let repo = storage.domain::<RunLog>().repo();
+    let repo = storage.domain::<Event>().repo();
 
-    let keys: Vec<String> = (0..2_000).map(|i| format!("run-{i:06}")).collect();
+    let keys: Vec<String> = (0..2_000).map(|i| format!("evt-{i:06}")).collect();
 
     // `set` populates the cache, so seeding left every row already cached and
     // this first pass would otherwise be a warm one wearing a cold label.

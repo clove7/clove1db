@@ -119,7 +119,7 @@ fn main() -> Result<()> {
 
     let storage = Storage::builder(StorageConfig::default())
         .add_database(
-            DatabaseConfig::new("attachments_db", "attachments")
+            DatabaseConfig::new("files_db", "attachments")
                 .dir_path(base_dir)
                 .backup_enabled(false) // disable backup to save disk space
                 .has_cache(false) // disable cache to protect RAM

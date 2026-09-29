@@ -4,11 +4,11 @@
 //! and the next, each printing numbers you can check rather than a claim you
 //! have to believe.
 //!
-//! They exist because of a real server. Its `Storage` lived in a `static`,
-//! which is never dropped, so redb never closed a file cleanly — not on a
-//! crash, not on a kill, not even on Ctrl+C. Every boot began by repairing
-//! every file, a walk of the whole file; and redb's page cache, 1 GiB per file
-//! by default, kept whatever a scan had read. 0.0.112 answers each part:
+//! The scenario: a program keeps its `Storage` in a `static`, which is never
+//! dropped, so redb never closes a file cleanly — not on a crash, not on a
+//! kill, not even on Ctrl+C. Every start begins by repairing every file, a walk
+//! of the whole file; and redb's page cache, 1 GiB per file by default, keeps
+//! whatever a scan has read. 0.0.112 answers each part:
 //!
 //! | # | Question | Answer |
 //! |---|---|---|
@@ -43,7 +43,7 @@ use clove1db::{
 // ═══════════════════════════════════════════════════════════
 
 /// Counts live heap bytes. redb's page cache is ordinary heap, so this sees it
-/// directly — the same measurement that found it on the server.
+/// directly.
 struct Counting;
 
 static LIVE: AtomicUsize = AtomicUsize::new(0);
@@ -86,7 +86,7 @@ fn live() -> usize {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Event {
     id: String,
-    device_id: String,
+    source_id: String,
     payload: String,
 }
 
@@ -107,7 +107,7 @@ const ROW_BYTES: usize = 4 * KIB;
 fn event(i: usize) -> Event {
     Event {
         id: format!("ev-{i:06}"),
-        device_id: format!("pc-{:02}", i % 32),
+        source_id: format!("source-{:02}", i % 32),
         payload: "x".repeat(ROW_BYTES),
     }
 }

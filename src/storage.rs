@@ -46,10 +46,9 @@ use crate::{
 /// Default cache budget, in **bytes**.
 ///
 /// This was `10_000` and meant *entries*, which is a number that cannot bound
-/// memory: the value is a `Vec<u8>` of whatever the caller stored. A production
-/// database whose rows carried a serialized snapshot each filled that cache with
-/// ~100 MiB. 32 MiB is a budget an operator can reason about without knowing
-/// how big a row happens to be.
+/// memory: the value is a `Vec<u8>` of whatever the caller stored, and 10,000
+/// rows of 10 KB each are 100 MiB. 32 MiB is a budget an operator can reason
+/// about without knowing how big a row happens to be.
 const DEFAULT_CACHE_BYTES: u64 = 32 * 1024 * 1024;
 
 const DEFAULT_CACHE_TTL: u64 = 300;
@@ -161,9 +160,8 @@ impl Storage {
     ///
     /// `moka` expires entries on a clock but frees them during maintenance, and
     /// maintenance runs when a cache is *used*. A database nobody has read since
-    /// its entries expired therefore still holds them — in one production run,
-    /// ~100 MiB outlived a five-minute TTL by thirteen hours, until the next
-    /// read happened to trigger housekeeping.
+    /// its entries expired therefore still holds them, hours past their TTL,
+    /// until the next read happens to trigger housekeeping.
     ///
     /// Call this from an idle tick, a maintenance job, or before reporting
     /// process memory, when "expired" should mean "gone".
@@ -232,6 +230,50 @@ impl Storage {
         self.0.migration_registry.clone()
     }
 
+    /// How every file this `Storage` serves was opened by [`StorageBuilder::build`]:
+    /// one line per `.cldb`, followed by its `.cldb.bak` when backup is enabled,
+    /// sorted by database name.
+    ///
+    /// Always recorded, never printed: reading it is up to the caller. It costs
+    /// a clock read and a file-size lookup per open, and nothing afterwards.
+    ///
+    /// Only the opens the storage keeps are listed. A `.cldb.bak` not yet marked
+    /// upgraded — an old one, or one created by the previous build — is first
+    /// opened once more for a one-time format check; that open, and a repair
+    /// it may have done, is not in the report.
+    pub fn open_report(&self) -> Vec<OpenReport> {
+        let mut dbs: Vec<&DatabaseManager> = self.db_list();
+        dbs.sort_by(|a, b| a.db_name.cmp(&b.db_name));
+        dbs.into_iter()
+            .flat_map(|db| {
+                db.opened_files().into_iter().map(|file| OpenReport {
+                    database: db.db_name.clone(),
+                    path: file.path.clone(),
+                    bytes: file.bytes,
+                    open_time: file.open_time,
+                    repaired: file.repaired,
+                })
+            })
+            .collect()
+    }
+
+}
+
+/// How one file was opened. See [`Storage::open_report`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenReport {
+    /// The database's name, as given to [`DatabaseConfig::new`].
+    pub database: String,
+    /// The `.cldb` or `.cldb.bak`.
+    pub path: PathBuf,
+    /// The file's size right after the open.
+    pub bytes: u64,
+    /// How long redb took to open (or create) the file.
+    pub open_time: std::time::Duration,
+    /// redb walked the whole file to rebuild its allocator state: the last
+    /// process to write it ended without closing it, and its last commit did
+    /// not save that state (see [`DatabaseConfig::quick_repair`]).
+    pub repaired: bool,
 }
 
 
@@ -371,9 +413,10 @@ impl DatabaseConfig {
     ///
     /// This is redb's cache, underneath [`Self::cache_bytes`] — that one holds
     /// decoded rows, this one holds file pages. Without a cap redb allows 1 GiB
-    /// per file, and pages read once stay resident: a full scan of a 545 MB
-    /// table left 528 MiB behind, where a 64 MiB cap left 65 MiB at the same
-    /// scan speed. It also bounds the peak of a repair after an unclean exit.
+    /// per file, and pages read once stay resident: a full scan of a large
+    /// table leaves about as much of it behind as it read, where a 64 MiB cap
+    /// leaves 64 MiB at the same scan speed. It also bounds the peak of a
+    /// repair after an unclean exit.
     ///
     /// The `.cldb` and the `.cldb.bak` each get this much.
     pub fn redb_cache_bytes(mut self, max_bytes: usize) -> Self {
@@ -386,9 +429,11 @@ impl DatabaseConfig {
     ///
     /// Without it, a process that exits without closing — killed, crashed, or
     /// simply never dropping a `Storage` held in a `static` — leaves each file
-    /// needing a repair that walks all of it: 612 ms with a 422 MiB peak for a
-    /// 545 MB table, against 7 ms with this on. The price is on every commit:
-    /// 0.94 → 2.02 ms in the same measurement. Applies to the `.cldb.bak` too.
+    /// needing a repair that walks all of it, in time and memory that grow with
+    /// the file; with this on, the same open takes milliseconds. The price is
+    /// on every commit: 0.94 → 2.02 ms measured. Applies to the `.cldb.bak` too.
+    ///
+    /// [`Storage::open_report`] says, per file, whether the last open repaired it.
     ///
     /// For the clean path, see [`Storage::close`], which needs no option.
     pub fn quick_repair(mut self, enabled: bool) -> Self {
@@ -452,8 +497,8 @@ impl DatabaseConfig {
     /// site has to say what it meant.
     ///
     /// An entry count cannot bound memory. `10_000` entries of an unknown size
-    /// is an unknown, and in one production database it was ~100 MiB of run-log
-    /// rows that were read once during a range scan and never again.
+    /// is an unknown — 100 MiB of rows read once during a range scan and never
+    /// again, if each row is 10 KB.
     ///
     /// `ttl_secs` and `idle_secs` decide when an entry *expires*. They do not
     /// decide when its memory comes back — see

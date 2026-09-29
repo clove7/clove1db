@@ -209,7 +209,7 @@ fn main() -> Result<()> {
     let user_domain = storage.domain::<UserAccount>();
 
     let new_user = user_domain.create::<RegisterUserDto, UserPublicProfile>(RegisterUserDto {
-        username: "admin_root".into(),
+        username: "root_user".into(),
         raw_password: "supersecret123".into(),
     })?;
 

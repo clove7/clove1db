@@ -66,12 +66,7 @@ impl OpenUpgradePipeline {
         // validation does not leave an empty `.cldb` behind; a directory is
         // left to `inspect_database`, which classifies it without opening it.
         let handle = if primary_path.is_file() {
-            Some(DbHandle::new(
-                input.redb.open(&primary_path)?,
-                primary_path.clone(),
-                input.durability,
-                input.redb,
-            ))
+            Some(DbHandle::open(&primary_path, input.durability, input.redb)?)
         } else {
             None
         };
@@ -199,12 +194,7 @@ impl OpenUpgradePipeline {
 
         let handle = match handle {
             Some(handle) => handle,
-            None => DbHandle::new(
-                input.redb.create(&primary_path)?,
-                primary_path.clone(),
-                input.durability,
-                input.redb,
-            ),
+            None => DbHandle::create(&primary_path, input.durability, input.redb)?,
         };
 
         meta.upgrade_complete = true;
