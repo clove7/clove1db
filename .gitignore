@@ -2,4 +2,3 @@
 Cargo.lock
 examples/*/target/
 examples/*/examples_data/
-.serena
