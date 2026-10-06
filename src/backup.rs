@@ -1,5 +1,7 @@
+use redb::TableHandle;
 // backup.rs
 // Backup values are normalized to canonical BackupRecord JSON during Storage::build().
+pub(crate) mod codec;
 pub mod view;
 
 use crate::backup::view::{BackupRecordView, HistoryDisplayMode, RecordData};
@@ -22,7 +24,7 @@ fn bulk_table_name(table_name: &str) -> String {
     format!("{}_bulk", table_name)
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BackupOperation {
     Set,
     Delete,
@@ -30,7 +32,7 @@ pub enum BackupOperation {
     RestoreBulk,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BackupRecord {
     pub version: u64,
     pub timestamp: i64,
@@ -41,6 +43,9 @@ pub struct BackupRecord {
     pub data: Option<Vec<u8>>, // None on Delete
     pub bulk_id: Option<String>,
     pub restored_version: Option<u64>,
+    /// The original record had no date; conversion supplied it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub date_from_migration: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -98,6 +103,21 @@ impl BackupManager {
         let bulk_name = bulk_table_name(table_name);
 
         let db = self.db()?;
+        {
+            let read = db.begin_read()?;
+            if read
+                .open_table(TableDefinition::<&str, &[u8]>::new(table_name))
+                .is_ok()
+                && read
+                    .open_table(TableDefinition::<&str, u64>::new(&ver_name))
+                    .is_ok()
+                && read
+                    .open_table(TableDefinition::<&str, &[u8]>::new(&bulk_name))
+                    .is_ok()
+            {
+                return Ok(());
+            }
+        }
         let write_txn = db.begin_write()?;
         {
             let data_table: TableDefinition<&str, &[u8]> = TableDefinition::new(table_name);
@@ -121,8 +141,9 @@ impl BackupManager {
         key: &str,
         data: Vec<u8>,
     ) -> Result<()> {
-        let version = self.next_version(table_name, key)?;
+        let version = 0;
         let record = BackupRecord {
+            date_from_migration: false,
             version,
             timestamp: Local::now().timestamp_millis(),
             date: Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string(),
@@ -133,7 +154,7 @@ impl BackupManager {
             restored_version: None,
             bulk_id: None,
         };
-        self.write(table, key, version, &record)
+        self.write(table, key, &record)
     }
 
     /// Called from DatabaseManager::delete()
@@ -143,9 +164,10 @@ impl BackupManager {
         table_name: &str,
         key: &str,
     ) -> Result<()> {
-        let version = self.next_version(table_name, key)?;
+        let version = 0;
 
         let record = BackupRecord {
+            date_from_migration: false,
             version,
             timestamp: Local::now().timestamp_millis(),
             date: Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string(),
@@ -156,7 +178,7 @@ impl BackupManager {
             restored_version: None,
             bulk_id: None,
         };
-        self.write(table, key, version, &record)
+        self.write(table, key, &record)
     }
 
     pub fn record_restore<'db>(
@@ -168,9 +190,10 @@ impl BackupManager {
         data: Option<Vec<u8>>,
         bulk_id: Option<String>,
     ) -> Result<()> {
-        let version = self.next_version(table_name, key)?;
+        let version = 0;
 
         let record = BackupRecord {
+            date_from_migration: false,
             version,
             timestamp: Local::now().timestamp_millis(),
             date: Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string(),
@@ -182,7 +205,7 @@ impl BackupManager {
             bulk_id,
         };
 
-        self.write(table, key, version, &record)
+        self.write(table, key, &record)
     }
 
     pub fn restore_bulk<'db>(
@@ -210,25 +233,30 @@ impl BackupManager {
 
         for entry in &bulk.entries {
             let backup_key = format!("{}:{}", entry.key, entry.version);
-            // Scoped: `next_version` below takes the handle itself, and a
+            // Scoped: `write` below acquires the handle itself, and a
             // second guard while holding one can deadlock against `close`.
             let record = {
                 let db = self.db()?;
                 let read_txn = db.begin_read()?;
                 let tbl = read_txn.open_table(table)?;
                 tbl.get(backup_key.as_str())?
-                    .and_then(|v| serde_json::from_slice::<BackupRecord>(v.value()).ok())
+                    .map(|v| codec::decode_record(table_name, &backup_key, v.value()))
+                    .transpose()?
+                    .ok_or_else(|| {
+                        ClError::NotFound(format!("backup record {backup_key} not found"))
+                    })?
             };
 
-            let data = record.as_ref().and_then(|r| match r.operation {
+            let data = match record.operation {
                 BackupOperation::Set | BackupOperation::Restore | BackupOperation::RestoreBulk => {
-                    r.data.clone()
+                    record.data.clone()
                 }
                 BackupOperation::Delete => None,
-            });
+            };
 
-            let new_version = self.next_version(table_name, &entry.key)?;
+            let new_version = 0;
             let restore_record = BackupRecord {
+                date_from_migration: false,
                 version: new_version,
                 timestamp: Local::now().timestamp_millis(),
                 date: Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string(),
@@ -240,21 +268,7 @@ impl BackupManager {
                 data: data.clone(),
             };
 
-            let rk = format!("{}:{}", entry.key, new_version);
-            let rdata = serde_json::to_vec(&restore_record)?;
-            let db = self.db()?;
-            let write_txn = db.begin_write()?;
-            {
-                if self.has_cache {
-                    let mut tbl = write_txn.open_table(table)?;
-                    tbl.insert(rk.as_str(), rdata.as_slice())?;
-                } else {
-                    let mut tbl = write_txn.open_table(table)?;
-                    let mut slot = tbl.insert_reserve(rk.as_str(), rdata.len())?;
-                    slot.as_mut().copy_from_slice(&rdata);
-                }
-            }
-            write_txn.commit()?;
+            self.write(table, &entry.key, &restore_record)?;
 
             results.push((entry.key.clone(), data));
         }
@@ -270,19 +284,13 @@ impl BackupManager {
         let read_txn = db.begin_read()?;
         let btbl = read_txn.open_table(bulk_table)?;
 
-        // A read failure propagates; an unparseable record does not. The two are
-        // different problems: a storage error means the file cannot be trusted,
-        // while a record this build cannot parse is expected on databases
-        // written by an older era and is what `upgrade` exists to normalize.
-        // Failing the whole listing for one legacy record would make a database
-        // unreadable instead of upgradeable.
         let mut records: Vec<BulkRecord> = btbl
             .iter()?
-            .map(|e| e.map_err(ClError::from))
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .filter_map(|(_, v)| serde_json::from_slice::<BulkRecord>(v.value()).ok())
-            .collect();
+            .map(|entry| {
+                let (_, value) = entry?;
+                Ok(serde_json::from_slice(value.value())?)
+            })
+            .collect::<Result<_>>()?;
 
         records.sort_by_key(|r| r.timestamp);
         Ok(records)
@@ -299,16 +307,27 @@ impl BackupManager {
         let tbl = read_txn.open_table(table)?;
         let prefix = format!("{}:", key);
 
-        // Read errors propagate; unparseable legacy records are skipped. See
-        // `list_bulk` for why the two are treated differently.
-        let mut records: Vec<BackupRecord> = tbl
-            .iter()?
-            .map(|e| e.map_err(ClError::from))
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .filter(|(k, _)| k.value().starts_with(&prefix))
-            .filter_map(|(_, v)| serde_json::from_slice::<BackupRecord>(v.value()).ok())
-            .collect();
+        let mut records = Vec::new();
+        let mut unreadable = Vec::new();
+        for entry in tbl.iter()? {
+            let (k, v) = entry?;
+            if !k.value().starts_with(&prefix) {
+                continue;
+            }
+            match codec::decode_record(table.name(), k.value(), v.value()) {
+                Ok(record) => records.push(record),
+                Err(error) => unreadable.push(format!("{}: {error}", k.value())),
+            }
+        }
+        if !unreadable.is_empty() {
+            return Err(ClError::BackupNormalizeFailed {
+                reason: format!(
+                    "{} unreadable backup records: {}",
+                    unreadable.len(),
+                    unreadable.join("; ")
+                ),
+            });
+        }
 
         records.sort_by_key(|r| r.version);
         Ok(records)
@@ -347,7 +366,8 @@ impl BackupManager {
 
         Ok(tbl
             .get(backup_key.as_str())?
-            .and_then(|v| serde_json::from_slice::<BackupRecord>(v.value()).ok())
+            .map(|v| codec::decode_record(table.name(), &backup_key, v.value()))
+            .transpose()?
             .and_then(|r| match r.operation {
                 BackupOperation::Set => r.data,
                 BackupOperation::Restore => r.data,
@@ -369,50 +389,43 @@ impl BackupManager {
 
     // ── Internal ──────────────────────────────────────────────────────
 
-    fn next_version(&self, table_name: &str, key: &str) -> Result<u64> {
-        let ver_name = version_table_name(table_name);
-
-        let ver_table: TableDefinition<&str, u64> = TableDefinition::new(ver_name.as_str());
-
-        let db = self.db()?;
-        let write_txn = db.begin_write()?;
-        let new_version = {
-            let mut tbl = write_txn.open_table(ver_table)?;
-            let current = tbl.get(key)?.map(|v| v.value()).unwrap_or(0);
-            let next = current + 1;
-            tbl.insert(key, next)?;
-            next
-        };
-        write_txn.commit()?;
-
-        Ok(new_version)
+    fn next_version(tx: &redb::WriteTransaction, table_name: &str, key: &str) -> Result<u64> {
+        let name = version_table_name(table_name);
+        let mut table = tx.open_table(TableDefinition::<&str, u64>::new(&name))?;
+        let current = table.get(key)?.map(|v| v.value()).unwrap_or(0);
+        let next = current
+            .checked_add(1)
+            .ok_or_else(|| ClError::Validation("backup version exhausted".into()))?;
+        table.insert(key, next)?;
+        Ok(next)
     }
-
     fn write<'db>(
         &self,
         table: TableDefinition<'db, &str, &[u8]>,
         key: &str,
-        version: u64,
         record: &BackupRecord,
     ) -> Result<()> {
-        // backup key = "entity_id:version" → append-only ✅
-        let backup_key = format!("{}:{}", key, version);
-        let data = serde_json::to_vec(record)?;
-
         let db = self.db()?;
-        let write_txn = db.begin_write()?;
+        let tx = db.begin_write()?;
+        let version = Self::next_version(&tx, &record.table, key)?;
+        crate::fsutil::maybe_crash("backup_after_version");
+        let mut record = record.clone();
+        record.version = version;
+        let data = codec::encode_record(&record)?;
+        let backup_key = format!("{key}:{version}");
         {
+            let mut table = tx.open_table(table)?;
+            if table.get(backup_key.as_str())?.is_some() {
+                return Err(ClError::Validation(format!("backup version collision: {backup_key}")));
+            }
             if self.has_cache {
-                let mut tbl = write_txn.open_table(table)?;
-                tbl.insert(backup_key.as_str(), data.as_slice())?;
+                table.insert(backup_key.as_str(), data.as_slice())?;
             } else {
-                let mut tbl = write_txn.open_table(table)?;
-                let mut slot = tbl.insert_reserve(backup_key.as_str(), data.len())?;
+                let mut slot = table.insert_reserve(backup_key.as_str(), data.len())?;
                 slot.as_mut().copy_from_slice(&data);
             }
         }
-        write_txn.commit()?;
-
+        tx.commit()?;
         Ok(())
     }
 
@@ -460,23 +473,57 @@ impl BackupManager {
     }
 
     pub fn rewrite_table_name(&self, from_table: &str, to_table: &str) -> Result<()> {
+        if from_table == to_table {
+            return Ok(());
+        }
         let db = self.db()?;
         let read_txn = db.begin_read()?;
         let mut records: Vec<(String, BackupRecord)> = Vec::new();
         {
             let data_table: TableDefinition<&str, &[u8]> = TableDefinition::new(from_table);
-            if let Ok(table_ref) = read_txn.open_table(data_table) {
-                for entry in table_ref.iter()? {
-                    let (k, v) = entry?;
-                    if let Ok(record) = serde_json::from_slice::<BackupRecord>(v.value()) {
+            match read_txn.open_table(data_table) {
+                Ok(table_ref) => {
+                    for entry in table_ref.iter()? {
+                        let (k, v) = entry?;
+                        let record = codec::decode_record(from_table, k.value(), v.value())?;
                         records.push((k.value().to_string(), record));
                     }
                 }
+                Err(redb::TableError::TableDoesNotExist(_)) => {}
+                Err(error) => return Err(error.into()),
             }
         }
+        let from_version = version_table_name(from_table);
+        let to_version = version_table_name(to_table);
+        let from_bulk = bulk_table_name(from_table);
+        let to_bulk = bulk_table_name(to_table);
+        let versions = match read_txn.open_table(TableDefinition::<&str, u64>::new(&from_version)) {
+            Ok(table) => table
+                .iter()?
+                .map(|entry| {
+                    let (key, value) = entry?;
+                    Ok((key.value().to_string(), value.value()))
+                })
+                .collect::<Result<Vec<_>>>()?,
+            Err(redb::TableError::TableDoesNotExist(_)) => Vec::new(),
+            Err(error) => return Err(error.into()),
+        };
+        let bulks = match read_txn.open_table(TableDefinition::<&str, &[u8]>::new(&from_bulk)) {
+            Ok(table) => table
+                .iter()?
+                .map(|entry| {
+                    let (key, value) = entry?;
+                    let mut record: BulkRecord = serde_json::from_slice(value.value())?;
+                    record.table = to_table.to_string();
+                    Ok((key.value().to_string(), serde_json::to_vec(&record)?))
+                })
+                .collect::<Result<Vec<_>>>()?,
+            Err(redb::TableError::TableDoesNotExist(_)) => Vec::new(),
+            Err(error) => return Err(error.into()),
+        };
         drop(read_txn);
 
-        if records.is_empty() {
+        if records.is_empty() && versions.is_empty() && bulks.is_empty() {
             return Ok(());
         }
 
@@ -486,11 +533,48 @@ impl BackupManager {
             let to_def: TableDefinition<&str, &[u8]> = TableDefinition::new(to_table);
             let mut from_tbl = write_txn.open_table(from_def)?;
             let mut to_tbl = write_txn.open_table(to_def)?;
+            let now = Local::now();
             for (key, mut record) in records {
                 record.table = to_table.to_string();
-                let bytes = serde_json::to_vec(&record)?;
+                if record.date_from_migration && record.date.is_empty() {
+                    record.timestamp = now.timestamp_millis();
+                    record.date = now.format("%Y-%m-%d %H:%M:%S%.3f").to_string();
+                }
+                let bytes = codec::encode_record(&record)?;
+                if to_tbl.get(key.as_str())?.is_some() {
+                    return Err(ClError::Validation(format!(
+                        "backup rename collision: {to_table}/{key}"
+                    )));
+                }
                 to_tbl.insert(key.as_str(), bytes.as_slice())?;
                 from_tbl.remove(key.as_str())?;
+            }
+        }
+        {
+            let mut from =
+                write_txn.open_table(TableDefinition::<&str, u64>::new(&from_version))?;
+            let mut to = write_txn.open_table(TableDefinition::<&str, u64>::new(&to_version))?;
+            for (key, version) in versions {
+                if to.get(key.as_str())?.is_some() {
+                    return Err(ClError::Validation(format!(
+                        "backup version rename collision: {key}"
+                    )));
+                }
+                to.insert(key.as_str(), version)?;
+                from.remove(key.as_str())?;
+            }
+        }
+        {
+            let mut from = write_txn.open_table(TableDefinition::<&str, &[u8]>::new(&from_bulk))?;
+            let mut to = write_txn.open_table(TableDefinition::<&str, &[u8]>::new(&to_bulk))?;
+            for (key, bytes) in bulks {
+                if to.get(key.as_str())?.is_some() {
+                    return Err(ClError::Validation(format!(
+                        "backup bulk rename collision: {key}"
+                    )));
+                }
+                to.insert(key.as_str(), bytes.as_slice())?;
+                from.remove(key.as_str())?;
             }
         }
         write_txn.commit()?;
@@ -522,6 +606,7 @@ impl BackupManager {
                 version: raw.version,
                 timestamp: raw.timestamp,
                 date: raw.date.clone(),
+                date_from_migration: raw.date_from_migration,
                 operation: raw.operation.clone(),
                 table: raw.table.clone(),
                 key: raw.key.clone(),
@@ -550,6 +635,7 @@ impl BackupManager {
                         version: raw.version,
                         timestamp: raw.timestamp,
                         date: raw.date.clone(),
+                        date_from_migration: raw.date_from_migration,
                         operation: raw.operation.clone(),
                         table: raw.table.clone(),
                         key: raw.key.clone(),
@@ -567,6 +653,7 @@ impl BackupManager {
                     version: raw.version,
                     timestamp: raw.timestamp,
                     date: raw.date.clone(),
+                    date_from_migration: raw.date_from_migration,
                     operation: raw.operation.clone(),
                     table: raw.table.clone(),
                     key: raw.key.clone(),
@@ -585,6 +672,7 @@ impl BackupManager {
                     version: raw.version,
                     timestamp: raw.timestamp,
                     date: raw.date.clone(),
+                    date_from_migration: raw.date_from_migration,
                     operation: raw.operation.clone(),
                     table: raw.table.clone(),
                     key: raw.key.clone(),
@@ -601,6 +689,7 @@ impl BackupManager {
                     version: raw.version,
                     timestamp: raw.timestamp,
                     date: raw.date.clone(),
+                    date_from_migration: raw.date_from_migration,
                     operation: raw.operation.clone(),
                     table: raw.table.clone(),
                     key: raw.key.clone(),

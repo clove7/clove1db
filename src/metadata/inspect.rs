@@ -271,5 +271,6 @@ pub fn is_clove_framework_meta(bytes: &[u8]) -> bool {
 }
 
 pub fn backup_record_from_bytes(bytes: &[u8]) -> Option<BackupRecord> {
-    serde_json::from_slice(bytes).ok()
+    // A wrapped record carries its own table, key and version; a raw row's version lives only in its redb key, so without one it is None.
+    crate::backup::codec::decode_record("", "", bytes).ok()
 }

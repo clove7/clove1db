@@ -1,3 +1,4 @@
+use redb::TableHandle;
 // use crate::emitter::LogEventEmitter;
 use crate::{
     backup::{
@@ -63,6 +64,7 @@ pub struct DatabaseManager {
 
     // Max entries per commit_batch chunk
     max_commit_batch_entries: usize,
+    pub(crate) format_opens: Vec<FileOpen>,
 
     // Blob sidecar storage
     blob_enabled: bool,
@@ -215,6 +217,7 @@ impl DatabaseManager {
             has_cache,
             durability,
             max_commit_batch_entries: max_commit_batch_entries.max(1),
+            format_opens: Vec::new(),
             blob_enabled,
             table_storage,
             blob_store,
@@ -345,6 +348,7 @@ impl DatabaseManager {
     pub(crate) fn opened_files(&self) -> Vec<&FileOpen> {
         std::iter::once(self.db.opened())
             .chain(self.backup_manager.as_ref().map(BackupManager::opened))
+            .chain(self.format_opens.iter())
             .collect()
     }
 
@@ -478,6 +482,20 @@ impl DatabaseManager {
         Ok(())
     }
 
+    /// Commit every write and delete in one transaction, regardless of the batch limit.
+    /// Cache changes are applied only after the transaction commits. Like `commit_batch`,
+    /// this raw API does not create backup history records.
+    pub fn commit_batch_atomic(
+        &self,
+        writes: &[(String, String, Vec<u8>)],
+        deletes: &[(String, String)],
+    ) -> Result<()> {
+        self.commit_batch_transaction(writes, deletes, true)
+    }
+
+    /// Commit raw changes in bounded transactions. Batches larger than the configured
+    /// limit may leave a committed prefix on failure; writes precede deletes.
+    /// This API does not create backup history records.
     pub fn commit_batch(
         &self,
         writes: &[(String, String, Vec<u8>)],
@@ -508,6 +526,15 @@ impl DatabaseManager {
         writes: &[(String, String, Vec<u8>)],
         deletes: &[(String, String)],
     ) -> Result<()> {
+        self.commit_batch_transaction(writes, deletes, false)
+    }
+
+    fn commit_batch_transaction(
+        &self,
+        writes: &[(String, String, Vec<u8>)],
+        deletes: &[(String, String)],
+        propagate_delete_errors: bool,
+    ) -> Result<()> {
         let db = self.db()?;
         let write_txn = db.begin_write()?;
         maybe_crash("before_commit");
@@ -526,7 +553,11 @@ impl DatabaseManager {
         for (table_name, key) in deletes {
             let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(table_name.as_str());
             let mut table_ref = write_txn.open_table(table)?;
-            let _ = table_ref.remove(key.as_str());
+            if propagate_delete_errors {
+                table_ref.remove(key.as_str())?;
+            } else {
+                let _ = table_ref.remove(key.as_str());
+            }
         }
 
         write_txn.commit()?;
@@ -784,7 +815,8 @@ impl DatabaseManager {
             let read_txn = bdb.begin_read()?;
             let tbl = read_txn.open_table(table)?;
             tbl.get(backup_key.as_str())?
-                .and_then(|v| serde_json::from_slice::<BackupRecord>(v.value()).ok())
+                .map(|v| crate::backup::codec::decode_record(table.name(), &backup_key, v.value()))
+                .transpose()?
                 .ok_or_else(|| ClError::NotFound(format!("version {} not found", version)))?
         };
 
@@ -815,6 +847,17 @@ impl DatabaseManager {
                         let cache_key = format!("{}:{}", table_name, key);
                         self.memory_cache.insert(cache_key, data.clone());
                     }
+                }
+
+                // A Restore/RestoreBulk with no data represents an absent row.
+                if data.is_none() {
+                    {
+                        let db=self.db()?;
+                        let tx=db.begin_write()?;
+                        {tx.open_table(table)?.remove(key)?;}
+                        tx.commit()?;
+                    }
+                    if self.has_cache {self.memory_cache.invalidate(&format!("{table_name}:{key}"));}
                 }
 
                 // Backup record_restore
@@ -861,7 +904,8 @@ impl DatabaseManager {
 
         let record = tbl
             .get(backup_key.as_str())?
-            .and_then(|v| serde_json::from_slice::<BackupRecord>(v.value()).ok())
+            .map(|v| crate::backup::codec::decode_record(table.name(), &backup_key, v.value()))
+            .transpose()?
             .ok_or_else(|| ClError::NotFound(format!("version {} not found", version)));
 
         drop(read_txn);
@@ -1313,6 +1357,8 @@ pub struct BackupRecordRepository<T> {
     pub version: u64,
     pub timestamp: i64,
     pub date: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub date_from_migration: bool,
     pub operation: BackupOperation,
     pub table: String,
     pub key: String,
@@ -1333,6 +1379,7 @@ fn view_into_repository<T>(view: BackupRecordView) -> BackupRecordRepository<T> 
         version: view.version,
         timestamp: view.timestamp,
         date: view.date,
+        date_from_migration: view.date_from_migration,
         operation: view.operation,
         table: view.table,
         key: view.key,

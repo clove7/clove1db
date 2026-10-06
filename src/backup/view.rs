@@ -31,6 +31,7 @@ pub struct BackupRecordView {
     pub version: u64,
     pub timestamp: i64,
     pub date: String,
+    pub date_from_migration: bool,
     pub operation: BackupOperation,
     pub table: String,
     pub key: String,

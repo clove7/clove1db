@@ -4,6 +4,7 @@ pub const META_TABLE: &str = "_clove_meta";
 pub const META_KEY: &str = "meta";
 pub const FRAMEWORK_ID: &str = "clove1db";
 pub const META_VERSION: u32 = 2;
+pub const BACKUP_FORMAT_V2: &str = "json_wrapped_v2";
 pub const BACKUP_FORMAT_JSON: &str = "json_wrapped_v1";
 pub const BACKUP_PRE_UPGRADE_SUFFIX: &str = ".pre-upgrade";
 pub const BACKUP_UPGRADING_SUFFIX: &str = ".upgrading";
@@ -20,6 +21,7 @@ pub enum FileEra {
 #[serde(rename_all = "snake_case")]
 pub enum BackupFormat {
     JsonWrappedV1,
+    JsonWrappedV2,
     Unknown,
 }
 
@@ -27,6 +29,7 @@ impl BackupFormat {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::JsonWrappedV1 => BACKUP_FORMAT_JSON,
+            Self::JsonWrappedV2 => BACKUP_FORMAT_V2,
             Self::Unknown => "unknown",
         }
     }

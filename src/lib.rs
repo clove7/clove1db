@@ -19,4 +19,7 @@ pub mod upgrade;
 
 pub use durability::{DurabilityMode, DEFAULT_MAX_COMMIT_BATCH_ENTRIES};
 pub use handle::RedbOptions;
-pub use metadata::{inspect_cldb, FileEra, FileKind, InspectReport, TableStorageMode};
+pub use metadata::{FileEra, FileKind, InspectReport, TableStorageMode, inspect_cldb};
+
+#[cfg(test)]
+mod backup_tests;
