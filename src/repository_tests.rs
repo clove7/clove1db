@@ -126,3 +126,67 @@ fn a_row_that_does_not_parse_is_an_error_not_a_panic() {
     assert!(repo.list().is_err());
     assert!(repo.list_map(|n| n.id).is_err());
 }
+
+fn add_wrongly_typed_table(storage: &Storage) {
+    let manager = &storage.domain::<Note>().repo().database_manager;
+    let db = manager.db().unwrap();
+    let txn = db.begin_write().unwrap();
+    {
+        let numbers: TableDefinition<&str, u64> = TableDefinition::new("fault_numbers");
+        txn.open_table(numbers).unwrap();
+    }
+    txn.commit().unwrap();
+}
+
+#[test]
+fn atomic_batch_failure_never_keeps_a_committed_prefix() {
+    let storage = build(&fresh_dir("atomic_write_failure"));
+    add_wrongly_typed_table(&storage);
+    let manager = &storage.domain::<Note>().repo().database_manager;
+    let mut writes: Vec<_> = (0..999)
+        .map(|i| {
+            let row = note(i);
+            (
+                "notes".to_string(),
+                row.id.clone(),
+                serde_json::to_vec(&row).unwrap(),
+            )
+        })
+        .collect();
+    writes.push(("fault_numbers".into(), "wrong_type".into(), vec![1]));
+    assert!(manager.commit_batch_atomic(&writes, &[]).is_err());
+    assert_eq!(manager.count_keys("notes").unwrap(), 0);
+    assert!(storage.domain::<Note>().repo().get("n000").is_err());
+}
+
+#[test]
+fn atomic_write_and_delete_failure_preserves_the_old_row_and_cache() {
+    let storage = build(&fresh_dir("atomic_delete_failure"));
+    let original = note(0);
+    let repo = storage.domain::<Note>().repo();
+    repo.set(&original.id, &original).unwrap();
+    assert_eq!(repo.get(&original.id).unwrap(), original);
+    add_wrongly_typed_table(&storage);
+    let writes: Vec<_> = (0..1000)
+        .map(|i| {
+            let mut row = note(i);
+            row.name = "replacement".into();
+            (
+                "notes".to_string(),
+                row.id.clone(),
+                serde_json::to_vec(&row).unwrap(),
+            )
+        })
+        .collect();
+    let deletes = vec![
+        ("notes".into(), original.id.clone()),
+        ("fault_numbers".into(), "wrong_type".into()),
+    ];
+    assert!(
+        repo.database_manager
+            .commit_batch_atomic(&writes, &deletes)
+            .is_err()
+    );
+    assert_eq!(repo.database_manager.count_keys("notes").unwrap(), 1);
+    assert_eq!(repo.get(&original.id).unwrap(), original);
+}

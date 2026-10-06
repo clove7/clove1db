@@ -8,7 +8,7 @@ Everything lives in `.cldb` files next to your binary. No server, no daemon, no 
 
 ```toml
 [dependencies]
-clove1db = "0.0.119"
+clove1db = "0.0.126"
 ```
 
 > **Work in progress.** The API and internals are still evolving, and versions before 1.0 may break. Contributions, issue reports and real-world feedback are all welcome — see [Contributing](#contributing).
@@ -27,49 +27,67 @@ clove1db = "0.0.119"
 - 🛡️ **Durability**: Default `DurabilityMode::Strict` — atomic sidecar writes (tmp→rename), `fsync` in Strict, `redb::Durability::Immediate`, corrupt migration-index recovery, chunked commit batches
 - 🔌 **Open, close & recover**: each file opened once per `build()`, an explicit `Storage::close()`, a cap on redb's page cache, quick repair after a kill or crash, and a per-file open report
 
-## Upgrading to 0.0.119
+## Upgrading to 0.0.126
 
-**Nothing to change in your code.** Every signature is the same; what is new
-is additive.
+**The first `build()` converts existing `.cldb.bak` history to `json_wrapped_v2`.**
+The primary `.cldb` data format is unchanged. After conversion, older releases
+(including 0.0.119) cannot read the new backup records.
 
-- **`Repository::list` reads one row at a time.** It copied every stored value
-  into one `Vec<Vec<u8>>` and parsed them only once the whole table was in
-  memory, so a large table was held twice while it was read, and the process
-  kept much of that heap afterwards. Same signature, same result. A row that
-  does not parse is now an error; it was an `unwrap()` panic.
-- **`Repository::list_map(map)`** — every row, passed through `map` as it is
-  read. A field `map` drops never outlives its row, and the `Vec` is sized from
-  the table, not grown by doubling.
-- **`Repository::get_uncached_as::<U>(id)`** — one row read as a lighter type
-  `U` whose fields are a subset of the stored row's: serde skips the rest
-  without building it, and the value is parsed without being copied first.
-- **`DatabaseManager::count_keys`** asks redb for the count instead of copying
-  the whole table to take its length.
-- **`Storage::open_report()`** — how every file was opened by `build()`: per
-  `.cldb` (and its `.cldb.bak`), the size, how long redb took, and whether it
-  had to repair the file. Always recorded, never printed; read it if you want
-  it. See [Open, close & recover](#open-close--recover).
+- **Smaller history records.** Valid JSON is embedded byte-for-byte in `doc`,
+  preserving key order, numbers, escapes and whitespace. Other bytes use
+  `data_b64`; deletes have no payload. The old numeric-array `data` field is
+  never written in v2. `BackupRecord.data` in memory remains `Option<Vec<u8>>`.
+- **All previous formats are readable:** raw values, legacy JSON wrappers and
+  `json_wrapped_v1`. Conversion uses one sibling `.upgrading` copy, compares
+  every record's metadata and exact payload bytes, checks table counts and
+  version/bulk metadata, compacts the converted file, then replaces the original.
+  A failed conversion removes its copy, records the reason in
+  `_clove_meta.upgrade_log`, and retries on the next build; existing formats
+  remain readable. The source is inspected read-only; an unclean backup is
+  repaired on the byte-checked copy, with a pre-conversion MVCC snapshot for
+  verification. Ordinary redb writers
+  can still update internal allocator metadata when opened and closed.
+- **Dates stay honest.** Dated records keep their original date and timestamp.
+  Undated raw values get the conversion time once, with
+  `date_from_migration: true`; subsequent reads keep that time and flag.
+- **Unreadable records are reported.** History returns an error with the number
+  and context of unreadable records, rather than an incomplete success. Table
+  renames decode every format and move history, counters and bulk metadata in
+  one transaction; invalid records or target collisions abort the rename.
+- **One commit per new history record.** Its version counter and record are
+  written together; a failed write cannot leave a version with no record.
+- **`DatabaseManager::commit_batch_atomic`** commits every write and delete in
+  one transaction, even above 512 entries. The existing `commit_batch` remains
+  chunked. Neither raw batch API creates backup history.
+- **`OpenReport::format_check`** identifies every one-time format inspection or
+  temporary conversion file open, including size, elapsed open time and repair.
+  Once the v2 marker is recorded, subsequent builds do not copy or recheck it.
 
-`examples/13_large_table_open_and_read` measures all of it on a synthetic
-269 MB table of 100,000 articles, 70% of them with a large `body`. Windows,
-release, one process per line:
+Public record/view structs now include `date_from_migration`, and `OpenReport`
+includes `format_check`; code constructing these structs directly must supply
+the new fields. Untagged historical raw objects and wrappers share JSON shapes;
+objects matching the historical metadata signature are interpreted as wrappers.
+Invalid recognized wrappers are reported instead of silently discarded.
 
-| read | kept per row | redb cache | +live | +private | retained | peak |
-|---|---|---|---|---|---|---|
-| copy, then parse (`list` in 0.0.112) | all but `body` | 64 MiB | 153 MiB | 365 MiB | 213 MiB | 502 MiB |
-| `list_map` | all but `body` | 64 MiB | 153 MiB | 190 MiB | 39 MiB | 191 MiB |
-| `list_map` | card fields only | 8 MiB | 58 MiB | 71 MiB | 14 MiB | 72 MiB |
+`examples/14_backup_v2_and_atomic_batches` generates 200 synthetic notes with
+five versions each. Windows, release, 1,000 history records preserved:
 
-20,000 rows by id: `get_uncached` → full row, 242 ms and 169 MiB allocated;
-`get_uncached_as` → card, 151 ms and 97 MiB.
+| Measurement | v1 | v2 after compact |
+|---|---:|---:|
+| Primary file, bytes | 1,056,768 | 897,024 |
+| Backup file, bytes | 18,747,392 | 4,206,592 |
+| Stored history value bytes | 8,652,350 | 2,519,450 |
+| Numeric-array payload bytes | 8,485,350 (98.07%) | 0 |
+| redb allocated pages | 4,024 | 1,026 |
+| Unused file page capacity | 553 | 1 |
 
-| the previous run | next open | repaired |
-|---|---|---|
-| `Storage::close()` | 0.8 ms | no |
-| killed, `quick_repair(false)` | 358 ms | yes |
-| killed, `quick_repair(true)` | 1.3 ms | no |
-
-No data migration; the on-disk format is unchanged.
+The backup shrank **77.56%**; the conversion build took **262 ms** on this run.
+The first build costs this work once. Timings and allocation depend on the
+machine. Unused capacity includes header/allocator overhead; redb does not
+expose an exact free-page counter through its public API. Primary file sizes
+can change when redb updates allocator metadata; the stored data format does
+not change. The demo also checks legacy payloads, dates, schema replay, renames,
+first/second-build reports and interrupted 1,000-entry batches.
 
 ## Durability
 
@@ -79,7 +97,7 @@ By default clove1db runs in **Strict** mode:
 - **Strict** also `sync_all`s sidecar files and sets `redb::Durability::Immediate` on commits (independent of cache).
 - **Fast** skips fsync / Immediate for throughput; still atomic.
 - Corrupt / zeroed migration indexes are quarantined and rebuilt on open (not a fatal `Serialization` panic).
-- Large `commit_batch` calls are split by `max_commit_batch_entries` (default 512).
+- Large `commit_batch` calls are split by `max_commit_batch_entries` (default 512): all write chunks precede delete chunks, and a failure can leave a committed prefix. Use `commit_batch_atomic(writes, deletes)` for one transaction regardless of size. Both update cache only after their commits and neither raw API creates backup history.
 
 ```rust
 use clove1db::{storage::{DatabaseConfig, Storage, StorageConfig}, DurabilityMode};
@@ -134,20 +152,23 @@ DatabaseConfig::new("logs_db", "logs")
 storage.close();
 ```
 
-`build()` opens each file once — inspect, upgrade and serve share one handle.
+`build()` opens the primary once — inspect, upgrade and serve share one handle.
+A backup undergoing its one-time format conversion also has inspection and
+temporary-copy opens; once marked v2, it is opened only to serve it.
 
 **`storage.open_report()`** says how each of those opens went — one line per
-`.cldb`, then its `.cldb.bak`, sorted by database:
+`.cldb`, then its served `.cldb.bak` and any format-check opens, sorted by database:
 
 ```rust
 for r in storage.open_report() {
     println!(
-        "{} {} bytes={} ms={:.1} repaired={}",
+        "{} {} bytes={} ms={:.1} repaired={} format_check={}",
         r.database,
         r.path.display(),
         r.bytes,
         r.open_time.as_secs_f64() * 1000.0,
         r.repaired,
+        r.format_check,
     );
 }
 ```
@@ -156,9 +177,10 @@ for r in storage.open_report() {
 last process to write it neither closed it nor had `quick_repair` on. A brand
 new file is never reported as repaired. The report is recorded on every
 `build()` at the cost of a clock read and a file-size lookup per file; nothing
-reads or prints it unless you do. A `.cldb.bak` that has not yet been marked
-upgraded is opened once more before it is served, for a one-time format check;
-that extra open is not in the report.
+reads or prints it unless you do. One-time backup inspection and conversion-copy opens have `format_check=true`
+and are included in the same report. Ongoing primary/backup handles have
+`format_check=false`. `open_time` measures each redb open; the conversion build's
+total duration is measured separately in example 14.
 
 ## Quick Start
 
@@ -372,6 +394,15 @@ Use `list_external_tables(path)` and `read_external_table(path, &spec)` to probe
 
 ## Backup & Versioning
 
+Every history version is kept forever. In `json_wrapped_v2`, JSON payloads are
+stored verbatim in `doc`, non-JSON bytes in `data_b64`, and deletes contain no
+payload. Reads and restores receive the original bytes in `BackupRecord.data`.
+An undated raw record converted from an older file has a fixed conversion time
+and `date_from_migration=true`, also exposed by history views.
+Version allocation and each new history record share one redb transaction.
+Raw `commit_batch` and `commit_batch_atomic` are outside this history mechanism.
+
+
 ```rust
 use redb::TableDefinition;
 use clove1db::{backup::view::HistoryDisplayMode, units::Result};
@@ -430,7 +461,7 @@ On `Storage::build()`, clove1db automatically:
 2. Writes or updates `_clove_meta` (per-table `schema_id` / `schema_version`)
 3. Ensures `{db}.migration/tables/{table}/` matches registered layouts
 4. Upgrades legacy v0.0.49 single-root migration indexes to per-table chains
-5. Normalizes `.cldb.bak` to canonical `BackupRecord` JSON (`.pre-upgrade` copy removed on success)
+5. Converts all previous `.cldb.bak` record formats to `json_wrapped_v2` on one verified, compacted copy before table migrations; records the v2 marker only after success
 
 Inspect without opening `Storage`:
 
@@ -473,6 +504,7 @@ cd clove1db/examples/01_basic_crud && cargo run
 | `11_cache_memory_budget` | What the cache costs: byte budgets, uncached reads, expiry vs reclamation |
 | `12_open_close_repair` | Between runs: redb cache cap, quick repair after a kill, `close()`, one open per build |
 | `13_large_table_open_and_read` | A large table: `list_map` vs copy-then-parse, `get_uncached_as`, and `open_report` after a clean close and after a kill |
+| `14_backup_v2_and_atomic_batches` | v1/v2 sizes, mixed legacy conversion, exact bytes and dates, schema history/renames, format-check reports, interrupted atomic/chunked batches |
 
 ## Contributing
 

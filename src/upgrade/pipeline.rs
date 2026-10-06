@@ -2,15 +2,15 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-use crate::handle::{DbHandle, RedbOptions};
-use crate::metadata::inspect::{inspect_database, inspect_open, pre_upgrade_path, FileKind};
+use crate::durability::DurabilityMode;
+use crate::handle::{DbHandle, FileOpen, RedbOptions};
+use crate::metadata::inspect::{FileKind, inspect_database, inspect_open};
 use crate::metadata::store::{create_meta_table, put_meta, read_meta};
-use crate::metadata::types::{BackupFormat, CloveMeta, FileEra, TableMeta, BACKUP_FORMAT_JSON};
+use crate::metadata::types::TableStorageMode;
+use crate::metadata::types::{BACKUP_FORMAT_V2, BackupFormat, CloveMeta, FileEra, TableMeta};
 use crate::migration::chain::DbMigrationIndex;
 use crate::migration::layout::FieldLayout;
-use crate::metadata::types::TableStorageMode;
 use crate::migration::types::migration_dir_name;
-use crate::durability::DurabilityMode;
 use crate::upgrade::backup_normalize::eager_normalize;
 use crate::upgrade::migration_refs::upgrade_migration_refs_with_durability;
 use crate::units::{ClError, Result};
@@ -40,6 +40,7 @@ pub struct UpgradeOutput {
     /// The primary, still open. `Storage::build` serves from this handle
     /// rather than opening the file again.
     pub db: DbHandle,
+    pub(crate) format_opens: Vec<FileOpen>,
 }
 
 pub struct OpenUpgradePipeline;
@@ -99,6 +100,9 @@ impl OpenUpgradePipeline {
 
         let file_era = resolve_file_era(&inspection);
         let mut meta = build_meta(input, file_era);
+        if backup_path.as_ref().is_some_and(|p| p.exists()) {
+            meta.backup_format = "unknown".to_string();
+        }
 
         if inspection.kind == FileKind::Authenticated {
             if let Some(handle) = &handle {
@@ -111,8 +115,9 @@ impl OpenUpgradePipeline {
             }
         }
 
+        let mut format_opens = Vec::new();
         if let Some(ref bp) = backup_path {
-            if bp.exists() && input.backup_enabled && !meta.backup_upgraded {
+            if bp.exists() && input.backup_enabled && meta.backup_format != BACKUP_FORMAT_V2 {
                 let table_names: Vec<String> =
                     input.tables.iter().map(|t| t.name.to_string()).collect();
                 let result = eager_normalize(
@@ -122,24 +127,19 @@ impl OpenUpgradePipeline {
                     input.durability,
                     input.redb,
                 )?;
-                if let Some(pre) = backup_path.as_ref().map(|p| pre_upgrade_path(p.as_path())) {
-                    if pre.exists() && result.pre_upgrade_removed {
-                        meta.backup_pre_upgrade_path = None;
-                    } else if pre.exists() {
-                        meta.backup_pre_upgrade_path = pre.to_str().map(|s| s.to_string());
-                    }
+                format_opens = result.opens;
+                if let Some(reason) = result.failure {
+                    meta.push_log("backup_conversion_failed", Some(reason));
+                    meta.backup_upgraded = false;
+                } else {
+                    meta.push_log(
+                        "backup_normalize",
+                        Some(format!("converted={}", result.entries_converted)),
+                    );
+                    meta.backup_upgraded = true;
+                    meta.backup_format = BACKUP_FORMAT_V2.to_string();
+                    meta.backup_pre_upgrade_path = None;
                 }
-                meta.push_log(
-                    "backup_normalize",
-                    Some(format!(
-                        "converted={} skipped={} pre_upgrade_removed={}",
-                        result.entries_converted,
-                        result.entries_skipped,
-                        result.pre_upgrade_removed
-                    )),
-                );
-                meta.backup_upgraded = true;
-                meta.backup_format = BACKUP_FORMAT_JSON.to_string();
             }
         }
 
@@ -212,6 +212,7 @@ impl OpenUpgradePipeline {
             meta,
             table_layouts,
             db: handle,
+            format_opens,
         })
     }
 }
@@ -250,8 +251,8 @@ fn build_meta(input: &UpgradeInput<'_>, file_era: FileEra) -> CloveMeta {
     );
 
     if input.backup_enabled {
-        meta.backup_format = BackupFormat::JsonWrappedV1.as_str().to_string();
-        meta.backup_upgraded = false;
+        meta.backup_format = BackupFormat::JsonWrappedV2.as_str().to_string();
+        meta.backup_upgraded = true;
     }
 
     meta

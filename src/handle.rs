@@ -68,9 +68,32 @@ impl RedbOptions {
         self.open_timed(path, true).map(|(db, _)| db)
     }
 
+    /// Inspect without writing redb's allocator state or shutdown header.
+    pub(crate) fn open_read_only_timed(
+        &self,
+        path: &Path,
+    ) -> (Result<redb::ReadOnlyDatabase>, FileOpen) {
+        #[cfg(test)]
+        opens::record(path);
+        let start = Instant::now();
+        let db = self
+            .builder()
+            .open_read_only(path)
+            .map_err(|e| ClError::Database(redb::Error::from(e)));
+        let open_time = start.elapsed();
+        let opened = FileOpen {
+            path: path.to_path_buf(),
+            bytes: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+            open_time,
+            repaired: false,
+            format_check: true,
+        };
+        (db, opened)
+    }
+
     /// Open (or create) a file and say how the open went: how long it took,
     /// whether redb had to repair the file, and how large the file is.
-    fn open_timed(&self, path: &Path, create: bool) -> Result<(Database, FileOpen)> {
+    pub(crate) fn open_timed(&self, path: &Path, create: bool) -> Result<(Database, FileOpen)> {
         #[cfg(test)]
         opens::record(path);
         // redb calls this when it rebuilds the allocator state by walking the
@@ -101,6 +124,7 @@ impl RedbOptions {
                 bytes,
                 open_time,
                 repaired: existed && repaired.load(Ordering::Relaxed),
+                format_check: false,
             },
         ))
     }
@@ -116,6 +140,7 @@ pub(crate) struct FileOpen {
     pub(crate) open_time: Duration,
     /// redb walked the whole file to rebuild its allocator state.
     pub(crate) repaired: bool,
+    pub(crate) format_check: bool,
 }
 
 /// Every path opened through [`RedbOptions`], so a test can count the opens

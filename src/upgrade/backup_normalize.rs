@@ -1,278 +1,327 @@
-use std::fs;
-use std::path::Path;
-
-use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
-
-use crate::backup::{BackupRecord, BulkRecord};
-use crate::durability::DurabilityMode;
-use crate::handle::RedbOptions;
-use crate::metadata::inspect::{pre_upgrade_path, upgrading_path};
-use crate::upgrade::legacy_record::{canonical_bytes, parse_backup_value};
-use crate::units::{ClError, Result};
-
+//! Convert on one sibling copy, verify against the untouched source, then replace.
+use crate::{
+    backup::codec,
+    durability::DurabilityMode,
+    handle::{FileOpen, RedbOptions},
+    metadata::inspect::upgrading_path,
+    units::{ClError, Result},
+};
+use chrono::Local;
+use redb::{
+    Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle,
+};
+use std::{fs, io::Read, path::Path};
 const BATCH_SIZE: usize = 1000;
-
 pub struct BackupNormalizeResult {
     pub upgraded: bool,
     pub entries_converted: usize,
     pub entries_skipped: usize,
     pub pre_upgrade_removed: bool,
+    pub(crate) opens: Vec<FileOpen>,
+    pub failure: Option<String>,
 }
-
 pub fn eager_normalize(
-    backup_path: &Path,
-    data_tables: &[String],
+    path: &Path,
+    registered_tables: &[String],
     has_cache: bool,
     durability: DurabilityMode,
     redb: RedbOptions,
 ) -> Result<BackupNormalizeResult> {
-    if !backup_path.exists() {
-        return Ok(BackupNormalizeResult {
-            upgraded: false,
-            entries_converted: 0,
-            entries_skipped: 0,
-            pre_upgrade_removed: false,
-        });
-    }
-
-    if is_fully_normalized(backup_path, data_tables, redb)? {
-        return Ok(BackupNormalizeResult {
-            upgraded: false,
-            entries_converted: 0,
-            entries_skipped: count_data_entries(backup_path, data_tables, redb)?,
-            pre_upgrade_removed: false,
-        });
-    }
-
-    let pre_path = pre_upgrade_path(backup_path);
-    if !pre_path.exists() {
-        fs::copy(backup_path, &pre_path)?;
-    }
-
-    let upgrading = upgrading_path(backup_path);
-    if upgrading.exists() {
-        fs::remove_file(&upgrading)?;
-    }
-    fs::copy(backup_path, &upgrading)?;
-
-    let (converted, skipped) =
-        transform_database(&upgrading, data_tables, has_cache, durability, redb)?;
-
-    verify_normalized(&upgrading, data_tables, redb)?;
-
-    drop_open_handles();
-
-    fs::remove_file(backup_path).map_err(|e| ClError::BackupNormalizeFailed {
-        reason: format!("remove original backup: {}", e),
-    })?;
-    fs::rename(&upgrading, backup_path).map_err(|e| ClError::BackupNormalizeFailed {
-        reason: format!("swap upgrading backup: {}", e),
-    })?;
-
-    let pre_removed = if pre_path.exists() {
-        fs::remove_file(&pre_path).is_ok()
-    } else {
-        false
+    let mut result = BackupNormalizeResult {
+        upgraded: false,
+        entries_converted: 0,
+        entries_skipped: 0,
+        pre_upgrade_removed: false,
+        opens: Vec::new(),
+        failure: None,
     };
-
-    Ok(BackupNormalizeResult {
-        upgraded: true,
-        entries_converted: converted,
-        entries_skipped: skipped,
-        pre_upgrade_removed: pre_removed,
-    })
-}
-
-fn is_fully_normalized(
-    backup_path: &Path,
-    data_tables: &[String],
-    redb: RedbOptions,
-) -> Result<bool> {
-    let db = redb.open(backup_path)?;
-    let read_txn = db.begin_read()?;
-
-    for table_name in data_tables {
-        let table: TableDefinition<&str, &[u8]> = TableDefinition::new(table_name.as_str());
-        let table_ref = match read_txn.open_table(table) {
-            Ok(t) => t,
-            Err(_) => continue,
+    if !path.exists() {
+        return Ok(result);
+    }
+    let copy = upgrading_path(path);
+    // Only this converter's reserved sibling is disposable. A previous interrupted
+    // attempt is restarted from the original, never treated as authoritative.
+    if copy.exists() {
+        fs::remove_file(&copy)?;
+    }
+    let attempt = (|| -> Result<()> {
+        let source = match format_open_read_only(redb, path, &mut result.opens) {
+            Ok(source) => Some(source),
+            // A read-only open cannot repair. Repair only the byte-identical copy.
+            Err(ClError::Database(redb::Error::RepairAborted)) => None,
+            Err(error) => return Err(error),
         };
-        for entry in table_ref.iter()? {
-            let (_, value) = entry?;
-            let bytes = value.value();
-            if bytes.is_empty() {
-                continue;
+        if let Some(source) = &source {
+            let names = table_names(source)?;
+            let data = history_tables(&names, registered_tables);
+            let read = source.begin_read()?;
+            let mut all_v2 = true;
+            for name in &data {
+                for entry in read
+                    .open_table(TableDefinition::<&str, &[u8]>::new(name))?
+                    .iter()?
+                {
+                    let (_, value) = entry?;
+                    if !codec::is_v2(value.value())? {
+                        all_v2 = false;
+                    }
+                }
             }
-            if serde_json::from_slice::<BackupRecord>(bytes).is_err() {
-                return Ok(false);
+            if all_v2 {
+                result.upgraded = true;
+                return Ok(());
             }
         }
+        fs::copy(path, &copy)?;
+        verify_copy_bytes(path, &copy)?;
+        let mut converted = format_open(redb, &copy, &mut result.opens)?;
+        let tables = table_names(&converted)?;
+        let data_tables = history_tables(&tables, registered_tables);
+        // This MVCC snapshot represents the exact copy before conversion, after any
+        // redb recovery. It remains readable through the writes, with bounded RAM.
+        let read = converted.begin_read()?;
+        let now = Local::now();
+        let timestamp = now.timestamp_millis();
+        let date = now.format("%Y-%m-%d %H:%M:%S%.3f").to_string();
+        for name in data_tables.iter() {
+            let table = read.open_table(TableDefinition::<&str, &[u8]>::new(name))?;
+            let mut batch = Vec::with_capacity(BATCH_SIZE);
+            for entry in table.iter()? {
+                let (key, value) = entry?;
+                let mut record = codec::decode_record(name, key.value(), value.value())?;
+                if record.date_from_migration && record.date.is_empty() {
+                    record.timestamp = timestamp;
+                    record.date = date.clone();
+                }
+                batch.push((key.value().to_string(), codec::encode_record(&record)?));
+                result.entries_converted += 1;
+                if batch.len() == BATCH_SIZE {
+                    write_batch(&converted, name, &batch, has_cache, durability, redb)?;
+                    batch.clear();
+                }
+            }
+            if !batch.is_empty() {
+                write_batch(&converted, name, &batch, has_cache, durability, redb)?;
+            }
+        }
+        #[cfg(test)]
+        fault::corrupt_copy_if_requested(&converted, &data_tables)?;
+        verify(&read, &converted, &tables, &data_tables, timestamp, &date)?;
+        drop(read);
+        // No read/write guards may survive into compact or file replacement.
+        converted
+            .compact()
+            .map_err(|e| ClError::BackupNormalizeFailed {
+                reason: format!("compact converted backup: {e}"),
+            })?;
+        drop(converted);
+        drop(source);
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&copy)?
+            .sync_all()?;
+        crate::fsutil::maybe_crash("backup_before_replace");
+        // Same-directory rename replaces the destination on supported Windows/Unix.
+        // Never remove or move the source aside first: there must be no missing-file gap.
+        fs::rename(&copy, path)?;
+        crate::fsutil::maybe_crash("backup_after_replace");
+        result.upgraded = true;
+        Ok(())
+    })();
+    if let Err(error) = attempt {
+        if copy.exists() {
+            fs::remove_file(&copy)?;
+        }
+        result.failure = Some(error.to_string());
     }
-    Ok(true)
+    Ok(result)
 }
-
-fn count_data_entries(
-    backup_path: &Path,
-    data_tables: &[String],
-    redb: RedbOptions,
-) -> Result<usize> {
-    let db = redb.open(backup_path)?;
-    let read_txn = db.begin_read()?;
-    let mut count = 0;
-    for table_name in data_tables {
-        let table: TableDefinition<&str, &[u8]> = TableDefinition::new(table_name.as_str());
-        if let Ok(table_ref) = read_txn.open_table(table) {
-            count += table_ref.iter()?.count();
-        }
+fn verify_copy_bytes(source: &Path, copy: &Path) -> Result<()> {
+    let mut original = fs::File::open(source)?;
+    let mut staged = fs::File::open(copy)?;
+    let mut remaining = original.metadata()?.len();
+    if remaining != staged.metadata()?.len() {
+        return Err(mismatch("initial copy length"));
     }
-    Ok(count)
-}
-
-fn transform_database(
-    path: &Path,
-    data_tables: &[String],
-    has_cache: bool,
-    durability: DurabilityMode,
-    redb: RedbOptions,
-) -> Result<(usize, usize)> {
-    let db = redb.open(path)?;
-    let mut converted = 0usize;
-    let mut skipped = 0usize;
-
-    for table_name in data_tables {
-        let bulk_name = format!("{}_bulk", table_name);
-        let ver_name = format!("{}_version", table_name);
-
-        let entries = read_table_entries(&db, table_name)?;
-        if entries.is_empty() {
-            continue;
+    let mut left = [0u8; 8192];
+    let mut right = [0u8; 8192];
+    while remaining > 0 {
+        let length = remaining.min(left.len() as u64) as usize;
+        original.read_exact(&mut left[..length])?;
+        staged.read_exact(&mut right[..length])?;
+        if left[..length] != right[..length] {
+            return Err(mismatch("initial copy bytes"));
         }
-
-        let mut batch: Vec<(String, Vec<u8>)> = Vec::new();
-        for (key, value) in entries {
-            if serde_json::from_slice::<BackupRecord>(&value).is_ok() {
-                skipped += 1;
-                batch.push((key, value));
-            } else {
-                let record = parse_backup_value(table_name, &key, &value)?;
-                let bytes = canonical_bytes(&record)?;
-                converted += 1;
-                batch.push((key, bytes));
-            }
-            if batch.len() >= BATCH_SIZE {
-                write_batch(&db, table_name, &batch, has_cache, durability)?;
-                batch.clear();
-            }
-        }
-        if !batch.is_empty() {
-            write_batch(&db, table_name, &batch, has_cache, durability)?;
-        }
-
-        normalize_bulk_table(&db, &bulk_name, has_cache, durability)?;
-        let _ = ver_name;
+        remaining -= length as u64;
     }
-
-    Ok((converted, skipped))
+    Ok(())
 }
-
-fn read_table_entries(db: &Database, table_name: &str) -> Result<Vec<(String, Vec<u8>)>> {
-    let read_txn = db.begin_read()?;
-    let table: TableDefinition<&str, &[u8]> = TableDefinition::new(table_name);
-    let table_ref = read_txn.open_table(table).map_err(|_| {
-        ClError::BackupNormalizeFailed {
-            reason: format!("table '{}' not found in backup", table_name),
-        }
-    })?;
-    table_ref
-        .iter()?
-        .map(|e| {
-            let (k, v) = e?;
-            Ok((k.value().to_string(), v.value().to_vec()))
+fn history_tables(tables: &[String], registered: &[String]) -> Vec<String> {
+    tables
+        .iter()
+        .filter(|name| {
+            if registered.contains(name) {
+                return true;
+            }
+            let parent = name
+                .strip_suffix("_version")
+                .or_else(|| name.strip_suffix("_bulk"));
+            !parent.is_some_and(|parent| tables.iter().any(|table| table == parent))
         })
+        .cloned()
         .collect()
 }
-
+fn table_names(db: &impl ReadableDatabase) -> Result<Vec<String>> {
+    Ok(db
+        .begin_read()?
+        .list_tables()?
+        .map(|table| table.name().to_string())
+        .collect())
+}
+fn format_open_read_only(
+    redb: RedbOptions,
+    path: &Path,
+    opens: &mut Vec<FileOpen>,
+) -> Result<redb::ReadOnlyDatabase> {
+    let (db, opened) = redb.open_read_only_timed(path);
+    opens.push(opened);
+    db
+}
+fn format_open(redb: RedbOptions, path: &Path, opens: &mut Vec<FileOpen>) -> Result<Database> {
+    let (db, mut opened) = redb.open_timed(path, false)?;
+    opened.format_check = true;
+    opens.push(opened);
+    Ok(db)
+}
 fn write_batch(
     db: &Database,
-    table_name: &str,
+    name: &str,
     batch: &[(String, Vec<u8>)],
     has_cache: bool,
     durability: DurabilityMode,
+    redb: RedbOptions,
 ) -> Result<()> {
-    let table: TableDefinition<&str, &[u8]> = TableDefinition::new(table_name);
-    let mut write_txn = db.begin_write()?;
+    let mut tx = db.begin_write()?;
     if durability.is_strict() {
-        write_txn.set_durability(Durability::Immediate)?;
+        tx.set_durability(redb::Durability::Immediate)?;
+    }
+    if redb.quick_repair {
+        tx.set_quick_repair(true);
     }
     {
-        let mut table_ref = write_txn.open_table(table)?;
+        let mut table = tx.open_table(TableDefinition::<&str, &[u8]>::new(name))?;
         for (key, value) in batch {
             if has_cache {
-                table_ref.insert(key.as_str(), value.as_slice())?;
+                table.insert(key.as_str(), value.as_slice())?;
             } else {
-                let mut slot = table_ref.insert_reserve(key.as_str(), value.len())?;
+                let mut slot = table.insert_reserve(key.as_str(), value.len())?;
                 slot.as_mut().copy_from_slice(value);
             }
         }
     }
-    write_txn.commit()?;
+    tx.commit()?;
     Ok(())
 }
-
-fn normalize_bulk_table(
-    db: &Database,
-    bulk_table_name: &str,
-    has_cache: bool,
-    durability: DurabilityMode,
+fn verify(
+    before: &redb::ReadTransaction,
+    converted: &Database,
+    names: &[String],
+    data_tables: &[String],
+    timestamp: i64,
+    date: &str,
 ) -> Result<()> {
-    let read_txn = db.begin_read()?;
-    let table: TableDefinition<&str, &[u8]> = TableDefinition::new(bulk_table_name);
-    let Ok(table_ref) = read_txn.open_table(table) else {
-        return Ok(());
-    };
-
-    let entries: Vec<(String, Vec<u8>)> = table_ref
-        .iter()?
-        .map(|e| {
-            let (k, v) = e?;
-            Ok((k.value().to_string(), v.value().to_vec()))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    drop(read_txn);
-
-    if entries.is_empty() {
-        return Ok(());
+    if table_names(converted)? != names {
+        return Err(mismatch("table inventory"));
     }
-
-    let mut batch = Vec::new();
-    for (key, value) in entries {
-        if serde_json::from_slice::<BulkRecord>(&value).is_ok() {
-            batch.push((key, value));
+    let after = converted.begin_read()?;
+    for name in names {
+        if !data_tables.contains(name) && name.ends_with("_version") {
+            let left = before.open_table(TableDefinition::<&str, u64>::new(name))?;
+            let right = after.open_table(TableDefinition::<&str, u64>::new(name))?;
+            if left.len()? != right.len()? {
+                return Err(mismatch(name));
+            }
+            for entry in left.iter()? {
+                let (key, value) = entry?;
+                if right.get(key.value())?.map(|v| v.value()) != Some(value.value()) {
+                    return Err(mismatch(name));
+                }
+            }
         } else {
-            return Err(ClError::BackupNormalizeFailed {
-                reason: format!("bulk entry '{}' is not valid BulkRecord JSON", key),
-            });
+            let left = before.open_table(TableDefinition::<&str, &[u8]>::new(name))?;
+            let right = after.open_table(TableDefinition::<&str, &[u8]>::new(name))?;
+            if left.len()? != right.len()? {
+                return Err(mismatch(name));
+            }
+            for entry in left.iter()? {
+                let (key, value) = entry?;
+                let actual = right.get(key.value())?.ok_or_else(|| mismatch(name))?;
+                if !data_tables.contains(name) && name.ends_with("_bulk") {
+                    // Preserve every byte of bulk metadata, not just selected fields.
+                    if value.value() != actual.value() {
+                        return Err(mismatch(name));
+                    }
+                    let _: crate::backup::BulkRecord = serde_json::from_slice(actual.value())?;
+                } else {
+                    let mut expected = codec::decode_record(name, key.value(), value.value())?;
+                    if expected.date_from_migration && expected.date.is_empty() {
+                        expected.timestamp = timestamp;
+                        expected.date = date.to_string();
+                    }
+                    if !codec::is_v2(actual.value())? {
+                        return Err(mismatch(name));
+                    }
+                    let actual = codec::decode_record(name, key.value(), actual.value())?;
+                    // Includes payload byte-for-byte and every metadata field.
+                    if expected != actual {
+                        return Err(mismatch(&format!("{name}/{}", key.value())));
+                    }
+                }
+            }
         }
     }
-    write_batch(db, bulk_table_name, &batch, has_cache, durability)
-}
-
-fn verify_normalized(backup_path: &Path, data_tables: &[String], redb: RedbOptions) -> Result<()> {
-    let before = count_data_entries(backup_path, data_tables, redb)?;
-    if !is_fully_normalized(backup_path, data_tables, redb)? {
-        return Err(ClError::BackupNormalizeFailed {
-            reason: "verify failed: not all entries parse as BackupRecord".into(),
-        });
-    }
-    let after = count_data_entries(backup_path, data_tables, redb)?;
-    if before != after {
-        return Err(ClError::BackupNormalizeFailed {
-            reason: format!("entry count mismatch: before {} after {}", before, after),
-        });
-    }
     Ok(())
 }
-
-fn drop_open_handles() {
-    // redb Database drops when out of scope; explicit hook for future use
+fn mismatch(context: &str) -> ClError {
+    ClError::BackupNormalizeFailed {
+        reason: format!("conversion verification mismatch: {context}"),
+    }
+}
+#[cfg(test)]
+pub(crate) mod fault {
+    use super::*;
+    thread_local! { static CORRUPT:std::cell::Cell<bool>=const { std::cell::Cell::new(false) }; }
+    pub(crate) fn corrupt_next() {
+        CORRUPT.with(|flag| flag.set(true));
+    }
+    pub(super) fn corrupt_copy_if_requested(db: &Database, names: &[String]) -> Result<()> {
+        if !CORRUPT.with(|flag| flag.replace(false)) {
+            return Ok(());
+        }
+        let name = names
+            .first()
+            .ok_or_else(|| mismatch("fault table missing"))?;
+        let (key, mut record) = {
+            let tx = db.begin_read()?;
+            let table = tx.open_table(TableDefinition::<&str, &[u8]>::new(name))?;
+            let (key, value) = table
+                .iter()?
+                .next()
+                .ok_or_else(|| mismatch("fault record missing"))??;
+            (
+                key.value().to_string(),
+                codec::decode_record(name, key.value(), value.value())?,
+            )
+        };
+        record.data = Some(b"altered payload".to_vec());
+        write_batch(
+            db,
+            name,
+            &[(key, codec::encode_record(&record)?)],
+            true,
+            DurabilityMode::Strict,
+            RedbOptions::default(),
+        )
+    }
 }

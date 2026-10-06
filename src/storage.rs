@@ -252,6 +252,7 @@ impl Storage {
                     bytes: file.bytes,
                     open_time: file.open_time,
                     repaired: file.repaired,
+                    format_check: file.format_check,
                 })
             })
             .collect()
@@ -264,7 +265,7 @@ impl Storage {
 pub struct OpenReport {
     /// The database's name, as given to [`DatabaseConfig::new`].
     pub database: String,
-    /// The `.cldb` or `.cldb.bak`.
+    /// The primary, backup, or temporary conversion file.
     pub path: PathBuf,
     /// The file's size right after the open.
     pub bytes: u64,
@@ -274,9 +275,9 @@ pub struct OpenReport {
     /// process to write it ended without closing it, and its last commit did
     /// not save that state (see [`DatabaseConfig::quick_repair`]).
     pub repaired: bool,
+    /// This open belongs to one-time backup format inspection or conversion.
+    pub format_check: bool,
 }
-
-
 
 trait DomainFactory: Send + Sync {
     fn table_name(&self) -> &'static str;
@@ -821,8 +822,7 @@ impl StorageBuilder {
 
             let durability = config.durability.unwrap_or(DurabilityMode::Strict);
 
-            let db_manager = DatabaseManager::open(
-
+            let mut db_manager = DatabaseManager::open(
                 upgrade.db,
 
                 &config.dir_path,
@@ -859,10 +859,9 @@ impl StorageBuilder {
 
             )?;
 
-
+            db_manager.format_opens = upgrade.format_opens;
 
             for factory in &config.factories {
-
                 let (type_id, domain) = factory.build(&db_manager);
 
                 domains.insert(type_id, domain);

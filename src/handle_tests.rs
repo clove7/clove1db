@@ -296,6 +296,7 @@ fn opened(storage: &Storage) -> Vec<(PathBuf, bool)> {
     storage
         .open_report()
         .into_iter()
+        .filter(|r| !r.format_check)
         .map(|r| (r.path, r.repaired))
         .collect()
 }
@@ -404,5 +405,46 @@ fn open_report_after_an_unclean_exit_with_quick_repair_is_not_repaired() {
     settled(&dir);
     run_child(&dir, "set", true);
     let storage = build(&dir, |c| c.quick_repair(true));
-    assert_eq!(opened(&storage), vec![(primary(&dir), false), (backup(&dir), false)]);
+    assert_eq!(
+        opened(&storage),
+        vec![(primary(&dir), false), (backup(&dir), false)]
+    );
+}
+
+#[test]
+fn format_check_opens_are_reported_once_and_match_actual_opens() {
+    let dir = fresh_dir("report_format_checks");
+    let storage = build(&dir, |c| c);
+    storage
+        .domain::<Row>()
+        .repo()
+        .set("a", &row("a", 16))
+        .unwrap();
+    storage.close();
+    drop(storage);
+    let db = redb::Database::open(primary(&dir)).unwrap();
+    let mut meta = crate::metadata::store::read_meta(&db).unwrap().unwrap();
+    meta.backup_format = "json_wrapped_v1".into();
+    let tx = db.begin_write().unwrap();
+    crate::metadata::store::put_meta(&tx, &meta).unwrap();
+    tx.commit().unwrap();
+    drop(db);
+    let before = opens::count(&backup(&dir));
+    let storage = build(&dir, |c| c);
+    let report = storage.open_report();
+    let checks: Vec<_> = report.iter().filter(|r| r.format_check).collect();
+    assert!(!checks.is_empty(), "missing format inspection opens");
+    assert!(
+        checks
+            .iter()
+            .all(|r| r.bytes > 0 && r.open_time > std::time::Duration::ZERO)
+    );
+    assert_eq!(
+        report.iter().filter(|r| r.path == backup(&dir)).count(),
+        opens::count(&backup(&dir)) - before
+    );
+    storage.close();
+    drop(storage);
+    let storage = build(&dir, |c| c);
+    assert!(storage.open_report().iter().all(|r| !r.format_check));
 }

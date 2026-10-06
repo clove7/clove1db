@@ -1,0 +1,10 @@
+[package]
+name = "example_14_backup_v2_and_atomic_batches"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+clove1db = { path = "../..", features = ["crash-inject"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+redb = "4.3.0"
