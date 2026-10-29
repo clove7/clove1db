@@ -110,6 +110,8 @@ pub(crate) fn encode_record(record: &BackupRecord) -> Result<Vec<u8>> {
             return Err(invalid("delete record contains a payload"));
         }
         encoded.pop();
+        // The record holds the payload again: as itself, or as base64 (4/3 of it) plus its JSON string.
+        crate::memory::reserve("backup.encode_record", &mut encoded, data.len().saturating_add(data.len() / 3 * 2).saturating_add(64))?;
         if serde_json::from_slice::<&RawValue>(data).is_ok() {
             // RawValue validates the JSON. Append the original slice as the LAST field,
             // including outer whitespace that RawValue itself normally trims.
@@ -117,7 +119,7 @@ pub(crate) fn encode_record(record: &BackupRecord) -> Result<Vec<u8>> {
             encoded.extend_from_slice(data);
         } else {
             encoded.extend_from_slice(b",\"data_b64\":");
-            encoded.extend_from_slice(&serde_json::to_vec(&encode_base64(data))?);
+            encoded.extend_from_slice(&serde_json::to_vec(&encode_base64(data)?)?);
         }
         encoded.push(b'}');
     }
@@ -217,8 +219,12 @@ pub(crate) fn raw_record(table: &str, key: &str, bytes: &[u8]) -> Result<BackupR
     })
 }
 const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-fn encode_base64(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+fn encode_base64(bytes: &[u8]) -> Result<String> {
+    let capacity = bytes.len().div_ceil(3).saturating_mul(4);
+    let mut out = String::new();
+    if crate::memory::probe("backup.encode_record", capacity).is_err() || out.try_reserve_exact(capacity).is_err() {
+        return Err(crate::units::ClError::OutOfMemory { site: "backup.encode_record", bytes: capacity as u64 });
+    }
     for chunk in bytes.chunks(3) {
         let a = chunk[0];
         let b = *chunk.get(1).unwrap_or(&0);
@@ -236,7 +242,7 @@ fn encode_base64(bytes: &[u8]) -> String {
             '='
         });
     }
-    out
+    Ok(out)
 }
 fn decode_base64(text: &str) -> Result<Vec<u8>> {
     let bytes = text.as_bytes();

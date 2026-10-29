@@ -51,6 +51,14 @@ pub struct TableMeta {
     pub layout_hash: String,
     #[serde(default)]
     pub storage: TableStorageMode,
+    /// Random identity of the table, made when a table with protected fields is created. Keys of
+    /// protected fields are tied to it instead of to the table's name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table_id: Option<String>,
+    /// The protected fields the table was created with. Absent for a table without any, so such
+    /// a description is written exactly as before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sealed: Vec<crate::field_crypto::SealedField>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

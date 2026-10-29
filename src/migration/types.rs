@@ -1,25 +1,10 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 pub use crate::metadata::types::TableStorageMode;
 
 pub const MIGRATION_INDEX_VERSION: u32 = 2;
-
-#[derive(Debug, Clone)]
-pub struct BlobMigrationPolicy {
-    pub batch_size: usize,
-    pub delete_source_blobs: bool,
-}
-
-impl Default for BlobMigrationPolicy {
-    fn default() -> Self {
-        Self {
-            batch_size: 256,
-            delete_source_blobs: true,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -144,7 +129,8 @@ pub struct TableChainIndex {
 pub struct DbMigrationRootIndex {
     pub index_version: u32,
     pub db_name: String,
-    pub tables: HashMap<String, TableChainSummary>,
+    /// Ordered by table name, so the serialized index is byte-for-byte the same every time it is written.
+    pub tables: BTreeMap<String, TableChainSummary>,
 }
 
 // ── API types ────────────────────────────────────────────────────────────────

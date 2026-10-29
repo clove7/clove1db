@@ -60,6 +60,7 @@ const LOG_CHANNEL_CAPACITY: usize = 1024;
 
 
 struct StorageInner {
+    index_worker:crate::indexes::Worker,
 
     domains: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
 
@@ -127,6 +128,14 @@ impl Storage {
 
 
 
+    /// Value-free snapshot of index diagnostics; does not build or refresh usage.
+    pub fn index_report(&self)->Vec<crate::indexes::IndexReport> {self.db_list().into_iter().flat_map(|db|db.indexes.reports()).collect()}
+    #[cfg(any(test,feature="crash-inject"))]
+    #[doc(hidden)]
+    pub fn test_advance_index_clock(&self,duration:std::time::Duration) {for db in self.db_list(){db.indexes.advance_clock(duration.as_millis() as u64);}}
+    #[cfg(any(test,feature="crash-inject"))]
+    #[doc(hidden)]
+    pub fn test_request_index_compaction(&self){for db in self.db_list(){db.indexes.request_compact();}}
     pub fn db_list(&self) -> Vec<&DatabaseManager> {
 
         self.0.database_managers.values().collect()
@@ -146,6 +155,8 @@ impl Storage {
     /// [`ClError::Closed`] instead of writing to a file that is gone. It does
     /// not cover a kill or a crash; [`DatabaseConfig::quick_repair`] does.
     pub fn close(&self) {
+        self.0.index_worker.stop();
+        for db in self.db_list() {db.indexes.clear();}
 
         for db in self.db_list() {
 
@@ -281,19 +292,40 @@ pub struct OpenReport {
 
 trait DomainFactory: Send + Sync {
     fn table_name(&self) -> &'static str;
+    fn entity_type(&self)->TypeId;
+    fn id_path(&self)->Option<crate::fields::Path>;
     fn layout(&self) -> FieldLayout;
     fn storage(&self) -> TableStorageMode;
-    fn build(&self, database_manager: &DatabaseManager) -> (TypeId, Box<dyn Any + Send + Sync>);
+    /// The protected fields the entity declares.
+    fn sealed(&self) -> &'static [crate::field_crypto::SealedSpec];
+    fn build(
+        &self,
+        database_manager: &DatabaseManager,
+        seal: &SealEnv<'_>,
+    ) -> Result<(TypeId, Box<dyn Any + Send + Sync>)>;
+}
+
+/// What a table with protected fields needs when its repository is made.
+struct SealEnv<'a> {
+    /// The keys of the database, when it has any.
+    keys: Option<Arc<crate::field_crypto::FieldKeys>>,
+    /// The identity recorded for each table that has protected fields.
+    table_ids: &'a HashMap<String, String>,
 }
 
 struct TypedFactory<E: Entity + serde::Serialize + Default> {
     table: &'static str,
     layout: FieldLayout,
     storage: TableStorageMode,
+    sealed: &'static [crate::field_crypto::SealedSpec],
+    /// Set by `register_sealed`: how to encode and bind a row of this entity.
+    kit: Option<crate::field_crypto::SealedKit<E>>,
     _marker: PhantomData<fn() -> E>,
 }
 
 impl<E: Entity + serde::Serialize + Default> DomainFactory for TypedFactory<E> {
+    fn entity_type(&self)->TypeId {TypeId::of::<E>()}
+    fn id_path(&self)->Option<crate::fields::Path> {E::id_field().map(|f|f.path())}
     fn table_name(&self) -> &'static str {
         self.table
     }
@@ -306,14 +338,73 @@ impl<E: Entity + serde::Serialize + Default> DomainFactory for TypedFactory<E> {
         self.storage
     }
 
-    fn build(&self, database_manager: &DatabaseManager) -> (TypeId, Box<dyn Any + Send + Sync>) {
-        let repo = Repository::<E>::new(self.table, database_manager.clone());
+    fn sealed(&self) -> &'static [crate::field_crypto::SealedSpec] {
+        self.sealed
+    }
+
+    fn build(
+        &self,
+        database_manager: &DatabaseManager,
+        seal: &SealEnv<'_>,
+    ) -> Result<(TypeId, Box<dyn Any + Send + Sync>)> {
+        let repo = match self.kit {
+            Some(kit) => {
+                let keys = seal.keys.clone().ok_or_else(|| {
+                    ClError::Validation(
+                        "a table with protected fields needs encryption keys: set `DatabaseConfig::encryption`".into(),
+                    )
+                })?;
+                let table_id = seal.table_ids.get(self.table).ok_or_else(|| {
+                    ClError::Validation("the table has no recorded identity".into())
+                })?;
+                let hooks = Arc::new(crate::field_crypto::SealedHooks::new(self.table, table_id, self.sealed, keys, kit));
+                Repository::<E>::new_sealed(self.table, database_manager.clone(), hooks)
+            }
+            None => Repository::<E>::new(self.table, database_manager.clone()),
+        };
         let domain = Domain::new(repo);
-        (TypeId::of::<E>(), Box::new(domain))
+        Ok((TypeId::of::<E>(), Box::new(domain)))
     }
 }
 
 
+
+/// The size from which [`Prefetch::Auto`] reads a `.cldb` before opening it: 64 MiB (included).
+pub const PREFETCH_AUTO_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The size above which [`Prefetch::Auto`] no longer reads a `.cldb` before opening it: 1 GiB (itself still read).
+pub const PREFETCH_AUTO_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Whether the `.cldb` is read once, front to back, before it is opened. See [`DatabaseConfig::prefetch`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Prefetch {
+    /// Read it when the file is from [`PREFETCH_AUTO_BYTES`] up to and including [`PREFETCH_AUTO_MAX_BYTES`]
+    /// (64 MiB to 1 GiB). The default.
+    #[default]
+    Auto,
+    /// Always read it, whatever its size.
+    Always,
+    /// Never read it.
+    Never,
+}
+
+impl Prefetch {
+    /// Whether a file of `file_bytes` (0 when it does not exist yet) is read before it is opened.
+    pub fn reads(self, file_bytes: u64) -> bool {
+        match self {
+            Prefetch::Auto => (PREFETCH_AUTO_BYTES..=PREFETCH_AUTO_MAX_BYTES).contains(&file_bytes),
+            Prefetch::Always => true,
+            Prefetch::Never => false,
+        }
+    }
+}
+
+/// `true` is [`Prefetch::Always`] and `false` is [`Prefetch::Never`], so `.prefetch(true)` and `.prefetch(false)` keep working.
+impl From<bool> for Prefetch {
+    fn from(on: bool) -> Self {
+        if on { Prefetch::Always } else { Prefetch::Never }
+    }
+}
 
 pub struct DatabaseConfig {
 
@@ -345,6 +436,11 @@ pub struct DatabaseConfig {
     max_commit_batch_entries: usize,
 
     redb: RedbOptions,
+    prefetch: Prefetch,
+    journal_retention:crate::journal::Retention,
+    unique:Vec<(TypeId,Vec<crate::Unique>)>,
+    field_encryption: Option<Arc<crate::encrypted_store::EncryptionConfig>>,
+    field_keys_file: Option<PathBuf>,
 }
 
 
@@ -381,13 +477,43 @@ impl DatabaseConfig {
 
             max_commit_batch_entries: DEFAULT_MAX_COMMIT_BATCH_ENTRIES,
 
-            redb: RedbOptions::default(),
+            redb: {
+                #[allow(unused_mut)]
+                let mut redb = RedbOptions::default();
+                // Test builds only (`--cfg clove_test_encrypt_all`): every database is encrypted with a fixed test key.
+                #[cfg(clove_test_encrypt_all)]
+                {
+                    redb.encryption = Some(crate::encrypted_store::EncryptionHandle::new(crate::encrypted_store::test_encrypt_all_config()));
+                }
+                redb
+            },
+            prefetch: Prefetch::Auto,
+            journal_retention:crate::journal::Retention::Default,
+            unique:Vec::new(),
+            field_encryption: None,
+            field_keys_file: None,
 
         }
 
     }
 
 
+
+    /// Test builds only: keep this database plain under `--cfg clove_test_encrypt_all`.
+    #[cfg(clove_test_encrypt_all)]
+    #[doc(hidden)]
+    pub fn plain(mut self) -> Self {
+        self.redb.encryption = None;
+        self
+    }
+
+    pub fn unique<E:Entity>(mut self,constraint:crate::Unique<E>)->Self {
+        let constraint=constraint.erase();
+        let id=TypeId::of::<E>();
+        if let Some((_,v))=self.unique.iter_mut().find(|(i,_)|*i==id){v.push(constraint)}else{self.unique.push((id,vec![constraint]));}self
+    }
+    /// Size-only budget for the durable change journal, independent of history.
+    pub fn journal_retention(mut self,retention:crate::journal::Retention)->Self {self.journal_retention=retention;self}
 
     pub fn has_cache(mut self, has_cache: bool) -> Self {
 
@@ -425,6 +551,77 @@ impl DatabaseConfig {
         self
     }
 
+    /// Encrypt every file of this database (the `.cldb`, its `.cldb.bak`, its `.inx`) with keys the
+    /// caller holds. The database must not exist yet: an existing unencrypted database is converted
+    /// by a migration, and opening one with a key is the single "could not be opened" error.
+    ///
+    /// Every commit of an encrypted file is two-phase and saves redb's allocator state.
+    ///
+    /// The cipher is AES-256-GCM-SIV unless the configuration says otherwise (`EncryptionConfig::new` uses it; `with_suite`
+    /// picks another, for example XChaCha20-Poly1305).
+    ///
+    /// The settings are checked at the start of `build()`, before any file is touched: only
+    /// AES-256-GCM-SIV and XChaCha20-Poly1305 are accepted, the read key is always required, and a
+    /// new database needs the search key too; each refusal is `ClError::Validation` saying what is
+    /// missing. A wrong key or an unencrypted file is the single "could not be opened" error.
+    ///
+    /// Limits: a block put back from an older copy of its own file has a valid seal and is found
+    /// only by [`DatabaseConfig::encryption_verify_on_open`] or, on closed files,
+    /// `encrypted_store::verify_encrypted_files`; the whole file put back to an older state cannot
+    /// be told; the number of files and their sizes are visible. Nothing converts a plain database
+    /// in place: use a migration.
+    pub fn encryption(mut self, config: crate::encrypted_store::EncryptionConfig) -> Self {
+        self.redb.encryption = Some(crate::encrypted_store::EncryptionHandle::new(config));
+        self
+    }
+
+    /// Keys for the protected fields (`Sealed`, `Hashed`, `SearchPrint`) of a database that is not
+    /// encrypted as a whole. Use either this or [`DatabaseConfig::encryption`], not both: with
+    /// whole-database encryption the protected fields use the keys of the database.
+    ///
+    /// A new database needs both the read key and the search key; an existing one opens with the
+    /// read key, or with the search key alone (it can then read rows but neither write nor open a
+    /// protected value). The data key is made at creation and stored locked in the main file, with
+    /// a copy in the small keys file `{db}.keys` next to it (written only when it changes: a new
+    /// protected table). The cipher is not stored, and only AES-256-GCM-SIV and XChaCha20-Poly1305
+    /// are accepted. A wrong key is the single "could not be opened" error.
+    ///
+    /// The keys file is as safe as the programmer's keys: the data key in it is sealed under them,
+    /// and a weak password can be guessed off the machine (the password is stretched, which only
+    /// slows that down).
+    pub fn field_encryption(mut self, config: crate::encrypted_store::EncryptionConfig) -> Self {
+        self.field_encryption = Some(Arc::new(config));
+        self
+    }
+
+    /// With [`DatabaseConfig::field_encryption`]: keep the sealed data key in this file **only**, and
+    /// none in the main file. The main file then cannot open the protected fields by itself, and a
+    /// copy of it taken alone is useless; the file must be kept somewhere else and backed up. If it
+    /// is missing, or does not belong to this database, the library refuses to start, before it
+    /// touches any file. **If this file is lost, the protected fields are lost for good.**
+    pub fn field_keys_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.field_keys_file = Some(path.into());
+        self
+    }
+
+    /// Speed settings of the encryption layer (call it after [`DatabaseConfig::encryption`]; without encryption it does nothing).
+    /// Parallel sealing of a commit is on by default; see [`crate::EncryptionTuning`]. A database written
+    /// with any setting opens with any other.
+    pub fn encryption_tuning(mut self, tuning: crate::encrypted_store::EncryptionTuning) -> Self {
+        if let Some(handle) = self.redb.encryption.take() {
+            self.redb.encryption = Some(handle.with_tuning(tuning));
+        }
+        self
+    }
+
+    /// With [`DatabaseConfig::encryption`]: read and check every block of each file at open, so
+    /// a block put back from an older copy of the file is found before any data is used. A full
+    /// read of each file at every open.
+    pub fn encryption_verify_on_open(mut self, enabled: bool) -> Self {
+        self.redb.verify_on_open = enabled;
+        self
+    }
+
     /// Make every commit save redb's allocator state, so reopening after a
     /// kill or crash is near-instant instead of a full repair.
     ///
@@ -439,6 +636,30 @@ impl DatabaseConfig {
     /// For the clean path, see [`Storage::close`], which needs no option.
     pub fn quick_repair(mut self, enabled: bool) -> Self {
         self.redb.quick_repair = enabled;
+        self
+    }
+
+    /// Read the `.cldb` once, front to back, before opening it, so that the first queries do not
+    /// pay for the file's pages one at a time.
+    ///
+    /// When the operating system has not got the file cached (the first start after a reboot, or
+    /// after other programs pushed it out), a scan reaches its pages in key order, which is not
+    /// their order in the file: a 349 MB catalog took 9.1 s to answer its first count that way
+    /// and 0.3 s once cached. One sequential read costs 0.18 s from cold and brings that to 0.5 s
+    /// in total. When the file is already cached the read is wasted time: 0.06 s for the same file.
+    /// The default is [`Prefetch::Auto`]: the read happens when the file is between
+    /// [`PREFETCH_AUTO_BYTES`] (64 MiB) and [`PREFETCH_AUTO_MAX_BYTES`] (1 GiB), both included.
+    /// The read happens at every open, so it has a price: from 64 MiB up, a cold start costs
+    /// seconds and the read of an already cached file costs tens of milliseconds; below that the
+    /// pages come one at a time in well under a second and the read is skipped. A file larger than
+    /// the memory the system can give the cache does not benefit from being read ahead, and its
+    /// read would take longer each time, so above 1 GiB it is skipped too.
+    /// `prefetch(false)` ([`Prefetch::Never`]) turns it off whatever the size, and `prefetch(true)`
+    /// ([`Prefetch::Always`]) turns it on whatever the size.
+    /// It only reads: nothing is written, a failure to read is ignored, and a database that another
+    /// program has open is still reported as [`ClError::DatabaseInUse`](crate::units::ClError::DatabaseInUse).
+    pub fn prefetch(mut self, mode: impl Into<Prefetch>) -> Self {
+        self.prefetch = mode.into();
         self
     }
 
@@ -529,19 +750,71 @@ impl DatabaseConfig {
         self.register_with_storage::<E>(table, TableStorageMode::BlobSidecar)
     }
 
+    /// Registers an entity that has protected fields (`Sealed`, `Hashed`, `SearchPrint`).
+    ///
+    /// The protected fields are fixed when the table is created: opening an existing table with a
+    /// different declaration is an error that writes nothing.
+    pub fn register_sealed<E>(self, table: &'static str) -> Self
+    where
+        E: Entity + serde::Serialize + Default + crate::field_crypto::SealedFields,
+    {
+        self.register_with_storage_and_sealed::<E>(
+            table,
+            TableStorageMode::InlineJson,
+            E::SEALED,
+            Some(crate::field_crypto::SealedKit::<E>::new()),
+        )
+    }
+
+    /// [`Self::register_sealed`] for a table that also keeps one attachment per row (it needs
+    /// `blob_enabled(true)`). The attachment of a row is sealed in chunks with the keys of the
+    /// protected fields, whatever the database itself is encrypted with, and is bound to the table,
+    /// to the place of the attachment and to the row; the names of its folder and file are
+    /// fingerprints that show neither the table nor the row.
+    pub fn register_sealed_blob<E>(self, table: &'static str) -> Self
+    where
+        E: Entity + serde::Serialize + Default + crate::field_crypto::SealedFields,
+    {
+        self.register_with_storage_and_sealed::<E>(
+            table,
+            TableStorageMode::BlobSidecar,
+            E::SEALED,
+            Some(crate::field_crypto::SealedKit::<E>::new()),
+        )
+    }
+
     fn register_with_storage<E: Entity + serde::Serialize + Default>(
-        mut self,
+        self,
         table: &'static str,
         storage: TableStorageMode,
     ) -> Self {
-        let layout =
+        self.register_with_storage_and_sealed::<E>(table, storage, &[], None)
+    }
+
+    fn register_with_storage_and_sealed<E: Entity + serde::Serialize + Default>(
+        mut self,
+        table: &'static str,
+        storage: TableStorageMode,
+        sealed: &'static [crate::field_crypto::SealedSpec],
+        kit: Option<crate::field_crypto::SealedKit<E>>,
+    ) -> Self {
+        // A default entity holds new protected values, which serialize only inside this step.
+        let scope = (!sealed.is_empty()).then(crate::field_crypto::SealScope::enter);
+        let mut layout =
             FieldLayout::capture_from_entity_json(&E::default()).unwrap_or_else(|_| {
                 FieldLayout::from_json_value(&serde_json::json!({}))
             });
+        drop(scope);
+        // A protected field is stored as text whatever it holds.
+        for spec in sealed {
+            layout.set_json_type(spec.key, "string");
+        }
         self.factories.push(Box::new(TypedFactory::<E> {
             table,
             layout,
             storage,
+            sealed,
+            kit,
             _marker: PhantomData,
         }));
         self
@@ -556,6 +829,8 @@ impl DatabaseConfig {
 pub struct StorageConfig {
 
     log_channel_capacity: usize,
+    event_sink:crate::events::EventSink,
+    slow_query_threshold:std::time::Duration,
 
     name: String,
 
@@ -584,6 +859,8 @@ impl StorageConfig {
         Self {
 
             log_channel_capacity: LOG_CHANNEL_CAPACITY,
+            event_sink:Default::default(),
+            slow_query_threshold:std::time::Duration::from_millis(50),
 
             name: "storage".to_string(),
 
@@ -597,6 +874,12 @@ impl StorageConfig {
 
 
 
+    pub fn event_sink(mut self,sink:impl Fn(&crate::LibraryEvent)+Send+Sync+'static)->Self {
+        self.event_sink=crate::events::EventSink(Some(Arc::new(sink)));self
+    }
+    pub fn slow_query_threshold(mut self,threshold:std::time::Duration)->Self {
+        self.slow_query_threshold=threshold;self
+    }
     pub fn change_log_channel_capacity(mut self, capacity: usize) -> Self {
 
         self.log_channel_capacity = capacity;
@@ -720,6 +1003,49 @@ impl StorageBuilder {
 
 
     pub fn build(self) -> Result<Storage> {
+        let events = self.storage_config.event_sink.clone();
+        let mut created = Vec::new();
+        match self.build_files(&mut created) {
+            Ok(storage) => Ok(storage),
+            Err(error) => {
+                // everything the failed build opened is closed by now (its handles were dropped)
+                for c in created {
+                    CreatedByThisCall::remove(c, &events);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn build_files(self, created: &mut Vec<CreatedByThisCall>) -> Result<Storage> {
+        // A change of a database's files that a crash cut short is settled before anything else is
+        // looked at: in the middle of it the main file may be missing (moved aside, its new version
+        // waiting), which would be taken for a new database; and the list of what this call makes
+        // must not include files that the settling puts in place. If any database is being changed
+        // right now (its marker is locked) the build fails before it touches any of them.
+        {
+            use crate::migration::encrypted::marker::{Migration, Places};
+            let places_of = |config: &DatabaseConfig| {
+                let dir = config.dir_path.join(&config.dir_name);
+                let backup = config.backup_dir_path.as_ref().map(|b| b.join(&config.dir_name)).unwrap_or_else(|| dir.clone());
+                (dir, backup)
+            };
+            for config in &self.database_configs {
+                let (dir, backup) = places_of(config);
+                Migration::check_free(Places { main: &dir, backup: &backup }, &config.db_name)?;
+            }
+            for config in &self.database_configs {
+                let (dir, backup) = places_of(config);
+                Migration::recover(Places { main: &dir, backup: &backup }, &config.db_name)?;
+            }
+        }
+        // The shape of the encryption settings is checked before any file or folder is touched.
+        for config in &self.database_configs {
+            if let Some(encryption) = &config.redb.encryption {
+                let is_new = main_file_is_new(&config.dir_path.join(&config.dir_name).join(format!("{}.cldb", config.db_name)));
+                encryption.check_settings(is_new).map_err(|why| ClError::Validation(why.into()))?;
+            }
+        }
 
         let mut domains: HashMap<TypeId, Box<dyn Any + Send + Sync>> = HashMap::new();
 
@@ -731,6 +1057,10 @@ impl StorageBuilder {
         }
 
         for config in self.database_configs {
+
+            let mut note = CreatedByThisCall::default();
+            note.note(&config);
+            created.push(note);
 
             if config.factories.is_empty() {
 
@@ -752,6 +1082,76 @@ impl StorageBuilder {
                 ));
             }
 
+            if config.redb.encryption.is_some() && config.field_encryption.is_some() {
+                return Err(ClError::Validation(
+                    "set either `DatabaseConfig::encryption` or `DatabaseConfig::field_encryption`, not both".into(),
+                ));
+            }
+            if config.redb.encryption.is_none()
+                && config.field_encryption.is_none()
+                && config.factories.iter().any(|f| !f.sealed().is_empty())
+            {
+                return Err(ClError::Validation(
+                    "a table with protected fields needs encryption keys: set `DatabaseConfig::encryption` or `DatabaseConfig::field_encryption`".into(),
+                ));
+            }
+            if let Some(keys) = &config.field_encryption
+                && !crate::encrypted_store::cipher_allowed(keys.suite.cipher)
+            {
+                return Err(ClError::Validation("this cipher is not allowed for protected fields".into()));
+            }
+            // A keys file kept apart from the main file: it must be there for a database that exists,
+            // and must not be there for one that does not. Decided before any file is touched.
+            if let Some(path) = &config.field_keys_file {
+                if config.redb.encryption.is_some() {
+                    return Err(ClError::Validation(
+                        "`DatabaseConfig::field_keys_file` is not available for a database encrypted as a whole: its lock stays in its file header (the keys file next to the database keeps a copy)".into(),
+                    ));
+                }
+                if config.field_encryption.is_none() {
+                    return Err(ClError::Validation(
+                        "`DatabaseConfig::field_keys_file` needs `DatabaseConfig::field_encryption`".into(),
+                    ));
+                }
+                if config.factories.iter().any(|f| !f.sealed().is_empty()) {
+                    let main = config.dir_path.join(&config.dir_name).join(format!("{}.cldb", config.db_name));
+                    let existing = !main_file_is_new(&main);
+                    if existing && !path.is_file() {
+                        return Err(ClError::Validation(format!(
+                            "the keys file {} is missing: the protected fields of this database cannot be opened without it; nothing was opened",
+                            path.display()
+                        )));
+                    }
+                    if !existing && path.exists() {
+                        return Err(ClError::Validation(format!(
+                            "the keys file {} exists but the database does not: it belongs to another database or to one that was lost; nothing was opened",
+                            path.display()
+                        )));
+                    }
+                }
+            }
+
+            // A unique constraint compares stored values; a protected field stores sealed text.
+            for (entity, definitions) in &config.unique {
+                let Some(factory) = config.factories.iter().find(|f| f.entity_type() == *entity) else {
+                    continue;
+                };
+                for definition in definitions {
+                    for path in &definition.paths {
+                        if let Some(crate::fields::Step::Key(first)) = path.steps.first()
+                            && factory.sealed().iter().any(|spec| {
+                                spec.key == first.as_str()
+                                    && crate::field_crypto::print_steps(spec).as_deref() != Some(path.steps.as_slice())
+                            })
+                        {
+                            return Err(ClError::Validation(format!(
+                                "`{first}` is a protected field: a unique constraint cannot use it"
+                            )));
+                        }
+                    }
+                }
+            }
+
             let table_regs: Vec<TableRegistration> = config
 
                 .factories
@@ -766,12 +1166,21 @@ impl StorageBuilder {
 
                     storage: f.storage(),
 
+                    sealed: f.sealed(),
+
                 })
 
                 .collect();
 
 
 
+            {
+                let file = config.dir_path.join(&config.dir_name).join(format!("{}.cldb", config.db_name));
+                let bytes = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
+                if config.prefetch.reads(bytes) {
+                    crate::handle::prefetch_file(&file);
+                }
+            }
             let upgrade = OpenUpgradePipeline::run(&UpgradeInput {
 
                 dir_path: &config.dir_path,
@@ -798,7 +1207,13 @@ impl StorageBuilder {
 
                 durability: config.durability.unwrap_or(DurabilityMode::Strict),
 
-                redb: config.redb,
+                redb: config.redb.clone(),
+
+                event_sink: self.storage_config.event_sink.clone(),
+
+                field_encryption: config.field_encryption.clone(),
+
+                field_keys_file: config.field_keys_file.clone(),
 
             })?;
 
@@ -822,7 +1237,49 @@ impl StorageBuilder {
 
             let durability = config.durability.unwrap_or(DurabilityMode::Strict);
 
-            let mut db_manager = DatabaseManager::open(
+            // Tables with protected fields: their identities (recorded in the description) and the
+            // keys of the database. Without keys such a table cannot be built.
+            let table_ids: HashMap<String, String> = upgrade
+                .meta
+                .tables
+                .iter()
+                .filter_map(|t| t.table_id.clone().map(|id| (t.name.clone(), id)))
+                .collect();
+            let sealed_tables: std::collections::HashSet<String> = config
+                .factories
+                .iter()
+                .filter(|f| !f.sealed().is_empty())
+                .map(|f| f.table_name().to_string())
+                .collect();
+            let field_keys: Option<Arc<crate::field_crypto::FieldKeys>> = if sealed_tables.is_empty() {
+                None
+            } else if let Some(keys) = upgrade.field_keys.clone() {
+                Some(keys)
+            } else {
+                config
+                    .redb
+                    .encryption
+                    .as_ref()
+                    .and_then(|e| e.context().cloned())
+                    .map(crate::field_crypto::FieldKeys::with_context)
+                    .transpose()?
+                    .map(Arc::new)
+            };
+
+            // Attachments of tables that have protected fields are sealed with those fields' keys.
+            let protected_attachments = field_keys.as_ref().and_then(|keys| {
+                let ids: HashMap<String, String> = config
+                    .factories
+                    .iter()
+                    .filter(|f| !f.sealed().is_empty() && f.storage() == TableStorageMode::BlobSidecar)
+                    .filter_map(|f| table_ids.get(f.table_name()).map(|id| (f.table_name().to_string(), id.clone())))
+                    .collect();
+                (!ids.is_empty()).then(|| (keys.clone(), Arc::new(ids)))
+            });
+
+            #[cfg(test)]
+            let encrypted_here = config.redb.encryption.is_some() && config.db_name == "hooked";
+            let mut db_manager = DatabaseManager::open_with_attachments(
                 upgrade.db,
 
                 &config.dir_path,
@@ -857,12 +1314,29 @@ impl StorageBuilder {
 
                 config.redb,
 
+                protected_attachments,
+
             )?;
 
+            #[cfg(test)]
+            if encrypted_here && FAIL_AFTER_OPEN.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(ClError::Validation("injected failure after the database opened".into()));
+            }
+            db_manager.event_sink=self.storage_config.event_sink.clone();
+            db_manager.slow_query_threshold=self.storage_config.slow_query_threshold;
+            let constraints=config.unique.iter().map(|(id,defs)| {
+                let table=config.factories.iter().find(|f|f.entity_type()==*id).ok_or_else(||ClError::Validation("unique entity not registered".into()))?.table_name().to_owned();
+                Ok((table,defs.clone()))
+            }).collect::<Result<Vec<_>>>()?;
+            let ids=config.factories.iter().filter_map(|f|f.id_path().map(|p|(f.table_name().to_owned(),p))).collect::<Vec<_>>();
+            db_manager.journal_write(|tx,_| {crate::id_contract::configure(tx,&ids)?;crate::unique::configure(tx,&constraints)})?;
+            db_manager.set_journal_retention(config.journal_retention)?;
             db_manager.format_opens = upgrade.format_opens;
-
+            db_manager.sealed_tables = Arc::new(sealed_tables);
+            db_manager.field_keys = field_keys.clone();
+            let seal_env = SealEnv { keys: field_keys, table_ids: &table_ids };
             for factory in &config.factories {
-                let (type_id, domain) = factory.build(&db_manager);
+                let (type_id, domain) = factory.build(&db_manager, &seal_env)?;
 
                 domains.insert(type_id, domain);
 
@@ -876,7 +1350,9 @@ impl StorageBuilder {
 
 
 
+        let index_worker=crate::indexes::boot(&mut database_managers)?;
         Ok(Storage(Arc::new(StorageInner {
+            index_worker,
 
             domains,
 
@@ -890,4 +1366,74 @@ impl StorageBuilder {
 
 }
 
+/// What one `build` call created for a new encrypted database. If the build then fails, all of it
+/// is removed again, so a failed first try never leaves files behind that refuse the next try
+/// (an empty encrypted file made with a mistyped password, for example). Only paths that did not
+/// exist when the call started are listed; nothing that was there before is ever touched.
+/// Same rule as `EncryptionHandle::open_file`: a main file of zero length is a database that does not exist yet.
+fn main_file_is_new(path: &std::path::Path) -> bool {
+    !path.exists() || (path.is_file() && std::fs::metadata(path).map(|m| m.len() == 0).unwrap_or(false))
+}
 
+#[derive(Default)]
+struct CreatedByThisCall {
+    /// (path, is a folder, which kind of file for the event)
+    items: Vec<(PathBuf, bool, &'static str)>,
+    /// The database folder, when this call made it: removed last, and only if it is empty.
+    folder: Option<PathBuf>,
+}
+
+impl CreatedByThisCall {
+    fn note(&mut self, config: &DatabaseConfig) {
+        let dir = config.dir_path.join(&config.dir_name);
+        // Only a database that this call makes is removed again when the build fails: one that was
+        // there before is never touched.
+        if dir.join(format!("{}.cldb", config.db_name)).exists() {
+            return;
+        }
+        if !dir.exists() {
+            self.folder = Some(dir.clone());
+        }
+        let backup_dir = match &config.backup_dir_path {
+            Some(b) => b.join(&config.dir_name),
+            None => dir.clone(),
+        };
+        let mut candidates = vec![
+            (dir.join(format!("{}.cldb", config.db_name)), false, "main"),
+            (backup_dir.join(format!("{}.cldb.bak", config.db_name)), false, "bak"),
+            (dir.join(format!("{}.inx", config.db_name)), false, "index"),
+            (dir.join(format!("{}.keys", config.db_name)), false, "sidecar"),
+            (crate::migration::chain::DbMigrationIndex::migration_path(&dir, &config.db_name), true, "sidecar"),
+            (crate::blob::blob_root(&dir, &config.db_name), true, "sidecar"),
+            (crate::blob::protected_blob_root(&dir, &config.db_name), true, "sidecar"),
+        ];
+        // the keys file kept apart from the database, when this call makes it
+        if let Some(path) = &config.field_keys_file {
+            candidates.push((path.clone(), false, "sidecar"));
+        }
+        for (path, is_dir, kind) in candidates {
+            if !path.exists() {
+                self.items.push((path, is_dir, kind));
+            }
+        }
+    }
+
+    fn remove(self, events: &crate::events::EventSink) {
+        for (path, is_dir, kind) in self.items {
+            let result = if is_dir { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) };
+            if let Err(e) = result {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    events.emit(&crate::LibraryEvent::Encryption { event: "encryption/cleanup_failed", file: kind });
+                }
+            }
+        }
+        if let Some(folder) = self.folder {
+            let _ = std::fs::remove_dir(&folder); // only when empty
+        }
+    }
+}
+
+/// Test hook: make the build fail after the database manager opened (files for the backup, the
+/// migration folder and the attachment folder exist by then).
+#[cfg(test)]
+pub(crate) static FAIL_AFTER_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

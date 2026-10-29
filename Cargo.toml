@@ -1,7 +1,8 @@
 [package]
 name = "clove1db"
-version = "0.0.126"
+version = "0.1.0"
 edition = "2024"
+rust-version.workspace = true
 license = "MIT"
 authors = ["clove7"]
 description = "Embedded database framework for Rust, built on redb: domain-driven CRUD over typed entities, a byte-budgeted cache, per-entity versioned backup and restore, per-table migrations, and strict durability. Work in progress — feedback welcome."
@@ -13,20 +14,58 @@ exclude = ["examples/**"]
 
 [features]
 default = []
-# Process-exit crash points for durability examples/tests (CLOVE_CRASH_POINT=...).
+# Process-exit crash points for durability tests (CLOVE_CRASH_POINT=...).
 crash-inject = []
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(clove_test_encrypt_all)',
+] }
+
 [dependencies]
+fst = { version = "0.4.7", features = ["levenshtein"] }
+strsim = "0.11.1"
+clove1db-derive = { path = "derive", version = "0.1.0" }
 chrono = "0.4.45"
 itertools = "0.15.0"
 moka = { version = "0.12.16", features = ["sync"] }
-redb = "4.3.0"
+redb = "4.4.0"
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = { version = "1.0.151", features = ["raw_value"] }
+serde_json = { version = "1.0.154", features = ["raw_value"] }
 thiserror = "2.0.21"
-uuid = { version = "1.27.0", features = ["v4"] }
+uuid = { version = "1.29.0", features = ["v4"] }
+aes-gcm = { version = "0.11.1", features = ["zeroize"] }
+aes-gcm-siv = { version = "0.12.1", features = ["zeroize"] }
+chacha20poly1305 = { version = "0.11.0", features = ["zeroize"] }
+argon2 = { version = "0.6.0", features = ["zeroize"] }
+scrypt = "0.12.0"
+hkdf = "0.13.0"
+hmac = { version = "0.13.0", features = ["zeroize"] }
+sha2 = { version = "0.11.1", features = ["zeroize"] }
+sha3 = { version = "0.12.0", features = ["zeroize"] }
+blake3 = { version = "1.8.7", features = ["zeroize"] }
+zeroize = "1.9.1"
+subtle = "2.6.1"
+getrandom = "0.4.3"
 
 [dev-dependencies]
 # Tests only: without `cache_metrics`, redb reports its cache as empty, and the
 # redb cache cap could not be checked against what redb actually holds.
 redb = { version = "4.3.0", features = ["cache_metrics"] }
+
+[workspace]
+members = [".", "derive"]
+exclude = [
+    "examples/01_getting_started",
+    "examples/02_queries_and_indexes",
+    "examples/03_backup_and_batches",
+    "examples/04_change_log",
+    "examples/05_files_and_memory",
+    "examples/06_encryption",
+    "examples/07_migration_and_recovery",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+rust-version = "1.89"

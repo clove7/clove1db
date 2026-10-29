@@ -1,12 +1,12 @@
 use std::path::Path;
 
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, TableHandle};
+use redb::{ReadableDatabase, ReadableTable, TableDefinition, TableHandle};
 
 use crate::migration::types::{KeyDecoder, RedbTableSpec, ValueDecoder};
 use crate::units::{ClError, Result};
 
 pub fn read_external_table(path: &Path, spec: &RedbTableSpec) -> Result<Vec<(String, Vec<u8>)>> {
-    let db = Database::open(path).map_err(|e| ClError::Database(redb::Error::from(e)))?;
+    let db = super::clove::open_source_read_only(path)?;
     let read_txn = db.begin_read()?;
 
     match spec.key_decoder {
@@ -106,7 +106,7 @@ pub fn scan_external_table(path: &Path, spec: &RedbTableSpec) -> Result<crate::m
 }
 
 pub fn list_external_tables(path: &Path) -> Result<Vec<String>> {
-    let db = Database::open(path).map_err(|e| ClError::Database(redb::Error::from(e)))?;
+    let db = super::clove::open_source_read_only(path)?;
     let read_txn = db.begin_read()?;
     Ok(read_txn
         .list_tables()?

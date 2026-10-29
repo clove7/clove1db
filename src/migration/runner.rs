@@ -16,7 +16,7 @@ use crate::migration::report::{ConflictEntry, MigrationReport, MigrationResult, 
 use crate::migration::scan::{scan_record, MigrationScanReport};
 use crate::migration::step_registry::MigrationStepRegistry;
 use crate::migration::types::{
-    BlobMigrationPolicy, ExternalFrom, MigrationFrom, MigrationKind, MigrationManifest,
+    ExternalFrom, MigrationFrom, MigrationKind, MigrationManifest,
     MigrationTo, RedbTableSpec, SchemaRef, TableRenameInfo, TableStorageMode,
     TargetConflictPolicy, VersionScope,
 };
@@ -62,7 +62,6 @@ pub struct MigrationRun<'a, F, T> {
     source: Option<MigrationSource>,
     target: Option<MigrationTo>,
     conflict_policy: TargetConflictPolicy,
-    blob_policy: BlobMigrationPolicy,
     prepared: Option<PreparedMigration>,
     _from: PhantomData<F>,
     _to: PhantomData<T>,
@@ -83,7 +82,6 @@ where
             source: None,
             target: None,
             conflict_policy: TargetConflictPolicy::Fail,
-            blob_policy: BlobMigrationPolicy::default(),
             prepared: None,
             _from: PhantomData,
             _to: PhantomData,
@@ -125,14 +123,6 @@ where
     pub fn on_target_conflict(self, policy: TargetConflictPolicy) -> Self {
         Self {
             conflict_policy: policy,
-            prepared: None,
-            ..self
-        }
-    }
-
-    pub fn blob_policy(self, policy: BlobMigrationPolicy) -> Self {
-        Self {
-            blob_policy: policy,
             prepared: None,
             ..self
         }
@@ -408,6 +398,7 @@ where
         let mut pending_copies: Vec<(String, String)> = Vec::new();
 
         for record in &prepared.staged {
+            if plan.kind == MigrationKind::InPlaceEvolve {batch.stage_delete(&plan.to.table,&record.source_key);}
             batch.stage_write(
                 &plan.to.table,
                 &record.storage_key,
@@ -419,16 +410,7 @@ where
                 pending_blobs.push((record.storage_key.clone(), blob.clone()));
             }
 
-            if batch.write_count() >= self.blob_policy.batch_size {
-                Self::flush_batch(
-                    &mut batch,
-                    &target_db,
-                    source_db.as_ref(),
-                    plan,
-                    &mut pending_blobs,
-                    &mut pending_copies,
-                )?;
-            }
+
         }
 
         if batch.write_count() > 0 {
@@ -509,11 +491,6 @@ where
         if plan.effective_delete_source {
             if let Some(source_db) = source_db {
                 for (key, _) in &prepared.source_entries {
-                    if self.blob_policy.delete_source_blobs
-                        && plan.from.storage == TableStorageMode::BlobSidecar
-                    {
-                        let _ = source_db.delete_blob(&plan.from.table, key);
-                    }
                     source_db.delete_raw(&plan.from.table, key)?;
                 }
                 if plan.from.table != plan.to.table && plan.from.db == plan.to.db {
@@ -593,22 +570,11 @@ where
         if batch.write_count() == 0 {
             return Ok(());
         }
-        batch.commit(target_db)?;
-        batch.clear();
-        for (key, blob) in pending_blobs.drain(..) {
-            target_db.write_blob(&plan.to.table, &key, &blob)?;
+        for (key,blob) in pending_blobs.drain(..) {batch.stage_blob(&plan.to.table,key,blob);}
+        if let Some(src_db)=source_db {
+            for (source,key) in pending_copies.drain(..) {batch.stage_blob_copy(&plan.to.table,key,src_db.clone(),&plan.from.table,source);}
         }
-        if let Some(src_db) = source_db {
-            for (src_key, dest_key) in pending_copies.drain(..) {
-                src_db.copy_blob(
-                    &plan.from.table,
-                    &src_key,
-                    target_db,
-                    &plan.to.table,
-                    &dest_key,
-                )?;
-            }
-        }
+        batch.commit(target_db)?;batch.clear();
         Ok(())
     }
 }

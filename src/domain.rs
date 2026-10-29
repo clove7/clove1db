@@ -14,6 +14,9 @@ pub struct Domain<E: Entity> {
 }
 
 impl<E: Entity> Domain<E> {
+    pub fn query(&self) -> crate::query::Query<E> {
+        crate::query::Query::new(self.repository.database_manager.clone(),self.repository.table.into()).with_sealed(self.repository.sealed.clone())
+    }
     pub fn new(repository: Repository<E>) -> Self {
         Self {
             repository,
@@ -103,7 +106,7 @@ impl<E: Entity> Domain<E> {
         self.repository.set_with_blob(id, meta, blob)
     }
 
-    pub fn open_blob(&self, id: &str) -> Result<std::fs::File> {
+    pub fn open_blob(&self, id: &str) -> Result<crate::blob::BlobReader> {
         self.repository.open_blob(id)
     }
 
@@ -179,7 +182,8 @@ impl<E: Entity> Domain<E> {
         for r in records {
             if r.restorable {
                 if let Some(json) = r.data.as_json() {
-                    let entity: E = serde_json::from_value(json.clone())?;
+                    let mut entity: E = serde_json::from_value(json.clone())?;
+                    self.repository.bind_entity(id, &mut entity);
                     out.push(O::from_entity(entity));
                 }
             }
@@ -189,6 +193,28 @@ impl<E: Entity> Domain<E> {
 
     pub fn current_version(&self, id: &str) -> Result<u64> {
         self.repository.current_version(id)
+    }
+
+    /// A permission to open protected values of this entity's database, for the request in hand.
+    /// See [`DatabaseManager::read_grant`](crate::repository::DatabaseManager::read_grant).
+    pub fn read_grant(&self) -> Result<crate::field_crypto::ReadGrant> {
+        self.repository.database_manager.read_grant()
+    }
+
+    /// A permission to search the fingerprinted fields of this entity, for the request in hand. It
+    /// needs the search key, not the read key. See [`PrintHandle`](crate::field_crypto::PrintHandle).
+    pub fn search_grant(&self) -> Result<crate::field_crypto::SearchGrant<E>> {
+        match &self.repository.sealed {
+            Some(hooks) => hooks.search_grant(self.repository.database_manager.event_sink.clone()),
+            None => Err(crate::units::ClError::Validation(
+                "this entity has no protected fields".into(),
+            )),
+        }
+    }
+
+    /// A checker of secrets against the verification hashes of this entity's database.
+    pub fn verifier(&self) -> Result<crate::field_crypto::Verifier> {
+        self.repository.database_manager.verifier()
     }
 
     pub fn repo(&self) -> &Repository<E> {

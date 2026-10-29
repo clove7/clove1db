@@ -12,7 +12,7 @@ use crate::units::ClError;
 use crate::units::Result;
 use chrono::Local;
 use crate::handle::{DbHandle, DbRef, FileOpen, RedbOptions};
-use redb::{ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{ ReadableTable, TableDefinition};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -74,11 +74,11 @@ impl BackupManager {
         path: &PathBuf,
         has_cache: bool,
         durability: DurabilityMode,
-        redb: RedbOptions,
+        redb: &RedbOptions,
     ) -> Result<Self> {
         // Last version in any table — we will search later when using
         // The tables are created in DatabaseManager::new() ✅
-        let db = Arc::new(DbHandle::create(path, durability, redb)?);
+        let db = Arc::new(DbHandle::create(path, durability, redb.clone(), "bak")?);
         Ok(Self { db, has_cache })
     }
 

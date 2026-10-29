@@ -1,0 +1,11 @@
+[package]
+name = "example_06_encryption"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+clove1db = { path = "../.." }
+serde = { version = "1.0.229", features = ["derive"] }
+
+[workspace]

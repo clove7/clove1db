@@ -3,7 +3,7 @@ use redb::{Database, ReadableDatabase, TableDefinition, TableHandle, WriteTransa
 use crate::metadata::types::{CloveMeta, FRAMEWORK_ID, META_KEY, META_TABLE};
 use crate::units::{ClError, Result};
 
-pub fn read_meta(db: &Database) -> Result<Option<CloveMeta>> {
+pub fn read_meta<D: ReadableDatabase>(db: &D) -> Result<Option<CloveMeta>> {
     let read_txn = db.begin_read()?;
     let names: Vec<String> = read_txn
         .list_tables()?

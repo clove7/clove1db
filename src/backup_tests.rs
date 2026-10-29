@@ -10,7 +10,7 @@ fn manager(tag: &str) -> BackupManager {
         &dir.join("notes.bak"),
         true,
         DurabilityMode::Strict,
-        RedbOptions::default(),
+        &RedbOptions::default(),
     )
     .unwrap();
     m.init_table("notes").unwrap();
@@ -153,6 +153,20 @@ impl Entity for Note {
         &self.id
     }
 }
+/// Under `--cfg clove_test_encrypt_all` every database starts encrypted; a test that needs a plain file says so
+/// (each use is listed in 7-5-plain-only.md).
+#[allow(dead_code)]
+fn plain(db: DatabaseConfig) -> DatabaseConfig {
+    #[cfg(clove_test_encrypt_all)]
+    {
+        db.plain()
+    }
+    #[cfg(not(clove_test_encrypt_all))]
+    {
+        db
+    }
+}
+
 fn build(dir: &std::path::Path) -> Storage {
     Storage::builder(StorageConfig::default().change_dir_path(dir.to_path_buf()))
         .add_database(
@@ -163,10 +177,21 @@ fn build(dir: &std::path::Path) -> Storage {
         .build()
         .unwrap()
 }
+/// A plain database, for tests whose subject is a legacy plain backup file (7-5-plain-only.md).
+fn build_plain(dir: &std::path::Path) -> Storage {
+    Storage::builder(StorageConfig::default().change_dir_path(dir.to_path_buf()))
+        .add_database(
+            plain(DatabaseConfig::new("notes", "notes"))
+                .backup_enabled(true)
+                .register::<Note>("notes"),
+        )
+        .build()
+        .unwrap()
+}
 fn mixed_fixture(tag: &str) -> (PathBuf, Vec<(String, Vec<u8>)>) {
     let dir = PathBuf::from("target/test_backup").join(tag);
     let _ = std::fs::remove_dir_all(&dir);
-    let storage = build(&dir);
+    let storage = build_plain(&dir);
     let mut meta = storage.db_manager("notes").read_meta().unwrap().unwrap();
     meta.backup_format = "json_wrapped_v1".into();
     storage.db_manager("notes").write_meta(&meta).unwrap();
@@ -197,7 +222,7 @@ fn mixed_fixture(tag: &str) -> (PathBuf, Vec<(String, Vec<u8>)>) {
 #[test]
 fn conversion_preserves_every_record_and_marks_raw_dates_once() {
     let (dir, records) = mixed_fixture("mixed_conversion");
-    let storage = build(&dir);
+    let storage = build_plain(&dir);
     assert_eq!(
         storage
             .db_manager("notes")
@@ -238,7 +263,7 @@ fn conversion_preserves_every_record_and_marks_raw_dates_once() {
     storage.close();
     drop(storage);
     assert!(!dir.join("notes/notes.cldb.bak.upgrading").exists());
-    let storage = build(&dir);
+    let storage = build_plain(&dir);
     assert!(storage.open_report().iter().all(|r| !r.format_check));
     assert_eq!(
         storage
@@ -260,7 +285,7 @@ fn conversion_verification_failure_keeps_original_bytes_and_retries() {
     let path = dir.join("notes/notes.cldb.bak");
     let bulk_id = {
         let manager =
-            BackupManager::new(&path, true, DurabilityMode::Strict, RedbOptions::default())
+            BackupManager::new(&path, true, DurabilityMode::Strict, &RedbOptions::default())
                 .unwrap();
         manager
             .write_bulk("notes", vec![("a".into(), 2), ("b".into(), 1)])
@@ -314,7 +339,7 @@ fn conversion_verification_failure_keeps_original_bytes_and_retries() {
         &["notes".into()],
         true,
         DurabilityMode::Strict,
-        RedbOptions::default(),
+        &RedbOptions::default(),
     )
     .unwrap();
     assert!(rejected
@@ -331,7 +356,7 @@ fn conversion_verification_failure_keeps_original_bytes_and_retries() {
 
     // Reject the build-time attempt too: reads must work before the next retry.
     crate::upgrade::backup_normalize::fault::corrupt_next();
-    let storage = build(&dir);
+    let storage = build_plain(&dir);
     let manager = storage.db_manager("notes");
     let meta = manager.read_meta().unwrap().unwrap();
     assert_ne!(meta.backup_format, "json_wrapped_v2");
@@ -371,7 +396,7 @@ fn conversion_verification_failure_keeps_original_bytes_and_retries() {
     assert_eq!(contents(&path), original_contents);
     assert!(!dir.join("notes/notes.cldb.bak.upgrading").exists());
 
-    let storage = build(&dir);
+    let storage = build_plain(&dir);
     assert_eq!(
         storage
             .db_manager("notes")
@@ -406,7 +431,7 @@ fn interrupted_child() {
             &dir.join("notes/notes.cldb.bak"),
             true,
             DurabilityMode::Strict,
-            RedbOptions::default(),
+            &RedbOptions::default(),
         )
         .unwrap();
         let record = crate::backup::BackupRecord {
@@ -439,7 +464,7 @@ fn interrupted_child() {
         std::process::exit(99);
     }
     if action == "convert" {
-        let _storage = build(&dir);
+        let _storage = build_plain(&dir);
         return;
     }
     let storage = build(&dir);
@@ -530,7 +555,7 @@ fn interrupted_conversion_retries_before_replace_and_only_marks_after_replace() 
             );
             assert!(dir.join("notes/notes.cldb.bak.upgrading").exists());
         }
-        let storage = build(&dir);
+        let storage = build_plain(&dir);
         let meta = storage.db_manager("notes").read_meta().unwrap().unwrap();
         assert_eq!(meta.backup_format, "json_wrapped_v2");
         let log = meta
@@ -576,7 +601,7 @@ fn rejected_converter_itself_leaves_every_original_byte_unchanged() {
         &["notes".into()],
         true,
         DurabilityMode::Strict,
-        RedbOptions::default(),
+        &RedbOptions::default(),
     )
     .unwrap();
     assert!(
@@ -855,7 +880,7 @@ fn a_registered_history_table_with_auxiliary_suffix_is_still_converted() {
     let make = || {
         Storage::builder(StorageConfig::default().change_dir_path(dir.clone()))
             .add_database(
-                DatabaseConfig::new("notes", "notes")
+                plain(DatabaseConfig::new("notes", "notes"))
                     .backup_enabled(true)
                     .register::<Note>("notes_bulk"),
             )
@@ -926,7 +951,7 @@ fn a_registered_history_table_with_auxiliary_suffix_is_still_converted() {
 fn an_unclean_legacy_backup_is_repaired_only_on_the_copy_and_converted() {
     let (dir, _) = mixed_fixture("unclean_conversion");
     interrupt(&dir, "dirty-legacy", "unused");
-    let storage = build(&dir);
+    let storage = build_plain(&dir);
     let meta = storage.db_manager("notes").read_meta().unwrap().unwrap();
     assert_eq!(
         meta.backup_format, "json_wrapped_v2",
@@ -959,7 +984,7 @@ fn rejecting_an_unclean_backup_conversion_keeps_the_original_bytes() {
         &["notes".into()],
         true,
         DurabilityMode::Strict,
-        RedbOptions::default(),
+        &RedbOptions::default(),
     )
     .unwrap();
     assert!(
@@ -1020,7 +1045,7 @@ fn rejected_conversion_remains_readable_and_retries_on_the_next_build() {
         .map(|(key, bytes)| crate::backup::codec::decode_record("notes", key, bytes).unwrap())
         .collect();
     crate::upgrade::backup_normalize::fault::corrupt_next();
-    let storage = build(&dir);
+    let storage = build_plain(&dir);
     let m = storage.db_manager("notes");
     let meta = m.read_meta().unwrap().unwrap();
     assert_eq!(meta.backup_format, "json_wrapped_v1");
@@ -1048,7 +1073,7 @@ fn rejected_conversion_remains_readable_and_retries_on_the_next_build() {
     storage.close();
     drop(storage);
     assert!(!dir.join("notes/notes.cldb.bak.upgrading").exists());
-    let storage = build(&dir);
+    let storage = build_plain(&dir);
     let m = storage.db_manager("notes");
     let meta = m.read_meta().unwrap().unwrap();
     assert_eq!(meta.backup_format, "json_wrapped_v2");

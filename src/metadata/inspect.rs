@@ -6,6 +6,8 @@ use crate::backup::BackupRecord;
 use crate::metadata::store::read_meta;
 use crate::metadata::types::{BACKUP_PRE_UPGRADE_SUFFIX, FRAMEWORK_ID, FileEra, META_TABLE};
 use crate::migration::types::migration_dir_name;
+use crate::encrypted_store::{EncryptionHandle, OpenOptionsExt, StoreError};
+use crate::handle::DbOrRo;
 use crate::units::{ClError, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,7 +51,42 @@ pub struct InspectReport {
     pub table_storage: Vec<(String, crate::metadata::types::TableStorageMode)>,
 }
 
+/// Open a file of the database to look at it, as a plain database or through the encryption. **Read only**: nothing is written to the file, not even the
+/// recovery mark redb leaves on a writable open. A file that needs repair is not repaired here: it is an error that says to open the database normally first.
+fn open_for_inspection(path: &Path, encryption: Option<&EncryptionHandle>) -> Result<DbOrRo> {
+    crate::handle::guard_open(path, false)?;
+    let needs_repair = || {
+        ClError::Validation(format!(
+            "{}: the file needs repair, and inspecting never changes it; open the database normally first",
+            path.display()
+        ))
+    };
+    match encryption {
+        Some(enc) => enc
+            .open_file(path, "main", false, &OpenOptionsExt { read_only: true, ..OpenOptionsExt::default() }, &mut |_| {})
+            .map(|db| DbOrRo::Enc(db.into_database()))
+            .map_err(|e| match e {
+                StoreError::InUse => ClError::DatabaseInUse { path: path.display().to_string() },
+                StoreError::NeedsRepair => needs_repair(),
+                e => ClError::from(e),
+            }),
+        None => Database::builder()
+            .open_read_only(path)
+            .map(DbOrRo::Plain)
+            .map_err(|e| match e {
+                redb::DatabaseError::RepairAborted => needs_repair(),
+                e => crate::handle::open_error(e, path),
+            }),
+    }
+}
+
 pub fn inspect_cldb(primary_path: &Path) -> Result<InspectReport> {
+    inspect_cldb_with(primary_path, None)
+}
+
+/// [`inspect_cldb`] for a database that may be encrypted: pass the same encryption the database
+/// was built with. A file that does not open with it is [`ClError::EncryptedOpenFailed`].
+pub fn inspect_cldb_with(primary_path: &Path, encryption: Option<&EncryptionHandle>) -> Result<InspectReport> {
     let parent = primary_path
         .parent()
         .map(|p| p.to_path_buf())
@@ -69,12 +106,11 @@ pub fn inspect_cldb(primary_path: &Path) -> Result<InspectReport> {
     };
 
     let migration_dir = parent.join(migration_dir_name(&db_name));
-    let inspection = inspect_database(primary_path, backup_path.as_deref(), &migration_dir)?;
+    let inspection = inspect_database_with(primary_path, backup_path.as_deref(), &migration_dir, encryption)?;
 
     let (framework_version, table_schemas, blob_enabled, table_storage) =
         if inspection.kind == FileKind::Authenticated {
-        let db =
-            Database::open(primary_path).map_err(|e| ClError::Database(redb::Error::from(e)))?;
+        let db = open_for_inspection(primary_path, encryption)?;
         if let Some(meta) = read_meta(&db)? {
             let schemas = meta
                 .tables
@@ -122,6 +158,16 @@ pub fn inspect_database(
     backup_path: Option<&Path>,
     migration_dir: &Path,
 ) -> Result<DatabaseInspection> {
+    inspect_database_with(primary_path, backup_path, migration_dir, None)
+}
+
+/// [`inspect_database`] for a database that may be encrypted.
+pub fn inspect_database_with(
+    primary_path: &Path,
+    backup_path: Option<&Path>,
+    migration_dir: &Path,
+    encryption: Option<&EncryptionHandle>,
+) -> Result<DatabaseInspection> {
     let primary_exists = primary_path.exists();
     let backup_exists = backup_path.map(|p| p.exists()).unwrap_or(false);
     let migration_exists = migration_dir.join("index.json").exists();
@@ -156,7 +202,7 @@ pub fn inspect_database(
         });
     }
 
-    let db = Database::open(primary_path).map_err(|e| ClError::Database(redb::Error::from(e)))?;
+    let db = open_for_inspection(primary_path, encryption)?;
     inspect_open(&db, primary_path, backup_path, migration_dir)
 }
 
@@ -167,8 +213,8 @@ pub fn inspect_database(
 /// once per step cost three to four opens, and an open is not free: it may
 /// repair the file, and in a debug build redb walks every page of it on each
 /// one.
-pub(crate) fn inspect_open(
-    db: &Database,
+pub(crate) fn inspect_open<D: ReadableDatabase>(
+    db: &D,
     primary_path: &Path,
     backup_path: Option<&Path>,
     migration_dir: &Path,
@@ -216,14 +262,14 @@ fn list_user_tables(read_txn: &redb::ReadTransaction) -> Result<Vec<String>> {
     Ok(read_txn
         .list_tables()?
         .map(|h| h.name().to_string())
-        .filter(|n| n != META_TABLE && !n.ends_with("_version") && !n.ends_with("_bulk"))
+        .filter(|n| n != META_TABLE && !n.starts_with("__") && !n.ends_with("_version") && !n.ends_with("_bulk"))
         .collect())
 }
 
 fn primary_has_clove_entity_json(read_txn: &redb::ReadTransaction) -> Result<bool> {
     for name in read_txn.list_tables()? {
         let n = name.name();
-        if n == META_TABLE || n.ends_with("_version") || n.ends_with("_bulk") {
+        if n == META_TABLE || n.starts_with("__") || n.ends_with("_version") || n.ends_with("_bulk") {
             continue;
         }
         let table: TableDefinition<&str, &[u8]> = TableDefinition::new(n);

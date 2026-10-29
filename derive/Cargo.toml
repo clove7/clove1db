@@ -1,0 +1,11 @@
+[package]
+name = "clove1db-derive"
+version.workspace = true
+edition = "2024"
+license = "MIT"
+[lib]
+proc-macro = true
+[dependencies]
+syn = "2.0.119"
+quote = "1.0.47"
+proc-macro2 = "1.0.107"

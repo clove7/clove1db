@@ -15,7 +15,6 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use redb::ReadableDatabase;
 use serde::{Deserialize, Serialize};
 
 use crate::entity::Entity;
@@ -49,6 +48,20 @@ fn fresh_dir(tag: &str) -> PathBuf {
 }
 
 /// One database, `rows`, with backup on — so both files are exercised.
+/// Under `--cfg clove_test_encrypt_all` every database starts encrypted; a test that needs a plain file says so
+/// (each use is listed in 7-5-plain-only.md).
+#[allow(dead_code)]
+fn plain(db: DatabaseConfig) -> DatabaseConfig {
+    #[cfg(clove_test_encrypt_all)]
+    {
+        db.plain()
+    }
+    #[cfg(not(clove_test_encrypt_all))]
+    {
+        db
+    }
+}
+
 fn build(dir: &Path, options: impl FnOnce(DatabaseConfig) -> DatabaseConfig) -> Storage {
     Storage::builder(StorageConfig::default().change_dir_path(dir.to_path_buf()))
         .add_database(
@@ -90,7 +103,7 @@ fn is_closed<T: std::fmt::Debug>(result: crate::units::Result<T>) -> bool {
 #[test]
 fn close_releases_both_files_clean_while_storage_is_alive() {
     let dir = fresh_dir("close");
-    let storage = build(&dir, |c| c);
+    let storage = build(&dir, |c| plain(c));
     let repo = storage.domain::<Row>().repo();
     repo.set("a", &row("a", 16)).unwrap();
     repo.get("a").unwrap(); // now cached
@@ -116,7 +129,7 @@ fn close_releases_both_files_clean_while_storage_is_alive() {
 
     // And the data is there for the next build.
     drop(storage);
-    let reopened = build(&dir, |c| c);
+    let reopened = build(&dir, |c| plain(c));
     assert_eq!(reopened.domain::<Row>().repo().get("a").unwrap().id, "a");
 }
 
@@ -234,7 +247,7 @@ fn quick_repair_child() {
     let write_path = std::env::var("CLOVE_QR_PATH").unwrap();
     let quick_repair = std::env::var("CLOVE_QR_ON").unwrap() == "1";
 
-    let storage = build(Path::new(&dir), |c| c.quick_repair(quick_repair));
+    let storage = build(Path::new(&dir), |c| plain(c.quick_repair(quick_repair)));
     let repo = storage.domain::<Row>().repo();
     let dbm = storage.db_manager("rows");
     if write_path != "build" {
@@ -385,7 +398,7 @@ fn open_report_after_a_clean_close_is_not_repaired() {
 /// `build_opens_each_file_once`).
 fn settled(dir: &Path) {
     for _ in 0..2 {
-        let storage = build(dir, |c| c);
+        let storage = build(dir, |c| plain(c));
         storage.close();
     }
 }
@@ -395,7 +408,7 @@ fn open_report_after_an_unclean_exit_without_quick_repair_is_repaired() {
     let dir = fresh_dir("report_killed");
     settled(&dir);
     run_child(&dir, "set", false);
-    let storage = build(&dir, |c| c);
+    let storage = build(&dir, |c| plain(c));
     assert_eq!(opened(&storage), vec![(primary(&dir), true), (backup(&dir), true)]);
 }
 
@@ -404,7 +417,7 @@ fn open_report_after_an_unclean_exit_with_quick_repair_is_not_repaired() {
     let dir = fresh_dir("report_killed_qr");
     settled(&dir);
     run_child(&dir, "set", true);
-    let storage = build(&dir, |c| c.quick_repair(true));
+    let storage = build(&dir, |c| plain(c).quick_repair(true));
     assert_eq!(
         opened(&storage),
         vec![(primary(&dir), false), (backup(&dir), false)]
@@ -414,7 +427,7 @@ fn open_report_after_an_unclean_exit_with_quick_repair_is_not_repaired() {
 #[test]
 fn format_check_opens_are_reported_once_and_match_actual_opens() {
     let dir = fresh_dir("report_format_checks");
-    let storage = build(&dir, |c| c);
+    let storage = build(&dir, |c| plain(c));
     storage
         .domain::<Row>()
         .repo()
@@ -430,7 +443,7 @@ fn format_check_opens_are_reported_once_and_match_actual_opens() {
     tx.commit().unwrap();
     drop(db);
     let before = opens::count(&backup(&dir));
-    let storage = build(&dir, |c| c);
+    let storage = build(&dir, |c| plain(c));
     let report = storage.open_report();
     let checks: Vec<_> = report.iter().filter(|r| r.format_check).collect();
     assert!(!checks.is_empty(), "missing format inspection opens");
@@ -445,6 +458,6 @@ fn format_check_opens_are_reported_once_and_match_actual_opens() {
     );
     storage.close();
     drop(storage);
-    let storage = build(&dir, |c| c);
+    let storage = build(&dir, |c| plain(c));
     assert!(storage.open_report().iter().all(|r| !r.format_check));
 }

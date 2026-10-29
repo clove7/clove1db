@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -9,6 +9,8 @@ use crate::durability::DurabilityMode;
 use crate::fsutil::{
     is_corrupt_index_bytes, quarantine_corrupt_file, write_atomic, write_atomic_json,
 };
+use crate::encrypted_store::{EncryptionContext, SidecarFiles};
+use crate::events::{EventSink, LibraryEvent};
 use crate::migration::layout::FieldLayout;
 use crate::migration::step_registry::MigrationStepRegistry;
 use crate::migration::types::{
@@ -18,6 +20,71 @@ use crate::migration::types::{
 use crate::units::{ClError, Result};
 use crate::upgrade::legacy_migration::{is_legacy_root_index, upgrade_legacy_migration_index};
 
+/// How the migration files are read and written: as plain files, or, in an encrypted database,
+/// as sealed files under fingerprint names, bound to their logical place (`parts`).
+#[derive(Debug, Clone)]
+pub(crate) struct MigrationFiles {
+    sealed: Option<SidecarFiles>,
+}
+
+impl MigrationFiles {
+    pub(crate) fn plain() -> Self {
+        Self { sealed: None }
+    }
+
+    pub(crate) fn new(dir: &Path, context: Option<EncryptionContext>) -> Self {
+        Self { sealed: context.map(|c| SidecarFiles::new(dir, c)) }
+    }
+
+    pub(crate) fn is_sealed(&self) -> bool {
+        self.sealed.is_some()
+    }
+
+    fn exists(&self, parts: &[&str], plain: &Path) -> bool {
+        match &self.sealed {
+            Some(s) => s.exists(parts).unwrap_or(false),
+            None => plain.exists(),
+        }
+    }
+
+    /// The content, `None` if there is no such file. A sealed file that was changed or moved is
+    /// [`ClError::DataTampered`], never `None`.
+    fn read(&self, parts: &[&str], plain: &Path) -> Result<Option<Vec<u8>>> {
+        match &self.sealed {
+            Some(s) => s.read(parts).map_err(ClError::from),
+            None if plain.exists() => Ok(Some(fs::read(plain)?)),
+            None => Ok(None),
+        }
+    }
+
+    fn write(&self, parts: &[&str], plain: &Path, bytes: &[u8], durability: DurabilityMode) -> Result<()> {
+        match &self.sealed {
+            Some(s) => s.write(parts, bytes, durability.is_strict()).map_err(ClError::from),
+            None => write_atomic(plain, bytes, durability),
+        }
+    }
+
+    fn write_json<T: serde::Serialize>(&self, parts: &[&str], plain: &Path, value: &T, durability: DurabilityMode) -> Result<()> {
+        match &self.sealed {
+            Some(_) => self.write(parts, plain, &serde_json::to_vec_pretty(value)?, durability),
+            None => write_atomic_json(plain, value, durability),
+        }
+    }
+
+    /// Move a sealed file that failed to open out of the way (only for files the library can
+    /// build again).
+    fn set_aside(&self, parts: &[&str]) -> Result<()> {
+        if let Some(s) = &self.sealed {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            s.set_aside(parts, stamp).map_err(ClError::from)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TableMigrationChain {
     pub table: String,
@@ -25,6 +92,7 @@ pub struct TableMigrationChain {
     pub index: TableChainIndex,
     pub manifests: Vec<MigrationManifest>,
     pub durability: DurabilityMode,
+    pub(crate) files: MigrationFiles,
 }
 
 #[derive(Debug, Clone)]
@@ -34,6 +102,7 @@ pub struct DbMigrationIndex {
     pub root: DbMigrationRootIndex,
     pub tables: HashMap<String, TableMigrationChain>,
     pub durability: DurabilityMode,
+    pub(crate) files: MigrationFiles,
 }
 
 impl DbMigrationIndex {
@@ -51,7 +120,26 @@ impl DbMigrationIndex {
         registered_tables: &[String],
         durability: DurabilityMode,
     ) -> Result<Self> {
+        Self::load_with_encryption(db_dir, db_name, registered_tables, durability, None, &EventSink::default())
+    }
+
+    /// [`DbMigrationIndex::load_with_durability`] for a database that may be encrypted: with a
+    /// context the files are sealed. A sealed file that fails to open is an error
+    /// ([`ClError::DataTampered`]) unless it can be built again from the others (the root index),
+    /// in which case it is set aside, an event is sent, and it is rebuilt.
+    pub(crate) fn load_with_encryption(
+        db_dir: &Path,
+        db_name: &str,
+        registered_tables: &[String],
+        durability: DurabilityMode,
+        context: Option<EncryptionContext>,
+        events: &EventSink,
+    ) -> Result<Self> {
         let dir = Self::migration_path(db_dir, db_name);
+        let files = MigrationFiles::new(&dir, context);
+        if files.is_sealed() {
+            return Self::load_sealed(dir, db_name, registered_tables, durability, files, events);
+        }
         if !dir.exists() {
             return Ok(Self::empty(dir, db_name, registered_tables, durability));
         }
@@ -82,7 +170,7 @@ impl DbMigrationIndex {
             None => DbMigrationRootIndex {
                 index_version: MIGRATION_INDEX_VERSION,
                 db_name: db_name.to_string(),
-                tables: HashMap::new(),
+                tables: BTreeMap::new(),
             },
         };
 
@@ -98,6 +186,87 @@ impl DbMigrationIndex {
             root,
             tables,
             durability,
+            files: MigrationFiles::plain(),
+        })
+    }
+
+    /// The sealed form of loading. Nothing is read from plain names.
+    fn load_sealed(
+        dir: PathBuf,
+        db_name: &str,
+        registered_tables: &[String],
+        durability: DurabilityMode,
+        files: MigrationFiles,
+        events: &EventSink,
+    ) -> Result<Self> {
+        let plain = dir.join("index.json");
+        // The root index only summarises the table chains and is filled in again from them, so a
+        // root that fails to open is set aside, reported, and built again.
+        let root = match files.read(&["index.json"], &plain) {
+            Ok(Some(bytes)) => match serde_json::from_slice::<DbMigrationRootIndex>(&bytes) {
+                Ok(root) if root.index_version == MIGRATION_INDEX_VERSION => Some(root),
+                _ => {
+                    files.set_aside(&["index.json"])?;
+                    events.emit(&LibraryEvent::Encryption { event: "encryption/sidecar_set_aside", file: "sidecar" });
+                    None
+                }
+            },
+            Ok(None) => None,
+            Err(ClError::DataTampered) => {
+                files.set_aside(&["index.json"])?;
+                events.emit(&LibraryEvent::Encryption { event: "encryption/sidecar_set_aside", file: "sidecar" });
+                None
+            }
+            Err(e) => return Err(e),
+        };
+        let root = root.unwrap_or_else(|| DbMigrationRootIndex {
+            index_version: MIGRATION_INDEX_VERSION,
+            db_name: db_name.to_string(),
+            tables: BTreeMap::new(),
+        });
+        let mut tables = HashMap::new();
+        for table in registered_tables {
+            tables.insert(table.clone(), Self::load_table_chain_sealed(&dir, table, durability, &files)?);
+        }
+        Ok(Self { dir, db_name: db_name.to_string(), root, tables, durability, files })
+    }
+
+    /// A table's chain is real history (versions and migration records): if it does not open, the
+    /// open fails; nothing is invented in its place.
+    fn load_table_chain_sealed(
+        migration_dir: &Path,
+        table: &str,
+        durability: DurabilityMode,
+        files: &MigrationFiles,
+    ) -> Result<TableMigrationChain> {
+        let table_dir = table_chain_dir(migration_dir, table);
+        let index_path = table_dir.join("index.json");
+        let index: TableChainIndex = match files.read(&["tables", table, "index.json"], &index_path)? {
+            Some(bytes) => serde_json::from_slice(&bytes).map_err(|_| ClError::DataTampered)?,
+            None => TableChainIndex {
+                schema_id: table.to_string(),
+                current_version: 1,
+                initial_version: 1,
+                chain: Vec::new(),
+            },
+        };
+        let mut manifests = Vec::new();
+        for entry in &index.chain {
+            let parts = ["tables", table, entry.migration_id.as_str(), "manifest.json"];
+            match files.read(&parts, &table_dir.join(&entry.migration_id).join("manifest.json"))? {
+                Some(bytes) => manifests.push(serde_json::from_slice::<MigrationManifest>(&bytes).map_err(|_| ClError::DataTampered)?),
+                // the index lists this migration, so its record must be there: a missing one is
+                // removed history, not an empty one
+                None => return Err(ClError::DataTampered),
+            }
+        }
+        Ok(TableMigrationChain {
+            table: table.to_string(),
+            dir: table_dir,
+            index,
+            manifests,
+            durability,
+            files: files.clone(),
         })
     }
 
@@ -156,6 +325,7 @@ impl DbMigrationIndex {
             index,
             manifests,
             durability,
+            files: MigrationFiles::plain(),
         })
     }
 
@@ -166,7 +336,7 @@ impl DbMigrationIndex {
         durability: DurabilityMode,
     ) -> Self {
         let mut table_map = HashMap::new();
-        let mut summaries = HashMap::new();
+        let mut summaries = BTreeMap::new();
         for t in tables {
             summaries.insert(
                 t.clone(),
@@ -189,6 +359,7 @@ impl DbMigrationIndex {
                     },
                     manifests: Vec::new(),
                     durability,
+                    files: MigrationFiles::plain(),
                 },
             );
         }
@@ -202,10 +373,18 @@ impl DbMigrationIndex {
             },
             tables: table_map,
             durability,
+            files: MigrationFiles::plain(),
         }
     }
 
     pub fn ensure_table(&mut self, table: &str, layout: &FieldLayout) -> Result<()> {
+        self.ensure_table_unpersisted(table, layout)?;
+        self.persist_root()
+    }
+
+    /// [`ensure_table`](Self::ensure_table) without writing the root index. The open pipeline calls this and writes the root
+    /// (`persist_root`) only after every stored layout has been checked, so an open that fails the check changes no migration file.
+    pub(crate) fn ensure_table_unpersisted(&mut self, table: &str, layout: &FieldLayout) -> Result<()> {
         if !self.tables.contains_key(table) {
             let chain = TableMigrationChain {
                 table: table.to_string(),
@@ -218,6 +397,7 @@ impl DbMigrationIndex {
                 },
                 manifests: Vec::new(),
                 durability: self.durability,
+                files: self.files.clone(),
             };
             self.tables.insert(table.to_string(), chain);
             self.root.tables.insert(
@@ -233,7 +413,6 @@ impl DbMigrationIndex {
             let chain = self.tables.get_mut(table).unwrap();
             chain.ensure_layout(1, layout)?;
         }
-        self.persist_root()?;
         Ok(())
     }
 
@@ -250,7 +429,9 @@ impl DbMigrationIndex {
     }
 
     pub fn persist_root(&mut self) -> Result<()> {
-        fs::create_dir_all(&self.dir)?;
+        if !self.files.is_sealed() {
+            fs::create_dir_all(&self.dir)?;
+        }
         for (name, chain) in &self.tables {
             self.root.tables.insert(
                 name.clone(),
@@ -263,6 +444,14 @@ impl DbMigrationIndex {
         }
         let path = self.dir.join("index.json");
         let bytes = serde_json::to_vec_pretty(&self.root)?;
+        if self.files.is_sealed() {
+            if let Ok(Some(existing)) = self.files.read(&["index.json"], &path) {
+                if existing == bytes {
+                    return Ok(());
+                }
+            }
+            return self.files.write(&["index.json"], &path, &bytes, self.durability);
+        }
         if path.exists() {
             if let Ok(existing) = fs::read(&path) {
                 if existing == bytes {
@@ -301,6 +490,23 @@ impl TableMigrationChain {
     }
 
     pub fn ensure_layout(&self, version: u32, layout: &FieldLayout) -> Result<()> {
+        if self.files.is_sealed() {
+            let layout_name = format!("v{version}.json");
+            let layout_parts = ["tables", self.table.as_str(), "layouts", layout_name.as_str()];
+            let path = layout_path(&self.dir, version);
+            if !self.files.exists(&layout_parts, &path) {
+                self.files.write_json(&layout_parts, &path, layout, self.durability)?;
+            }
+            let index_parts = ["tables", self.table.as_str(), "index.json"];
+            let index_path = self.dir.join("index.json");
+            let bytes = serde_json::to_vec_pretty(&self.index)?;
+            if let Ok(Some(existing)) = self.files.read(&index_parts, &index_path) {
+                if existing == bytes {
+                    return Ok(());
+                }
+            }
+            return self.files.write(&index_parts, &index_path, &bytes, self.durability);
+        }
         fs::create_dir_all(self.dir.join("layouts"))?;
         let path = layout_path(&self.dir, version);
         if !path.exists() {
@@ -318,6 +524,21 @@ impl TableMigrationChain {
         }
         write_atomic(&index_path, &bytes, self.durability)?;
         Ok(())
+    }
+
+    /// A stored layout of this table (the file for `version`), or `None`. A sealed one that was
+    /// changed is [`ClError::DataTampered`].
+    pub(crate) fn read_layout(&self, version: u32) -> Result<Option<FieldLayout>> {
+        let name = format!("v{version}.json");
+        let parts = ["tables", self.table.as_str(), "layouts", name.as_str()];
+        match self.files.read(&parts, &layout_path(&self.dir, version))? {
+            Some(bytes) => Ok(Some(
+                serde_json::from_slice(&bytes).map_err(|e| {
+                    if self.files.is_sealed() { ClError::DataTampered } else { ClError::from(e) }
+                })?,
+            )),
+            None => Ok(None),
+        }
     }
 
     pub fn schema_version_for_backup(&self, backup_version: u64) -> u32 {
@@ -391,7 +612,9 @@ impl TableMigrationChain {
         snapshot: Option<&[(String, Vec<u8>)]>,
     ) -> Result<()> {
         let mig_dir = self.dir.join(&manifest.migration_id);
-        fs::create_dir_all(mig_dir.join("refs"))?;
+        if !self.files.is_sealed() {
+            fs::create_dir_all(mig_dir.join("refs"))?;
+        }
 
         if let Some(entries) = snapshot {
             let ref_name = manifest
@@ -404,14 +627,13 @@ impl TableMigrationChain {
                 .iter()
                 .map(|(k, v)| (k.clone(), hex_encode(v)))
                 .collect();
-            write_atomic_json(&ref_path, &snapshot_data, self.durability)?;
+            let ref_file = format!("{ref_name}.json");
+            let ref_parts = ["tables", self.table.as_str(), manifest.migration_id.as_str(), "refs", ref_file.as_str()];
+            self.files.write_json(&ref_parts, &ref_path, &snapshot_data, self.durability)?;
         }
 
-        write_atomic_json(
-            &mig_dir.join("manifest.json"),
-            &manifest,
-            self.durability,
-        )?;
+        let manifest_parts = ["tables", self.table.as_str(), manifest.migration_id.as_str(), "manifest.json"];
+        self.files.write_json(&manifest_parts, &mig_dir.join("manifest.json"), &manifest, self.durability)?;
 
         let order = (self.index.chain.len() + 1) as u32;
         self.index.chain.push(MigrationIndexEntry {
@@ -421,8 +643,15 @@ impl TableMigrationChain {
         self.index.current_version = manifest.to.schema_version;
         self.manifests.push(manifest);
 
-        fs::create_dir_all(&self.dir)?;
-        write_atomic_json(&self.dir.join("index.json"), &self.index, self.durability)?;
+        if !self.files.is_sealed() {
+            fs::create_dir_all(&self.dir)?;
+        }
+        self.files.write_json(
+            &["tables", self.table.as_str(), "index.json"],
+            &self.dir.join("index.json"),
+            &self.index,
+            self.durability,
+        )?;
         Ok(())
     }
 }
@@ -559,6 +788,7 @@ mod tests {
                 },
             ],
             durability: DurabilityMode::Strict,
+            files: MigrationFiles::plain(),
         };
 
         assert_eq!(chain.schema_version_for_backup(5), 1);

@@ -3,6 +3,26 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum ClError {
+    #[error("serialized id_field must equal the row key")]
+    IdFieldMismatch,
+    #[error("query matched {count} rows where at most one was required")]
+    NonUnique { count:u64 },
+    #[error("cursor does not match this query or database")]
+    InvalidCursor,
+    #[error("sum requires numeric JSON values")]
+    UnsupportedSum,
+    #[error("decimal sum exceeds the supported 4096 coefficient digits or exponent magnitude") ]
+    DecimalSumLimit,
+    #[error("integer sum overflow")]
+    SumOverflow,
+    #[error("unique constraint violation")]
+    UniqueViolation,
+    #[error("unique constraint cannot be enabled: {groups} duplicate groups")]
+    DuplicateGroups {groups:u64},
+    #[error("journal consumer expired; register again and copy a full ReadView")]
+    ConsumerExpired,
+    #[error("internal journal consumer requires a full rebuild")]
+    ConsumerNeedsRebuild,
     #[error("IO error: {0}")]
     IoError(String),
     #[error("Validation error: {0}")]
@@ -23,6 +43,27 @@ pub enum ClError {
     DirectoryNotFound(String),
     #[error("Database error: {0}")]
     Database(#[from] redb::Error),
+
+    /// A database file (`.cldb`, `.cldb.bak` or `.inx`) is locked by another
+    /// program, or is already open through another handle. Returned at once:
+    /// nothing was opened, so the files are exactly as they were. Not damage and
+    /// not a disk error: close the other user of the file and open again.
+    #[error("database is in use by another program: {path}")]
+    DatabaseInUse { path: String },
+
+    /// Backup history was asked for, but its file (`.cldb.bak`) could not be opened or created, for a
+    /// reason other than another program using it (that is [`ClError::DatabaseInUse`]). The database is
+    /// not opened: it would otherwise run without recording history, silently.
+    #[error("cannot open the backup history {path}: {reason}")]
+    BackupOpenFailed { path: String, reason: String },
+
+    /// The system refused memory the library needed for the caller's data, at `site` (see
+    /// [`crate::memory::ALLOC_SITES`]). Returned before anything was committed: the database is
+    /// as it was, and the call can be retried when memory is available. Allocations the library
+    /// cannot reserve for (small ones, and those inside redb, serde_json and Rust itself) still
+    /// stop the process, which loses nothing.
+    #[error("out of memory: could not reserve {bytes} bytes for {site}")]
+    OutOfMemory { site: &'static str, bytes: u64 },
 
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
@@ -114,10 +155,38 @@ pub enum ClError {
     /// and cannot be used again. Build a new `Storage` to reopen it.
     #[error("database is closed: {path}")]
     Closed { path: String },
+
+    /// The database could not be opened: a wrong key, a wrong cipher or hash choice, wrong password
+    /// settings, no key, an unencrypted file, or a file that is damaged or cut. One error for all of
+    /// them; the cause goes to the diagnostic sink only.
+    #[error("the database could not be opened")]
+    EncryptedOpenFailed,
+
+    /// Data failed authentication after the database was opened: the file was changed or damaged.
+    #[error("the database file was changed or damaged")]
+    DataTampered,
+}
+
+impl From<crate::encrypted_store::StoreError> for ClError {
+    fn from(e: crate::encrypted_store::StoreError) -> Self {
+        use crate::encrypted_store::StoreError;
+        match e {
+            StoreError::OpenFailed => ClError::EncryptedOpenFailed,
+            StoreError::Tampered => ClError::DataTampered,
+            StoreError::InvalidParams(why) => ClError::Validation(why.to_string()),
+            // The path is filled in by the caller that knows it, before the error leaves the library.
+            StoreError::InUse => ClError::DatabaseInUse { path: String::new() },
+            StoreError::NeedsRepair => ClError::Database(redb::Error::RepairAborted),
+            StoreError::Io(e) => ClError::from(e),
+        }
+    }
 }
 
 impl From<std::io::Error> for ClError {
     fn from(e: std::io::Error) -> Self {
+        if crate::encrypted_store::is_tamper(&e) {
+            return ClError::DataTampered;
+        }
         ClError::IoError(e.to_string())
     }
 }
@@ -142,6 +211,11 @@ impl From<redb::TableError> for ClError {
 
 impl From<StorageError> for ClError {
     fn from(e: StorageError) -> Self {
+        if let StorageError::Io(io) = &e {
+            if crate::encrypted_store::is_tamper(io) {
+                return ClError::DataTampered;
+            }
+        }
         ClError::Database(redb::Error::from(e))
     }
 }

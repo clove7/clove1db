@@ -86,33 +86,25 @@ pub fn write_atomic(path: &Path, bytes: &[u8], mode: DurabilityMode) -> Result<(
     write_result
 }
 
+/// Give `tmp` the name `path` in one step. Where `path` exists it is replaced: at every moment the
+/// name holds the whole old file or the whole new one, never nothing. (On Windows the standard
+/// `rename` replaces an existing file in one system call; moving the old file aside first and
+/// the new one in afterwards leaves a gap in which `path` does not exist.)
+///
+/// On Windows a file that another program has just opened without allowing deletion (a virus
+/// scanner, a search indexer) makes the call fail for a moment, so it is tried a few times.
 fn replace_file(tmp: &Path, path: &Path) -> Result<()> {
-    #[cfg(windows)]
-    {
-        if path.exists() {
-            let bak = path.with_extension(format!(
-                "replace-old.{}",
-                TMP_NONCE.fetch_add(1, Ordering::Relaxed)
-            ));
-            fs::rename(path, &bak).map_err(|e| ClError::IoError(e.to_string()))?;
-            match fs::rename(tmp, path) {
-                Ok(()) => {
-                    let _ = fs::remove_file(&bak);
-                    Ok(())
-                }
-                Err(e) => {
-                    let _ = fs::rename(&bak, path);
-                    let _ = fs::remove_file(tmp);
-                    Err(ClError::IoError(e.to_string()))
-                }
+    const TRIES: u32 = 8;
+    let mut attempt = 0;
+    loop {
+        match fs::rename(tmp, path) {
+            Ok(()) => return Ok(()),
+            Err(e) if cfg!(windows) && e.kind() == std::io::ErrorKind::PermissionDenied && attempt + 1 < TRIES => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(10 * u64::from(attempt)));
             }
-        } else {
-            fs::rename(tmp, path).map_err(|e| ClError::IoError(e.to_string()))
+            Err(e) => return Err(ClError::IoError(e.to_string())),
         }
-    }
-    #[cfg(not(windows))]
-    {
-        fs::rename(tmp, path).map_err(|e| ClError::IoError(e.to_string()))
     }
 }
 
@@ -146,7 +138,9 @@ pub fn quarantine_corrupt_file(path: &Path, detail: &str) -> Result<()> {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let dest = path.with_extension(format!("corrupt.{ts}"));
+    // the whole name is kept, so two files with the same stem (`a.json`, `a.bin`) never share a name
+    let file_name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let dest = path.with_file_name(format!("{file_name}.corrupt.{ts}"));
     match fs::rename(path, &dest) {
         Ok(()) => Ok(()),
         Err(_) => {
@@ -179,12 +173,85 @@ mod tests {
         assert!(!is_corrupt_index_bytes(got.as_bytes()));
     }
 
+    fn temp() -> PathBuf {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = fs::read_dir(dir).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn replacing_a_file_leaves_the_new_content_and_nothing_else() {
+        let dir = temp();
+        let path = dir.join("store.keys");
+        fs::write(&path, b"old").unwrap();
+        write_atomic(&path, b"new", DurabilityMode::Strict).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        assert_eq!(names(&dir), vec!["store.keys".to_string()]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_that_is_open_for_reading_can_be_replaced() {
+        let dir = temp();
+        let path = dir.join("store.keys");
+        fs::write(&path, b"old").unwrap();
+        let reader = fs::File::open(&path).unwrap();
+        write_atomic(&path, b"new", DurabilityMode::Strict).unwrap();
+        drop(reader);
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        assert_eq!(names(&dir), vec!["store.keys".to_string()]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_name_always_holds_a_whole_file_when_a_write_is_cut_short() {
+        // a process that stops after the temporary file was written and before the rename leaves the
+        // old file in place with a temporary file next to it; the next write is not bothered by it
+        let dir = temp();
+        let path = dir.join("store.keys");
+        fs::write(&path, b"old").unwrap();
+        fs::write(dir.join("store.keys.tmp.1.2.3"), b"half").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"old");
+        write_atomic(&path, b"new", DurabilityMode::Strict).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_temporary_name_keeps_the_whole_name_so_two_files_never_share_one() {
+        let (a, b) = (Path::new("d/store.keys"), Path::new("d/store.cldb"));
+        let (ta, tb) = (tmp_path_for(a), tmp_path_for(b));
+        assert_ne!(ta, tb);
+        assert!(ta.file_name().unwrap().to_string_lossy().starts_with("store.keys.tmp."));
+        assert!(tb.file_name().unwrap().to_string_lossy().starts_with("store.cldb.tmp."));
+    }
+
     #[test]
     fn detects_nul_corruption() {
         assert!(is_corrupt_index_bytes(&[]));
         assert!(is_corrupt_index_bytes(&[0, 0, 0, 0]));
         assert!(is_corrupt_index_bytes(b"not-json"));
         assert!(!is_corrupt_index_bytes(br#"{"a":1}"#));
+    }
+
+    #[test]
+    fn two_quarantined_files_with_the_same_stem_keep_apart() {
+        let dir = temp();
+        fs::write(dir.join("a.json"), [0u8; 4]).unwrap();
+        fs::write(dir.join("a.bin"), [0u8; 4]).unwrap();
+        quarantine_corrupt_file(&dir.join("a.json"), "nul").unwrap();
+        quarantine_corrupt_file(&dir.join("a.bin"), "nul").unwrap();
+        let found = names(&dir);
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(found.iter().any(|n| n.starts_with("a.json.corrupt.")), "{found:?}");
+        assert!(found.iter().any(|n| n.starts_with("a.bin.corrupt.")), "{found:?}");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

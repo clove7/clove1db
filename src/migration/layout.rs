@@ -60,6 +60,14 @@ impl FieldLayout {
         Ok(Self::from_json_value(&value))
     }
 
+    /// Records that the field is stored with this JSON type, whatever a default value shows.
+    pub(crate) fn set_json_type(&mut self, name: &str, json_type: &str) {
+        if let Some(field) = self.fields.iter_mut().find(|f| f.name == name) {
+            field.json_type = json_type.to_string();
+        }
+        self.layout_hash = compute_hash(&self.fields);
+    }
+
     pub fn diff(&self, other: &Self) -> LayoutDiff {
         let self_map: BTreeMap<_, _> = self.fields.iter().map(|f| (&f.name, f)).collect();
         let other_map: BTreeMap<_, _> = other.fields.iter().map(|f| (&f.name, f)).collect();

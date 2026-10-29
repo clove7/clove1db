@@ -15,3 +15,8 @@ pub fn blob_root(db_dir: &Path, db_name: &str) -> PathBuf {
 pub fn blob_table_dir(db_dir: &Path, db_name: &str, table: &str) -> PathBuf {
     blob_root(db_dir, db_name).join(table)
 }
+
+/// Where the attachments of tables with protected fields are kept: `{db_dir}/{db_name}.pblobs`.
+pub fn protected_blob_root(db_dir: &Path, db_name: &str) -> PathBuf {
+    db_dir.join(format!("{db_name}.pblobs"))
+}

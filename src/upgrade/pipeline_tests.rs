@@ -25,6 +25,16 @@ mod tests {
     }
 
     #[test]
+    fn a_folder_can_be_flushed_here() {
+        // the atomic creation flushes the database folder after it gives the file its name; that this call works on this system is checked here
+        let dir = std::env::temp_dir().join(format!("clove-syncdir-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let result = crate::upgrade::pipeline::sync_folder(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        result.unwrap();
+    }
+
+    #[test]
     fn build_requires_register() {
         let dir = PathBuf::from("./target/test_register_required");
         let _ = std::fs::remove_dir_all(&dir);
@@ -43,6 +53,7 @@ mod tests {
             name: "users".to_string(),
             layout,
             storage: TableStorageMode::InlineJson,
+            sealed: &[],
         }];
         let out = OpenUpgradePipeline::run(&UpgradeInput {
             dir_path: &dir,
@@ -55,6 +66,8 @@ mod tests {
             has_cache: true,
             durability: crate::durability::DurabilityMode::Strict,
             redb: crate::handle::RedbOptions::default(),
+            event_sink: Default::default(),
+            field_encryption: None, field_keys_file: None,
         })
         .unwrap();
 
@@ -80,6 +93,19 @@ mod tests {
         assert_eq!(report.kind, FileKind::New);
     }
 
+    /// Under `--cfg clove_test_encrypt_all` a database starts encrypted; this test inspects a plain file (7-5-plain-only.md).
+    #[allow(dead_code)]
+    fn plain(db: DatabaseConfig) -> DatabaseConfig {
+        #[cfg(clove_test_encrypt_all)]
+        {
+            db.plain()
+        }
+        #[cfg(not(clove_test_encrypt_all))]
+        {
+            db
+        }
+    }
+
     #[test]
     fn reopen_empty_authenticated_db_without_entity_rows() {
         let dir = PathBuf::from("./target/test_reopen_empty_auth");
@@ -87,7 +113,7 @@ mod tests {
 
         let storage = Storage::builder(StorageConfig::default().change_dir_path(dir.clone()))
             .add_database(
-                DatabaseConfig::new("bots", "bots")
+                plain(DatabaseConfig::new("bots", "bots"))
                     .dir_path(dir.clone())
                     .backup_enabled(true)
                     .register::<User>("bots"),
@@ -107,7 +133,7 @@ mod tests {
 
         Storage::builder(StorageConfig::default().change_dir_path(dir.clone()))
             .add_database(
-                DatabaseConfig::new("bots", "bots")
+                plain(DatabaseConfig::new("bots", "bots"))
                     .dir_path(dir.clone())
                     .backup_enabled(true)
                     .register::<User>("bots"),

@@ -5,7 +5,7 @@ use crate::{
         view::{BackupRecordView, HistoryDisplayMode, RecordData},
         BackupManager, BackupOperation, BackupRecord,
     },
-    blob::BlobStore,
+    blob::{BlobReader, BlobStore},
     durability::{DurabilityMode, DEFAULT_MAX_COMMIT_BATCH_ENTRIES},
     fsutil::maybe_crash,
     handle::{DbHandle, DbRef, FileOpen, RedbOptions},
@@ -21,12 +21,11 @@ use crate::{
 use chrono::{Datelike, Local};
 use itertools::Itertools;
 use moka::sync::Cache;
-use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
+use redb::{ReadableTable, ReadableTableMetadata, TableDefinition};
 // use std::env;
 use crate::entity::Entity;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
-use std::fs::File;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -34,8 +33,12 @@ use std::time::Duration;
 
 #[derive(Clone, Debug)]
 pub struct DatabaseManager {
+    pub(crate) indexes:Arc<crate::indexes::Shared>,
     // L1: In-memory cache (moka) for fast access
     pub memory_cache: Cache<String, Vec<u8>>,
+    pub(crate) query_runtime:crate::query::optimizer::Shared,
+    pub(crate) event_sink:crate::events::EventSink,
+    pub(crate) slow_query_threshold:Duration,
 
     // L2: Persistent database (redb) for long-term storage. Shared by every
     // clone, so `close` on one closes it for all of them.
@@ -57,10 +60,11 @@ pub struct DatabaseManager {
     pub tables_names: Vec<String>,
 
     // Has cache
-    has_cache: bool,
+    pub(crate) has_cache: bool,
 
     // Durability policy (independent of cache)
     durability: DurabilityMode,
+    pub(crate) journal_retention:crate::journal::Retention,
 
     // Max entries per commit_batch chunk
     max_commit_batch_entries: usize,
@@ -76,6 +80,12 @@ pub struct DatabaseManager {
 
     // Shared decoder registry for history resolution
     migration_registry: Arc<MigrationStepRegistry>,
+    /// How this database's files are opened; the index worker opens `.inx` with it.
+    pub(crate) redb: RedbOptions,
+    /// Tables registered with protected fields: raw byte writes to them are refused.
+    pub(crate) sealed_tables: Arc<std::collections::HashSet<String>>,
+    /// The keys of the protected fields, forgotten when the database is closed.
+    pub(crate) field_keys: Option<Arc<crate::field_crypto::FieldKeys>>,
 }
 
 impl DatabaseManager {
@@ -100,6 +110,37 @@ impl DatabaseManager {
         max_commit_batch_entries: usize,
         redb: RedbOptions,
     ) -> Result<Self> {
+        Self::open_with_attachments(
+            db, dir_path, backup_dir_path, dir_name, db_name, tables, cache_max_bytes, cache_ttl_seconds,
+            cache_idle_seconds, has_cache, blob_enabled, table_storage, table_layouts, migration_registry,
+            durability, max_commit_batch_entries, redb, None,
+        )
+    }
+
+    /// [`Self::open`], also giving the keys and the identities of the tables with protected fields,
+    /// so that their attachments are sealed with the keys of those fields from the first moment
+    /// (the attachments are checked when the database opens).
+    pub(crate) fn open_with_attachments(
+        db: DbHandle,
+        dir_path: &PathBuf,
+        backup_dir_path: Option<&PathBuf>,
+        dir_name: &str,
+        db_name: &str,
+        tables: Vec<String>,
+        cache_max_bytes: u64,
+        cache_ttl_seconds: u64,
+        cache_idle_seconds: u64,
+        has_cache: bool,
+        blob_enabled: bool,
+        table_storage: std::collections::HashMap<String, TableStorageMode>,
+        table_layouts: std::collections::HashMap<String, FieldLayout>,
+        migration_registry: Arc<MigrationStepRegistry>,
+        durability: DurabilityMode,
+        max_commit_batch_entries: usize,
+        redb: RedbOptions,
+        protected_attachments: Option<(Arc<crate::field_crypto::FieldKeys>, Arc<std::collections::HashMap<String, String>>)>,
+    ) -> Result<Self> {
+        for table in &tables { crate::journal::validate_table(table)?; }
         let dir = dir_path.join(dir_name);
         let backup_dir = if let Some(backup_dir_path) = backup_dir_path {
             Some(backup_dir_path.join(dir_name))
@@ -118,11 +159,12 @@ impl DatabaseManager {
         let db = Arc::new(db);
 
         let backup_manager = if let Some(backup_db_path) = backup_db_path {
-            let backup_manager = BackupManager::new(&backup_db_path, has_cache, durability, redb);
-            if backup_manager.is_ok() {
-                Some(backup_manager.unwrap())
-            } else {
-                None
+            // Backup was asked for. A history file that cannot be opened is an error, whatever the reason:
+            // opening without it would silently stop recording history.
+            match BackupManager::new(&backup_db_path, has_cache, durability, &redb) {
+                Ok(backup_manager) => Some(backup_manager),
+                Err(e @ ClError::DatabaseInUse { .. }) => return Err(e),
+                Err(e) => return Err(ClError::BackupOpenFailed { path: backup_db_path.display().to_string(), reason: e.to_string() }),
             }
         } else {
             None
@@ -130,6 +172,7 @@ impl DatabaseManager {
 
         let db_ref = db.get()?;
         let write_txn = db_ref.begin_write()?;
+        crate::journal::initialize(&write_txn)?;
         {
             let meta_table: TableDefinition<&str, &[u8]> = TableDefinition::new(META_TABLE);
             write_txn.open_table(meta_table)?;
@@ -181,11 +224,13 @@ impl DatabaseManager {
             year: now.year() as u32,
         };
 
-        let mut migration_index = DbMigrationIndex::load_with_durability(
+        let mut migration_index = DbMigrationIndex::load_with_encryption(
             &dir_local.dir,
             db_name,
             &tables,
             durability,
+            redb.encryption.as_ref().and_then(|e| e.context().cloned()),
+            &crate::events::EventSink::default(),
         )?;
         for (table, layout) in &table_layouts {
             migration_index.ensure_table(table, layout)?;
@@ -194,10 +239,19 @@ impl DatabaseManager {
         let migration_index = Arc::new(RwLock::new(migration_index));
 
         let blob_store = if blob_enabled {
-            let store = BlobStore::new(dir_local.dir.as_path(), db_name);
+            let store = match redb.encryption.as_ref().and_then(|e| e.context()) {
+                Some(context) => BlobStore::with_encryption(dir_local.dir.as_path(), db_name, context.clone()),
+                None => BlobStore::new(dir_local.dir.as_path(), db_name),
+            };
+            let store = match protected_attachments {
+                Some((keys, ids)) if !ids.is_empty() => {
+                    store.with_protected(keys as Arc<dyn crate::encrypted_store::FileKeys>, ids)
+                }
+                _ => store,
+            };
             store.ensure_root()?;
             for table in &tables {
-                if table_storage.get(table).copied() == Some(TableStorageMode::BlobSidecar) {
+                if table_storage.get(table).copied() == Some(TableStorageMode::BlobSidecar) && !store.is_unreadable(table) {
                     store.ensure_table(table)?;
                 }
             }
@@ -206,8 +260,12 @@ impl DatabaseManager {
             None
         };
 
-        Ok(Self {
+        let manager=Self {
+            indexes:Arc::new(Default::default()),
             memory_cache,
+            query_runtime:Arc::new(std::sync::Mutex::new(Default::default())),
+            event_sink:Default::default(),
+            slow_query_threshold:Duration::from_millis(50),
             db: db,
             backup_manager,
             date,
@@ -216,14 +274,20 @@ impl DatabaseManager {
             tables_names: tables,
             has_cache,
             durability,
+            journal_retention:crate::journal::Retention::Default,
             max_commit_batch_entries: max_commit_batch_entries.max(1),
             format_opens: Vec::new(),
+            sealed_tables: Arc::new(std::collections::HashSet::new()),
+            field_keys: None,
             blob_enabled,
             table_storage,
             blob_store,
             migration_index,
             migration_registry,
-        })
+            redb,
+        };
+        manager.reconcile_blobs()?;
+        Ok(manager)
     }
 
     #[deprecated(note = "use DatabaseManager::open")]
@@ -242,11 +306,12 @@ impl DatabaseManager {
         table_layouts: std::collections::HashMap<String, FieldLayout>,
         migration_registry: Arc<MigrationStepRegistry>,
     ) -> Result<Self> {
+        for table in &tables { crate::journal::validate_table(table)?; }
         let dir = dir_path.join(dir_name);
         fs::create_dir_all(&dir)?;
         let db_path = dir.join(format!("{}.cldb", db_name));
         let redb = RedbOptions::default();
-        let db = DbHandle::create(&db_path, DurabilityMode::Strict, redb)?;
+        let db = DbHandle::create(&db_path, DurabilityMode::Strict, redb.clone(), "main")?;
         Self::open(
             db,
             dir_path,
@@ -283,15 +348,14 @@ impl DatabaseManager {
         self.table_storage_mode(table) == TableStorageMode::BlobSidecar
     }
 
-    pub fn blob_store(&self) -> Result<&BlobStore> {
+    pub(crate) fn blob_store(&self) -> Result<&BlobStore> {
         self.blob_store.as_ref().ok_or_else(|| {
             ClError::Validation("blob storage not enabled on this database".into())
         })
     }
 
     pub fn write_blob(&self, table: &str, id: &str, data: &[u8]) -> Result<()> {
-        self.blob_store()?
-            .write_atomic_with_mode(table, id, data, self.durability)
+        self.publish_blob(table,id,data,None)
     }
 
     pub fn durability(&self) -> DurabilityMode {
@@ -300,17 +364,21 @@ impl DatabaseManager {
 
     /// The open `.cldb`, or [`ClError::Closed`].
     ///
-    /// Reads go through the returned guard as a `&Database`. Writes go through
-    /// its `begin_write`, which applies this database's durability and quick
-    /// repair — see [`DbRef::begin_write`]. Hold it for one operation; see
+    /// Only snapshot reads are exposed. User writes use the journaled methods.
+    /// Hold the handle for one operation; see
     /// [`DbHandle::get`].
+    /// Query a registered raw table using an entity representation chosen by the caller.
+    pub fn query<E:Entity>(&self,table:&str)->Result<crate::query::Query<E>> {
+        if !self.tables_names.iter().any(|t|t==table){return Err(ClError::Validation("query table is not registered".into()))}
+        Ok(crate::query::Query::new(self.clone(),table.into()))
+    }
     pub fn db(&self) -> Result<DbRef<'_>> {
         self.db.get()
     }
 
     /// Read `_clove_meta`.
     pub fn read_meta(&self) -> Result<Option<CloveMeta>> {
-        read_meta(&*self.db()?)
+        read_meta(self.db()?.raw())
     }
 
     /// Write `_clove_meta` with this database's commit policy.
@@ -336,11 +404,34 @@ impl DatabaseManager {
         if let Some(bm) = &self.backup_manager {
             bm.close();
         }
+        if let Some(keys) = &self.field_keys {
+            keys.clear();
+        }
         was_open
     }
 
     pub fn is_closed(&self) -> bool {
         self.db.is_closed()
+    }
+
+    /// A checker of secrets against the verification hashes of this database (passwords, codes).
+    /// It opens no value; every check is reported to the event sink.
+    pub fn verifier(&self) -> Result<crate::field_crypto::Verifier> {
+        drop(self.db()?);
+        match &self.field_keys {
+            Some(keys) => Ok(crate::field_crypto::Verifier::new(keys.clone(), self.event_sink.clone())),
+            None => Err(ClError::Validation("this database has no protected fields".into())),
+        }
+    }
+
+    /// A permission to open protected values of this database, for the request in hand. The
+    /// application decides who may have one; every use is reported to the event sink.
+    pub fn read_grant(&self) -> Result<crate::field_crypto::ReadGrant> {
+        drop(self.db()?);
+        match &self.field_keys {
+            Some(keys) => Ok(crate::field_crypto::ReadGrant::new(keys.clone(), self.event_sink.clone())),
+            None => Err(ClError::Validation("this database has no protected fields".into())),
+        }
     }
 
     /// How this database's files opened: the `.cldb`, then its `.cldb.bak`
@@ -352,15 +443,13 @@ impl DatabaseManager {
             .collect()
     }
 
-    pub fn open_blob(&self, table: &str, id: &str) -> Result<File> {
-        self.blob_store()?.open_read(table, id)
+    pub fn open_blob(&self, table: &str, id: &str) -> Result<BlobReader> {
+        self.open_current_blob(table,id)
     }
 
     pub fn delete_blob(&self, table: &str, id: &str) -> Result<bool> {
-        match &self.blob_store {
-            Some(store) => store.delete(table, id),
-            None => Ok(false),
-        }
+        let removed=self.apply_changes(&[],&[(table.into(),id.into())])?;
+        Ok(removed[0])
     }
 
     pub fn copy_blob(
@@ -371,9 +460,7 @@ impl DatabaseManager {
         dest_table: &str,
         dest_id: &str,
     ) -> Result<()> {
-        let src = self.blob_store()?;
-        let dest_store = dest.blob_store()?;
-        src.copy(table, id, dest_store, dest_table, dest_id)
+        self.copy_current_blob(table,id,dest,dest_table,dest_id)
     }
 
     pub fn blobs_root(&self) -> Option<PathBuf> {
@@ -404,11 +491,9 @@ impl DatabaseManager {
     pub fn table_layout(&self, table: &str) -> Result<FieldLayout> {
         let guard = self.migration_index()?;
         let chain = guard.table_chain(table)?;
-        let version = chain.current_version();
-        let path = crate::migration::types::layout_path(&chain.dir, version);
-        if path.exists() {
-            let data = fs::read_to_string(path)?;
-            return Ok(serde_json::from_str(&data)?);
+        // Goes through the chain so a sealed layout file is read (and a changed one is an error).
+        if let Some(layout) = chain.read_layout(chain.current_version())? {
+            return Ok(layout);
         }
         Ok(FieldLayout::from_json_value(&serde_json::json!({})))
     }
@@ -474,9 +559,6 @@ impl DatabaseManager {
     }
 
     pub fn delete_raw(&self, table_name: &str, key: &str) -> Result<()> {
-        if self.is_blob_table(table_name) {
-            let _ = self.delete_blob(table_name, key);
-        }
         let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(table_name);
         self.delete(table, table_name, key)?;
         Ok(())
@@ -490,13 +572,51 @@ impl DatabaseManager {
         writes: &[(String, String, Vec<u8>)],
         deletes: &[(String, String)],
     ) -> Result<()> {
-        self.commit_batch_transaction(writes, deletes, true)
+        self.refuse_sealed(writes.iter().map(|r| r.0.as_str()))?;
+        self.apply_changes(writes,deletes).map(|_|())
+    }
+
+    /// Fails when one of `tables` was registered with protected fields: raw bytes cannot be sealed,
+    /// so such a table is written through its entity.
+    /// A program that opened the database with the search key alone only reads: every write is
+    /// refused, also the rewrite of a row with its protected values unchanged.
+    fn ensure_writable(&self) -> Result<()> {
+        if self.field_keys.as_ref().is_some_and(|keys| keys.is_search_only()) {
+            return Err(ClError::Validation(
+                "this program holds only the search key, so the database is read-only; open it with the read key to write".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn refuse_sealed<'a>(&self, tables: impl IntoIterator<Item = &'a str>) -> Result<()> {
+        if self.sealed_tables.is_empty() {
+            return Ok(());
+        }
+        for table in tables {
+            if self.sealed_tables.contains(table) {
+                return Err(ClError::Validation(
+                    "a table with protected fields is written through its entity (`Repository::set` or `commit_entities`), not with raw bytes".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Commit raw changes in bounded transactions. Batches larger than the configured
     /// limit may leave a committed prefix on failure; writes precede deletes.
     /// This API does not create backup history records.
     pub fn commit_batch(
+        &self,
+        writes: &[(String, String, Vec<u8>)],
+        deletes: &[(String, String)],
+    ) -> Result<()> {
+        self.refuse_sealed(writes.iter().map(|r| r.0.as_str()))?;
+        self.commit_batch_prepared(writes, deletes)
+    }
+
+    /// `commit_batch` for bytes that are already in their stored form (rows sealed by their entity).
+    pub(crate) fn commit_batch_prepared(
         &self,
         writes: &[(String, String, Vec<u8>)],
         deletes: &[(String, String)],
@@ -526,57 +646,88 @@ impl DatabaseManager {
         writes: &[(String, String, Vec<u8>)],
         deletes: &[(String, String)],
     ) -> Result<()> {
-        self.commit_batch_transaction(writes, deletes, false)
+        self.apply_changes(writes,deletes).map(|_|())
     }
 
-    fn commit_batch_transaction(
-        &self,
-        writes: &[(String, String, Vec<u8>)],
-        deletes: &[(String, String)],
-        propagate_delete_errors: bool,
-    ) -> Result<()> {
-        let db = self.db()?;
-        let write_txn = db.begin_write()?;
-        maybe_crash("before_commit");
+    pub(crate) fn journal_write<T>(&self,f:impl FnOnce(&redb::WriteTransaction,&mut Vec<crate::journal::ChangeKind>)->Result<T>)->Result<T> {crate::journal::write_with_sink(&self.db()?,self.journal_retention,&self.event_sink,f)}
 
-        for (table_name, key, value) in writes {
-            let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(table_name.as_str());
-            let mut table_ref = write_txn.open_table(table)?;
-            if self.has_cache {
-                table_ref.insert(key.as_str(), value.as_slice())?;
-            } else {
-                let mut slot = table_ref.insert_reserve(key.as_str(), value.len())?;
-                slot.as_mut().copy_from_slice(value);
+    fn apply_changes(&self, writes:&[(String,String,Vec<u8>)], deletes:&[(String,String)])->Result<Vec<bool>> {
+        for table in writes.iter().map(|r|r.0.as_str()).chain(deletes.iter().map(|r|r.0.as_str())) {crate::journal::validate_table(table)?;}
+        let db=self.db()?;
+        self.ensure_writable()?;
+        let removed=crate::journal::write_with_sink(&db,self.journal_retention,&self.event_sink,|tx,changes| {
+            maybe_crash("before_commit");
+            // The journal row holds its own copy of every value: reserve all of it before the first write.
+            crate::memory::reserve("write.change_rows",changes,writes.len()+deletes.len())?;
+            for (table,key,value) in writes {
+                if self.is_blob_table(table)&&crate::journal_blob::get(tx,table,key)?.is_none(){return Err(ClError::Validation("blob metadata requires set_with_blob or a previously written blob".into()))}
+                let copy=crate::memory::copy_bytes("write.change_rows",value)?;
+                tx.open_table(TableDefinition::<&str,&[u8]>::new(table))?.insert(key.as_str(),value.as_slice())?;
+                changes.push(crate::journal::ChangeKind::Upsert{table:table.clone(),key:key.clone(),value:copy});
             }
-        }
-
-        for (table_name, key) in deletes {
-            let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(table_name.as_str());
-            let mut table_ref = write_txn.open_table(table)?;
-            if propagate_delete_errors {
-                table_ref.remove(key.as_str())?;
-            } else {
-                let _ = table_ref.remove(key.as_str());
+            let mut removed=Vec::new();
+            for (table,key) in deletes {
+                let exists=tx.open_table(TableDefinition::<&str,&[u8]>::new(table))?.remove(key.as_str())?.is_some();
+                if exists { changes.push(crate::journal::ChangeKind::Delete{table:table.clone(),key:key.clone()}); }
+                let blob=if self.is_blob_table(table) {crate::journal_blob::remove(tx,table,key,changes)?} else {false};
+                removed.push(exists||blob);
             }
-        }
-
-        write_txn.commit()?;
+            Ok(removed)
+        })?;
         maybe_crash("after_commit");
-
         if self.has_cache {
-            for (table_name, key, value) in writes {
-                let cache_key = format!("{}:{}", table_name, key);
-                self.memory_cache.insert(cache_key, value.clone());
-            }
-            for (table_name, key) in deletes {
-                let cache_key = format!("{}:{}", table_name, key);
-                self.memory_cache.invalidate(&cache_key);
-            }
+            for (table,key,value) in writes {self.memory_cache.insert(format!("{table}:{key}"),value.clone());}
+            for (table,key) in deletes {self.memory_cache.invalidate(&format!("{table}:{key}"));}
         }
-
-        Ok(())
+        Ok(removed)
     }
 
+    /// Atomically publish a full replacement and one immutable TableReset image.
+    pub fn replace_table(&self,table:&str,entries:&[(String,Vec<u8>)])->Result<()> {
+        self.refuse_sealed([table])?;
+        self.ensure_writable()?;
+        crate::journal::validate_table(table)?;
+        let db=self.db()?;
+        crate::journal::write_with_sink(&db,self.journal_retention,&self.event_sink,|tx,changes| {
+            tx.delete_table(TableDefinition::<&str,&[u8]>::new(table))?;
+            {let mut target=tx.open_table(TableDefinition::<&str,&[u8]>::new(table))?;for (k,v) in entries {target.insert(k.as_str(),v.as_slice())?;}}
+            self.validate_blob_rows(tx,table,changes)?;
+            Self::capture_reset(tx,table,changes)
+        })?;self.clear_cache();Ok(())
+    }
+
+    fn capture_reset(tx:&redb::WriteTransaction,table:&str,changes:&mut Vec<crate::journal::ChangeKind>)->Result<()> {
+        let generation=crate::journal::number(tx,"reset_generation")?.checked_add(1).ok_or_else(||ClError::Validation("reset generation exhausted".into()))?;
+        crate::journal::put_number(tx,"reset_generation",generation)?;
+        let snapshot=format!("__reset_{generation}");
+        {let source=tx.open_table(TableDefinition::<&str,&[u8]>::new(table))?;let mut target=tx.open_table(TableDefinition::<&str,&[u8]>::new(&snapshot))?;for row in source.iter()? {let(k,v)=row?;target.insert(k.value(),v.value())?;}}
+        maybe_crash("journal_during_reset");
+        {let refs=tx.open_table(crate::journal_blob::REFS)?;let mut out=tx.open_table(TableDefinition::<&str,&[u8]>::new(&format!("{snapshot}_blobs")))?;for row in refs.iter()? {let(k,v)=row?;let(t,_):(String,String)=serde_json::from_str(k.value())?;if t==table {out.insert(k.value(),v.value())?;}}}
+        changes.push(crate::journal::ChangeKind::TableReset{table:table.into(),snapshot});Ok(())
+    }
+
+    /// Migration delta: preserve unaffected rows, publish each changed table once.
+    pub fn rewrite_tables(&self,writes:&[(String,String,Vec<u8>)],deletes:&[(String,String)])->Result<()> {
+        self.refuse_sealed(writes.iter().map(|r| r.0.as_str()))?;
+        self.rewrite_tables_with_blobs(writes,deletes,&[],&[])
+    }
+    pub(crate) fn rewrite_tables_with_blobs(&self,writes:&[(String,String,Vec<u8>)],deletes:&[(String,String)],blobs:&[(String,String,Vec<u8>)],copies:&[(String,String,DatabaseManager,String,String)])->Result<()> {
+        self.ensure_writable()?;
+        let mut prepared=Vec::new();for (t,k,v) in blobs {prepared.push((t,k,self.prepare_blob(t,k,v)?));}
+        for (table,key,source,source_table,source_key) in copies {prepared.push((table,key,self.prepare_copy_from(source,source_table,source_key,table,key)?));}
+        let tables=writes.iter().map(|r|r.0.as_str()).chain(deletes.iter().map(|r|r.0.as_str())).collect::<std::collections::BTreeSet<_>>();
+        for table in &tables {crate::journal::validate_table(table)?;}
+        let db=self.db()?;
+        crate::journal::write_with_sink(&db,self.journal_retention,&self.event_sink,|tx,changes| {
+            for (table,key) in deletes {tx.open_table(TableDefinition::<&str,&[u8]>::new(table))?.remove(key.as_str())?;if self.is_blob_table(table){crate::journal_blob::remove(tx,table,key,changes)?;}}
+            for (table,key,reference) in &prepared {crate::journal_blob::put(tx,table,key,reference,changes)?;}
+            for (table,key,value) in writes {tx.open_table(TableDefinition::<&str,&[u8]>::new(table))?.insert(key.as_str(),value.as_slice())?;}
+            for table in &tables {self.validate_blob_rows(tx,table,changes)?;Self::capture_reset(tx,table,changes)?;}Ok(())
+        })?;self.clear_cache();Ok(())
+    }
+
+    /// Write-Through: Write to both cache and DB. Raw bytes are refused for a table with
+    /// protected fields.
     /// Write-Through: Write to both cache and DB
     pub fn set<'db>(
         &self,
@@ -585,26 +736,26 @@ impl DatabaseManager {
         key: &str,
         value: Vec<u8>,
     ) -> Result<()> {
-        // Disk first (write-through), then cache.
-        {
-            let db = self.db()?;
-            let write_txn = db.begin_write()?;
-            {
-                let mut table_ref = write_txn.open_table(table)?;
-                if self.has_cache {
-                    table_ref.insert(key, value.as_slice())?;
-                } else {
-                    let mut slot = table_ref.insert_reserve(key, value.len())?;
-                    slot.as_mut().copy_from_slice(&value);
-                }
-            }
-            write_txn.commit()?;
-        }
+        self.refuse_sealed([table_name])?;
+        self.set_prepared(table, table_name, key, value)
+    }
 
-        if self.has_cache {
-            let cache_key = format!("{}:{}", table_name, key);
-            self.memory_cache.insert(cache_key, value.clone());
+    /// `set` for bytes that are already in their stored form.
+    pub(crate) fn set_prepared<'db>(
+        &self,
+        table: TableDefinition<'db, &str, &[u8]>,
+        table_name: &str,
+        key: &str,
+        value: Vec<u8>,
+    ) -> Result<()> {
+        if table.name()!=table_name {return Err(ClError::Validation("table name mismatch".into()))}
+        // The journal and the backup history each keep a copy of the row. The history copy is
+        // reserved for before the commit, so that refusing it leaves the database as it was.
+        if self.backup_manager.is_some() {
+            crate::memory::probe("backup.encode_record", value.len().saturating_mul(2).saturating_add(1024))?;
         }
+        let journal_copy=crate::memory::copy_bytes("write.single_row",&value)?;
+        self.apply_changes(&[(table_name.into(),key.into(),journal_copy)],&[])?;
 
         if let Some(ref bm) = self.backup_manager {
             bm.record_set(table, table_name, key, value)?;
@@ -752,33 +903,8 @@ impl DatabaseManager {
         table_name: &str,
         key: &str,
     ) -> Result<bool> {
-        let cache_key = format!("{}:{}", table_name, key);
-
-        let db = self.db()?;
-
-        // Check if exists
-        let read_txn = db.begin_read()?;
-        let table_ref = read_txn.open_table(table)?;
-        let found = table_ref.get(key)?.is_some();
-        drop(table_ref);
-        drop(read_txn);
-
-        if found {
-            // Step 1: Delete from database (L2)
-            let write_txn = db.begin_write()?;
-            {
-                let mut table_ref = write_txn.open_table(table)?;
-                table_ref.remove(key)?;
-            }
-            write_txn.commit()?;
-        }
-        // Released before the backup takes its own file.
-        drop(db);
-
-        // Step 2: Delete from cache (L1)
-        if self.has_cache {
-            self.memory_cache.invalidate(&cache_key);
-        }
+        if table.name()!=table_name {return Err(ClError::Validation("table name mismatch".into()))}
+        let found=self.apply_changes(&[],&[(table_name.into(),key.into())])?[0];
 
         if found {
             if let Some(ref bm) = self.backup_manager {
@@ -827,20 +953,7 @@ impl DatabaseManager {
 
                 if data.is_some() {
                     let data = data.clone().ok_or_else(|| ClError::OptionNone)?;
-                    // Primary DB
-                    let db = self.db()?;
-                    let write_txn = db.begin_write()?;
-                    {
-                        let mut table_ref = write_txn.open_table(table)?;
-                        if self.has_cache {
-                            table_ref.insert(key, data.as_slice())?;
-                        } else {
-                            let mut slot = table_ref.insert_reserve(key, data.len())?;
-                            slot.as_mut().copy_from_slice(&data);
-                        }
-                    }
-                    write_txn.commit()?;
-                    drop(db);
+                    self.apply_changes(&[(table_name.into(),key.into(),data.clone())],&[])?;
 
                     // Cache
                     if self.has_cache {
@@ -851,12 +964,7 @@ impl DatabaseManager {
 
                 // A Restore/RestoreBulk with no data represents an absent row.
                 if data.is_none() {
-                    {
-                        let db=self.db()?;
-                        let tx=db.begin_write()?;
-                        {tx.open_table(table)?.remove(key)?;}
-                        tx.commit()?;
-                    }
+                    self.apply_changes(&[],&[(table_name.into(),key.into())])?;
                     if self.has_cache {self.memory_cache.invalidate(&format!("{table_name}:{key}"));}
                 }
 
@@ -866,14 +974,7 @@ impl DatabaseManager {
 
             // Delete → Delete from Primary + Cache + log restore with None
             BackupOperation::Delete => {
-                {
-                    let db = self.db()?;
-                    let write_txn = db.begin_write()?;
-                    {
-                        write_txn.open_table(table)?.remove(key)?;
-                    }
-                    write_txn.commit()?;
-                }
+                self.apply_changes(&[],&[(table_name.into(),key.into())])?;
 
                 if self.has_cache {
                     let cache_key = format!("{}:{}", table_name, key);
@@ -959,6 +1060,7 @@ impl DatabaseManager {
     }
 
     pub fn set_bulk<'db>(&self, table_name: &str, entries: Vec<(String, u64)>) -> Result<String> {
+        self.ensure_writable()?;
         let bm = self
             .backup_manager
             .as_ref()
@@ -1000,37 +1102,10 @@ impl DatabaseManager {
 
         let results = bm.restore_bulk(table, table_name, bulk_id)?;
 
-        for (key, data) in results {
-            let db = self.db()?;
+        for (key,data) in results {
             match data {
-                Some(d) => {
-                    let write_txn = db.begin_write()?;
-                    {
-                        let mut table_ref = write_txn.open_table(table)?;
-                        if self.has_cache {
-                            table_ref.insert(key.as_str(), d.as_slice())?;
-                        } else {
-                            let mut slot = table_ref.insert_reserve(key.as_str(), d.len())?;
-                            slot.as_mut().copy_from_slice(&d);
-                        }
-                    }
-                    write_txn.commit()?;
-                    if self.has_cache {
-                        let cache_key = format!("{}:{}", table_name, key);
-                        self.memory_cache.insert(cache_key, d);
-                    }
-                }
-                None => {
-                    let write_txn = db.begin_write()?;
-                    {
-                        write_txn.open_table(table)?.remove(key.as_str())?;
-                    }
-                    write_txn.commit()?;
-                    if self.has_cache {
-                        let cache_key = format!("{}:{}", table_name, key);
-                        self.memory_cache.invalidate(&cache_key);
-                    }
-                }
+                Some(value)=>{self.apply_changes(&[(table_name.into(),key,value)],&[])?;},
+                None=>{self.apply_changes(&[],&[(table_name.into(),key)])?;}
             }
         }
 
@@ -1099,6 +1174,8 @@ impl Dir {
 pub struct Repository<T: DeserializeOwned + Serialize + Clone + 'static> {
     pub table: &'static str,
     pub database_manager: DatabaseManager,
+    /// Set for an entity registered with `register_sealed`.
+    pub(crate) sealed: Option<Arc<crate::field_crypto::SealedHooks<T>>>,
     _marker: std::marker::PhantomData<T>,
 }
 
@@ -1107,7 +1184,41 @@ impl<T: DeserializeOwned + Serialize + Clone + Entity> Repository<T> {
         Self {
             table,
             database_manager,
+            sealed: None,
             _marker: std::marker::PhantomData,
+        }
+    }
+
+    pub(crate) fn new_sealed(
+        table: &'static str,
+        database_manager: DatabaseManager,
+        sealed: Arc<crate::field_crypto::SealedHooks<T>>,
+    ) -> Self {
+        Self { sealed: Some(sealed), ..Self::new(table, database_manager) }
+    }
+
+    /// The stored bytes of `value` as row `id`: the plain JSON, or, for an entity with protected
+    /// fields, the JSON with each protected field sealed.
+    fn encode(&self, id: &str, value: &T) -> Result<Vec<u8>> {
+        match &self.sealed {
+            Some(hooks) => hooks.encode(id, value),
+            None => Ok(serde_json::to_vec(value)?),
+        }
+    }
+
+    /// The entity of stored row `id`. Protected fields stay closed and are tied to this row.
+    fn decode(&self, id: &str, bytes: &[u8]) -> Result<T> {
+        let mut value: T = serde_json::from_slice(bytes)?;
+        if let Some(hooks) = &self.sealed {
+            hooks.bind(id, &mut value);
+        }
+        Ok(value)
+    }
+
+    /// Ties the protected fields of an entity built from a stored record of row `id` to that row.
+    pub(crate) fn bind_entity(&self, id: &str, value: &mut T) {
+        if let Some(hooks) = &self.sealed {
+            hooks.bind(id, value);
         }
     }
 
@@ -1115,7 +1226,7 @@ impl<T: DeserializeOwned + Serialize + Clone + Entity> Repository<T> {
         let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(self.table);
         let data = self.database_manager.get(table, self.table, id)?;
         if let Some(data) = data {
-            let value: T = serde_json::from_slice(&data)?;
+            let value = self.decode(id, &data)?;
             Ok(value)
         } else {
             Err(ClError::NotFound(format!("{} not found", self.table)).into())
@@ -1132,7 +1243,7 @@ impl<T: DeserializeOwned + Serialize + Clone + Entity> Repository<T> {
         let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(self.table);
         let data = self.database_manager.get_uncached(table, id)?;
         if let Some(data) = data {
-            let value: T = serde_json::from_slice(&data)?;
+            let value = self.decode(id, &data)?;
             Ok(value)
         } else {
             Err(ClError::NotFound(format!("{} not found", self.table)).into())
@@ -1181,10 +1292,10 @@ impl<T: DeserializeOwned + Serialize + Clone + Entity> Repository<T> {
         let db = self.database_manager.db()?;
         let read_txn = db.begin_read()?;
         let table_ref = read_txn.open_table(table)?;
-        let mut out = Vec::with_capacity(usize::try_from(table_ref.len()?).unwrap_or(0));
+        let mut out = crate::memory::vec_with_capacity("repository.list_rows", usize::try_from(table_ref.len()?).unwrap_or(0))?;
         for row in table_ref.iter()? {
-            let (_key, value) = row?;
-            out.push(map(serde_json::from_slice::<T>(value.value())?));
+            let (key, value) = row?;
+            crate::memory::push("repository.list_rows", &mut out, map(self.decode(key.value(), value.value())?))?;
         }
         Ok(out)
     }
@@ -1209,9 +1320,23 @@ impl<T: DeserializeOwned + Serialize + Clone + Entity> Repository<T> {
 
     pub fn set(&self, id: &str, value: &T) -> Result<()> {
         let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(self.table);
-        let data = serde_json::to_vec(value)?;
-        self.database_manager.set(table, self.table, id, data)?;
+        let data = self.encode(id, value)?;
+        self.database_manager.set_prepared(table, self.table, id, data)?;
         Ok(())
+    }
+
+    /// Writes several entities (and deletes several rows) of this table in bounded transactions.
+    /// Each entity is encoded as `set` does, so protected fields are sealed. This is the way to
+    /// write in batches to a table that has protected fields: the raw batch calls refuse it.
+    pub fn commit_entities(&self, writes: &[(&str, &T)], deletes: &[&str]) -> Result<()> {
+        let mut rows = Vec::with_capacity(writes.len());
+        for (id, value) in writes {
+            let bytes = self.encode(id, value)?;
+            rows.push((self.table.to_string(), (*id).to_string(), bytes));
+        }
+        let removed: Vec<(String, String)> =
+            deletes.iter().map(|id| (self.table.to_string(), (*id).to_string())).collect();
+        self.database_manager.commit_batch_prepared(&rows, &removed)
     }
 
     pub fn set_bulk(&self, entries: Vec<(String, u64)>) -> Result<String> {
@@ -1219,9 +1344,6 @@ impl<T: DeserializeOwned + Serialize + Clone + Entity> Repository<T> {
     }
 
     pub fn delete(&self, id: &str) -> Result<()> {
-        if self.database_manager.is_blob_table(self.table) {
-            let _ = self.database_manager.delete_blob(self.table, id);
-        }
         let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(self.table);
         self.database_manager.delete(table, self.table, id)?;
         Ok(())
@@ -1234,14 +1356,19 @@ impl<T: DeserializeOwned + Serialize + Clone + Entity> Repository<T> {
                 self.table
             )));
         }
-        let mut meta_json = serde_json::to_value(meta)?;
+        // A row with protected fields is sealed first; the size is then added next to them.
+        let mut meta_json: serde_json::Value = if self.database_manager.sealed_tables.contains(self.table) {
+            serde_json::from_slice(&self.encode(id, meta)?)?
+        } else {
+            serde_json::to_value(meta)?
+        };
         if let serde_json::Value::Object(ref mut obj) = meta_json {
             obj.insert("size_bytes".to_string(), serde_json::json!(blob.len()));
         }
         let data = serde_json::to_vec(&meta_json)?;
         let table: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(self.table);
-        self.database_manager.set(table, self.table, id, data)?;
-        self.database_manager.write_blob(self.table, id, blob)?;
+        self.database_manager.publish_blob(self.table,id,blob,Some(data.clone()))?;
+        if let Some(ref bm)=self.database_manager.backup_manager {bm.record_set(table,self.table,id,data)?;}
         Ok(())
     }
 
@@ -1249,7 +1376,7 @@ impl<T: DeserializeOwned + Serialize + Clone + Entity> Repository<T> {
         self.set_with_blob(meta.entity_id(), meta, blob)
     }
 
-    pub fn open_blob(&self, id: &str) -> Result<File> {
+    pub fn open_blob(&self, id: &str) -> Result<BlobReader> {
         if !self.database_manager.is_blob_table(self.table) {
             return Err(ClError::Validation(format!(
                 "table '{}' is not registered as blob sidecar",

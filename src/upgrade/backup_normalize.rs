@@ -2,7 +2,7 @@
 use crate::{
     backup::codec,
     durability::DurabilityMode,
-    handle::{FileOpen, RedbOptions},
+    handle::{DbOrRo, FileOpen, RedbOptions},
     metadata::inspect::upgrading_path,
     units::{ClError, Result},
 };
@@ -25,7 +25,7 @@ pub fn eager_normalize(
     registered_tables: &[String],
     has_cache: bool,
     durability: DurabilityMode,
-    redb: RedbOptions,
+    redb: &RedbOptions,
 ) -> Result<BackupNormalizeResult> {
     let mut result = BackupNormalizeResult {
         upgraded: false,
@@ -180,16 +180,16 @@ fn table_names(db: &impl ReadableDatabase) -> Result<Vec<String>> {
         .collect())
 }
 fn format_open_read_only(
-    redb: RedbOptions,
+    redb: &RedbOptions,
     path: &Path,
     opens: &mut Vec<FileOpen>,
-) -> Result<redb::ReadOnlyDatabase> {
-    let (db, opened) = redb.open_read_only_timed(path);
+) -> Result<DbOrRo> {
+    let (db, opened) = redb.open_read_only_timed(path, "bak");
     opens.push(opened);
     db
 }
-fn format_open(redb: RedbOptions, path: &Path, opens: &mut Vec<FileOpen>) -> Result<Database> {
-    let (db, mut opened) = redb.open_timed(path, false)?;
+fn format_open(redb: &RedbOptions, path: &Path, opens: &mut Vec<FileOpen>) -> Result<Database> {
+    let (db, mut opened) = redb.open_timed(path, false, "bak")?;
     opened.format_check = true;
     opens.push(opened);
     Ok(db)
@@ -200,13 +200,13 @@ fn write_batch(
     batch: &[(String, Vec<u8>)],
     has_cache: bool,
     durability: DurabilityMode,
-    redb: RedbOptions,
+    redb: &RedbOptions,
 ) -> Result<()> {
     let mut tx = db.begin_write()?;
     if durability.is_strict() {
         tx.set_durability(redb::Durability::Immediate)?;
     }
-    if redb.quick_repair {
+    if redb.quick_repair || redb.encryption.is_some() {
         tx.set_quick_repair(true);
     }
     {
@@ -321,7 +321,7 @@ pub(crate) mod fault {
             &[(key, codec::encode_record(&record)?)],
             true,
             DurabilityMode::Strict,
-            RedbOptions::default(),
+            &RedbOptions::default(),
         )
     }
 }

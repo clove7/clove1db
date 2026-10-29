@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::Path;
 
@@ -159,7 +159,7 @@ pub fn upgrade_legacy_migration_index(
         write_atomic_json(&table_dir.join("index.json"), chain, durability)?;
     }
 
-    let mut summaries = HashMap::new();
+    let mut summaries = BTreeMap::new();
     for table in registered_tables {
         let chain = table_chains.get(table).unwrap();
         summaries.insert(

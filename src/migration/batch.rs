@@ -8,6 +8,7 @@ pub struct MigrationBatch {
     writes: HashMap<String, Vec<(String, Vec<u8>)>>,
     blob_writes: Vec<(String, String, Vec<u8>)>,
     deletes: Vec<(String, String)>,
+    blob_copies:Vec<(String,String,DatabaseManager,String,String)>,
 }
 
 impl MigrationBatch {
@@ -30,6 +31,8 @@ impl MigrationBatch {
         self.blob_writes.push((table.into(), key.into(), data));
     }
 
+    pub(crate) fn stage_blob_copy(&mut self,table:&str,key:String,source:DatabaseManager,source_table:&str,source_key:String) {self.blob_copies.push((table.into(),key,source,source_table.into(),source_key));}
+
     pub fn write_count(&self) -> usize {
         self.writes.values().map(|v| v.len()).sum()
     }
@@ -45,16 +48,14 @@ impl MigrationBatch {
                 flat_writes.push((table.clone(), key.clone(), value.clone()));
             }
         }
-        db.commit_batch(&flat_writes, &self.deletes)?;
-        for (table, key, data) in &self.blob_writes {
-            db.write_blob(table, key, data)?;
-        }
+        db.rewrite_tables_with_blobs(&flat_writes,&self.deletes,&self.blob_writes,&self.blob_copies)?;
         Ok(())
     }
 
     pub fn clear(&mut self) {
         self.writes.clear();
         self.blob_writes.clear();
+        self.blob_copies.clear();
         self.deletes.clear();
     }
 }

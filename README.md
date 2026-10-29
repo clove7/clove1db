@@ -1,201 +1,64 @@
 # clove1db
 
-An embedded database framework for Rust, built on [redb](https://github.com/cberner/redb).
+An embedded database for Rust applications, built on [redb](https://github.com/cberner/redb).
 
-redb gives you an ordered map of bytes to bytes. clove1db is the layer most applications end up writing on top of that: typed entities with DTOs at the edges, a cache with a memory budget you can state, a history of every write so any row can be restored to any earlier version, schema migrations per table, and durability settings that survive a crash mid-commit.
+redb is an ordered map of bytes to bytes in one file. clove1db is the layer an application builds on top of that, done once and tested hard:
 
-Everything lives in `.cldb` files next to your binary. No server, no daemon, no connection string.
+- **typed entities** with input and output DTOs at the edges;
+- **queries** on typed fields, with **indexes the optimizer builds by itself**;
+- a **history** of every write, so any row can be read or restored as it was;
+- a **change log** that other programs follow, with acknowledgements that survive restarts;
+- **attachments** stored as files beside the database and read as streams;
+- **encryption** of the whole database, or of single fields, under keys you hold;
+- **migrations** of a table's shape, of an older file, of a foreign redb file, and of the protection itself;
+- **durability** you can state: what survives a crash, and what a crash costs the next open.
+
+Everything lives in files next to your program: `.cldb` for the data, `.cldb.bak` for the history, `.inx` for the indexes. No server, no daemon, no connection string.
 
 ```toml
 [dependencies]
-clove1db = "0.0.126"
+clove1db = "0.1.0"
 ```
 
-> **Work in progress.** The API and internals are still evolving, and versions before 1.0 may break. Contributions, issue reports and real-world feedback are all welcome — see [Contributing](#contributing).
+> **Before 1.0.** The API can still change between minor versions. Every change that breaks code or files is listed in [Upgrading](#upgrading). Issues and feedback are welcome.
 
-## Features
+## Contents
 
-- 🗄️ **Embedded Storage**: Built on [redb](https://github.com/cberner/redb) — no external server needed
-- ⚡ **Budgeted Cache**: In-memory cache via [moka](https://github.com/moka-rs/moka), sized in **bytes** with TTL and idle expiry — plus uncached reads for bulk scans
-- 🔁 **Versioned Backup**: Every write/delete is recorded — restore any entity to any previous version
-- 📦 **Bulk Operations**: Update and restore multiple entities at once with a single `bulk_id`
-- 🧩 **Domain-Driven**: Clean separation via `Entity`, `InputDto`, `OutputDto`, `Repository`, `Domain`
-- 🗂️ **Multi-Database**: Multiple isolated `.cldb` files in a single `Storage` instance
-- 🔄 **Migrations**: In-place evolve, cross-DB transfer, external redb import, per-table migration chains
-- 🏷️ **Metadata & Auto-Upgrade**: `_clove_meta` inside `.cldb`, automatic upgrade from legacy eras on `build()`
-- 🔍 **Inspect**: Classify `.cldb` files (`Legacy042`, `Clove049`, `Authenticated`, `ExternalRedb`, …) without opening `Storage`
-- 🛡️ **Durability**: Default `DurabilityMode::Strict` — atomic sidecar writes (tmp→rename), `fsync` in Strict, `redb::Durability::Immediate`, corrupt migration-index recovery, chunked commit batches
-- 🔌 **Open, close & recover**: each file opened once per `build()`, an explicit `Storage::close()`, a cap on redb's page cache, quick repair after a kill or crash, and a per-file open report
+- [Quick start](#quick-start)
+- [Storage, databases and tables](#storage-databases-and-tables)
+- [Queries](#queries)
+- [Automatic indexes](#automatic-indexes)
+- [History, restore and bulk changes](#history-restore-and-bulk-changes)
+- [Raw batches](#raw-batches)
+- [The change log](#the-change-log)
+- [Attachments](#attachments)
+- [Memory: the cache and large tables](#memory-the-cache-and-large-tables)
+- [Durability and recovery](#durability-and-recovery)
+- [Encrypting the whole database](#encrypting-the-whole-database)
+- [Protected fields](#protected-fields)
+- [Changing how a database is protected](#changing-how-a-database-is-protected)
+- [Schema migrations and older files](#schema-migrations-and-older-files)
+- [Importing from a foreign redb file](#importing-from-a-foreign-redb-file)
+- [Events](#events)
+- [What it costs](#what-it-costs)
+- [Limits](#limits)
+- [Examples](#examples)
+- [Upgrading](#upgrading)
+- [Contributing](#contributing)
+- [License](#license)
 
-## Upgrading to 0.0.126
-
-**The first `build()` converts existing `.cldb.bak` history to `json_wrapped_v2`.**
-The primary `.cldb` data format is unchanged. After conversion, older releases
-(including 0.0.119) cannot read the new backup records.
-
-- **Smaller history records.** Valid JSON is embedded byte-for-byte in `doc`,
-  preserving key order, numbers, escapes and whitespace. Other bytes use
-  `data_b64`; deletes have no payload. The old numeric-array `data` field is
-  never written in v2. `BackupRecord.data` in memory remains `Option<Vec<u8>>`.
-- **All previous formats are readable:** raw values, legacy JSON wrappers and
-  `json_wrapped_v1`. Conversion uses one sibling `.upgrading` copy, compares
-  every record's metadata and exact payload bytes, checks table counts and
-  version/bulk metadata, compacts the converted file, then replaces the original.
-  A failed conversion removes its copy, records the reason in
-  `_clove_meta.upgrade_log`, and retries on the next build; existing formats
-  remain readable. The source is inspected read-only; an unclean backup is
-  repaired on the byte-checked copy, with a pre-conversion MVCC snapshot for
-  verification. Ordinary redb writers
-  can still update internal allocator metadata when opened and closed.
-- **Dates stay honest.** Dated records keep their original date and timestamp.
-  Undated raw values get the conversion time once, with
-  `date_from_migration: true`; subsequent reads keep that time and flag.
-- **Unreadable records are reported.** History returns an error with the number
-  and context of unreadable records, rather than an incomplete success. Table
-  renames decode every format and move history, counters and bulk metadata in
-  one transaction; invalid records or target collisions abort the rename.
-- **One commit per new history record.** Its version counter and record are
-  written together; a failed write cannot leave a version with no record.
-- **`DatabaseManager::commit_batch_atomic`** commits every write and delete in
-  one transaction, even above 512 entries. The existing `commit_batch` remains
-  chunked. Neither raw batch API creates backup history.
-- **`OpenReport::format_check`** identifies every one-time format inspection or
-  temporary conversion file open, including size, elapsed open time and repair.
-  Once the v2 marker is recorded, subsequent builds do not copy or recheck it.
-
-Public record/view structs now include `date_from_migration`, and `OpenReport`
-includes `format_check`; code constructing these structs directly must supply
-the new fields. Untagged historical raw objects and wrappers share JSON shapes;
-objects matching the historical metadata signature are interpreted as wrappers.
-Invalid recognized wrappers are reported instead of silently discarded.
-
-`examples/14_backup_v2_and_atomic_batches` generates 200 synthetic notes with
-five versions each. Windows, release, 1,000 history records preserved:
-
-| Measurement | v1 | v2 after compact |
-|---|---:|---:|
-| Primary file, bytes | 1,056,768 | 897,024 |
-| Backup file, bytes | 18,747,392 | 4,206,592 |
-| Stored history value bytes | 8,652,350 | 2,519,450 |
-| Numeric-array payload bytes | 8,485,350 (98.07%) | 0 |
-| redb allocated pages | 4,024 | 1,026 |
-| Unused file page capacity | 553 | 1 |
-
-The backup shrank **77.56%**; the conversion build took **262 ms** on this run.
-The first build costs this work once. Timings and allocation depend on the
-machine. Unused capacity includes header/allocator overhead; redb does not
-expose an exact free-page counter through its public API. Primary file sizes
-can change when redb updates allocator metadata; the stored data format does
-not change. The demo also checks legacy payloads, dates, schema replay, renames,
-first/second-build reports and interrupted 1,000-entry batches.
-
-## Durability
-
-By default clove1db runs in **Strict** mode:
-
-- Sidecar files (`*.migration/**/index.json`, layouts, manifests, blobs) are always written via atomic tmp→rename (both Strict and Fast), so a crash never leaves a final path half-filled with NULs.
-- **Strict** also `sync_all`s sidecar files and sets `redb::Durability::Immediate` on commits (independent of cache).
-- **Fast** skips fsync / Immediate for throughput; still atomic.
-- Corrupt / zeroed migration indexes are quarantined and rebuilt on open (not a fatal `Serialization` panic).
-- Large `commit_batch` calls are split by `max_commit_batch_entries` (default 512): all write chunks precede delete chunks, and a failure can leave a committed prefix. Use `commit_batch_atomic(writes, deletes)` for one transaction regardless of size. Both update cache only after their commits and neither raw API creates backup history.
+## Quick start
 
 ```rust
-use clove1db::{storage::{DatabaseConfig, Storage, StorageConfig}, DurabilityMode};
-
-// Default: Strict for every database
-Storage::builder(StorageConfig::default())
-    .add_database(DatabaseConfig::new("app_db", "app").register::<User>("users"))
-    .build()?;
-
-// Whole storage on Fast
-Storage::builder(StorageConfig::default().durability(DurabilityMode::Fast))
-    ...
-
-// One database Fast, others Strict
-Storage::builder(StorageConfig::default())
-    .add_database(DatabaseConfig::new("hot", "hot").durability(DurabilityMode::Fast).register::<User>("users"))
-    .add_database(DatabaseConfig::new("cold", "cold").register::<User>("users"))
-    .build()?;
-```
-
-**Guarantees:** crash-consistent sidecar files; last successfully committed redb transaction survives Strict flush; open succeeds after NUL index corruption.  
-**Not guaranteed:** uncommitted in-flight work after sudden power loss; absolute immunity without UPS/hardware.
-
-Extreme crash / pressure scenarios: `examples/10_crash_durability` (`cargo run --manifest-path examples/10_crash_durability/Cargo.toml`).
-
-## Open, close & recover
-
-`Durability` above is about a commit surviving. This is about the *file*: what
-opening it costs, what an unclean exit costs the next open, and what redb keeps
-in memory in between. `examples/12_open_close_repair` measures all of it.
-
-- **`storage.close()`** — call it once, on the way out. It waits for operations
-  already running, then closes every file cleanly, so the next open needs no
-  repair. Any clone used afterwards gets `ClError::Closed`. It matters most for
-  a `Storage` kept in a `static`, which is never dropped: without `close()`,
-  even a clean shutdown leaves every file to be repaired.
-- **`.quick_repair(true)`** — for what `close()` cannot cover: a kill, a crash,
-  a power cut. Every commit saves redb's allocator state, so the next open
-  loads it instead of walking the whole file. Costs each commit more; worth it
-  for large files on machines that get killed.
-- **`.redb_cache_bytes(n)`** — redb's own page cache, per file, underneath
-  `cache_bytes` (which holds decoded rows). The default is 1 GiB per file, and
-  pages a scan reads stay resident up to that.
-
-```rust
-DatabaseConfig::new("logs_db", "logs")
-    .redb_cache_bytes(64 * 1024 * 1024)   // 64 MiB of redb pages per file
-    .quick_repair(true)
-    .register::<Event>("events");
-
-// on shutdown, after the last request
-storage.close();
-```
-
-`build()` opens the primary once — inspect, upgrade and serve share one handle.
-A backup undergoing its one-time format conversion also has inspection and
-temporary-copy opens; once marked v2, it is opened only to serve it.
-
-**`storage.open_report()`** says how each of those opens went — one line per
-`.cldb`, then its served `.cldb.bak` and any format-check opens, sorted by database:
-
-```rust
-for r in storage.open_report() {
-    println!(
-        "{} {} bytes={} ms={:.1} repaired={} format_check={}",
-        r.database,
-        r.path.display(),
-        r.bytes,
-        r.open_time.as_secs_f64() * 1000.0,
-        r.repaired,
-        r.format_check,
-    );
-}
-```
-
-`repaired` means redb walked the whole file to rebuild its allocator state: the
-last process to write it neither closed it nor had `quick_repair` on. A brand
-new file is never reported as repaired. The report is recorded on every
-`build()` at the cost of a clock read and a file-size lookup per file; nothing
-reads or prints it unless you do. One-time backup inspection and conversion-copy opens have `format_check=true`
-and are included in the same report. Ongoing primary/backup handles have
-`format_check=false`. `open_time` measures each redb open; the conversion build's
-total duration is measured separately in example 14.
-
-## Quick Start
-
-Register tables with `.register::<YourEntity>("table_name")` — no global `schema_name` required.
-
-```rust
-use serde::{Deserialize, Serialize};
 use clove1db::{
     dto::{InputDto, OutputDto},
     entity::Entity,
     storage::{DatabaseConfig, Storage, StorageConfig},
-    units::Result,
+    units::{ClError, Result},
 };
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct User {
     id: String,
     name: String,
@@ -205,318 +68,473 @@ impl Entity for User {
     fn entity_id(&self) -> &str { &self.id }
 }
 
+/// What a caller may send. Checked before anything is written.
 #[derive(Deserialize)]
-struct CreateUserDto { name: String }
+struct NewUser { id: String, name: String }
 
-impl InputDto<User> for CreateUserDto {
+impl InputDto<User> for NewUser {
+    fn validate(&self) -> Result<()> {
+        if self.name.trim().is_empty() {
+            return Err(ClError::Validation("name is required".into()));
+        }
+        Ok(())
+    }
     fn into_entity(self) -> Result<User> {
-        let id = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-            .to_string();
-        Ok(User { id, name: self.name })
+        Ok(User { id: self.id, name: self.name })
     }
 }
 
+/// What a caller gets back.
 #[derive(Serialize)]
-struct UserResponse { id: String, name: String }
+struct UserView { id: String, name: String }
 
-impl OutputDto<User> for UserResponse {
-    fn from_entity(e: User) -> Self {
-        Self { id: e.id, name: e.name }
-    }
+impl OutputDto<User> for UserView {
+    fn from_entity(e: User) -> Self { Self { id: e.id, name: e.name } }
 }
 
 fn main() -> Result<()> {
     let storage = Storage::builder(StorageConfig::default())
-        .add_database(
-            DatabaseConfig::new("users_db", "users")
-                .backup_enabled(true)
-                .cache_bytes(32 * 1024 * 1024, 300, 60)
-                .register::<User>("users"),
-        )
+        .add_database(DatabaseConfig::new("accounts", "accounts").register::<User>("users"))
         .build()?;
 
-    let domain = storage.domain::<User>();
-    let user = domain.create::<CreateUserDto, UserResponse>(CreateUserDto {
-        name: "Alice".into(),
-    })?;
-    let _found = domain.get::<UserResponse>(&user.id)?;
-    domain.delete(&user.id)?;
+    let users = storage.domain::<User>();
+    users.create::<NewUser, UserView>(NewUser { id: "u1".into(), name: "Alice".into() })?;
+    let alice = users.get::<UserView>("u1")?;
+    users.delete(&alice.id)?;
+
+    storage.close(); // on the way out: the next open needs no repair
     Ok(())
 }
 ```
 
-### Cache budget
+## Storage, databases and tables
 
-`cache_bytes(max_bytes, ttl_secs, idle_secs)` sizes the in-memory cache in
-**bytes**, not entries.
-
-An entry count cannot bound memory: the cached value is whatever you stored, so
-`10_000` entries is ten thousand times a number the cache does not know: rows
-of 10 KB each make a "10,000 entry" cache 100 MiB. `examples/11_cache_memory_budget` measures this —
-the same 2,000 entries come to 2 MiB or 125 MiB depending only on the row.
-
-Three things are worth knowing:
-
-- **`get_uncached()`** reads a key without reading or writing the cache. Use it
-  when walking many keys once — a range scan, a report, an export — so the walk
-  does not spend the whole budget on rows it will never read again.
-- **Expiry is not reclamation.** `ttl_secs` and `idle_secs` decide when an entry
-  *expires*; `moka` frees it during maintenance, and maintenance runs when the
-  cache is used. A database nobody reads keeps expired entries resident, hours
-  past their TTL. Call `storage.run_cache_maintenance()` from an
-  idle tick when "expired" should mean "gone".
-- **`cache_stats()`** returns `(bytes, entries)`, per database or for the whole
-  `Storage`, so the budget can be checked instead of assumed.
+A `Storage` holds one or more **databases**. Each database is a `.cldb` file with its own tables, cache, history and settings. A table is registered with the entity it stores:
 
 ```rust
-DatabaseConfig::new("logs_db", "logs")
-    .cache_bytes(8 * 1024 * 1024, 300, 60)   // 8 MiB, 5 min TTL
-    .register::<Event>("events");
-
-// walking a range: do not fill the cache with rows read once
-let row: Event = storage.domain::<Event>().get_uncached(&id)?;
-
-storage.run_cache_maintenance();
-let (bytes, entries) = storage.cache_stats();
-```
-
-## Schema & Migrations
-
-Each registered table has its own version chain:
-
-| Concept | Meaning |
-|---------|---------|
-| `schema_id` | Table name (e.g. `"products"`) |
-| `schema_version` | `u32` per table (`1`, `2`, `3`, …) |
-| Entity JSON | Fields only in primary `.cldb` — version lives in `_clove_meta` and migration files |
-
-On-disk migration layout:
-
-```
-{db}.migration/
-  index.json
-  tables/
-    products/
-      index.json
-      layouts/v1.json
-      mig-*/manifest.json
-      mig-*/refs/
-```
-
-### Migration kinds (resolved automatically)
-
-| Kind | When | `delete_source` |
-|------|------|-----------------|
-| **InPlaceEvolve** | `.from_db(d, t)` only, or same `db` + `table` | Ignored |
-| **DataTransfer** | Different `db` and/or `table` | Honoured |
-| **ExternalImport** | `.from_external(...)` | Ignored |
-
-Typed migrations use `MigrateTo` + `storage.migrate::<From, To>()`. Migration steps are keyed automatically by `layout_hash` pairs stored in each manifest (`from_layout_hash` / `to_layout_hash`).
-
-Each `migrate_json` / `migrate_blob` call returns `Result<MigrateOutcome<T>>`:
-
-| Outcome | Meaning |
-|---------|---------|
-| `MigrateOutcome::Migrate(value)` | Write the transformed row |
-| `MigrateOutcome::Skip(reason)` | Omit this source row and continue (recorded in `MigrationReport::source_skipped`) |
-| `Err(...)` | Hard failure — stops the migration run |
-
-`TargetConflictPolicy::Skip` is separate: it skips rows whose **key already exists in the target table**, not rows you reject inside the transform.
-
-> **Breaking in 0.0.84:** `migrate_json` / `migrate_blob` now return `Result<MigrateOutcome<T>>` instead of `Result<T>`. Wrap successful values with `MigrateOutcome::Migrate(...)` or use the `migrate_value` / `skip_record` helpers.
-
-```rust
-use std::path::PathBuf;
-use clove1db::migration::{
-    migrate_value, skip_record, ExternalFrom, KeyDecoder, MigrateOutcome, MigrateTo,
-    MigrationTo, TargetConflictPolicy, ValueDecoder,
-};
-use serde_json::Value;
-
-// 1) Implement the transform once
-impl MigrateTo<ProductV2> for ProductV1 {
-    fn migrate_json(value: Value) -> clove1db::units::Result<MigrateOutcome<Value>> {
-        let v1: ProductV1 = serde_json::from_value(value)?;
-        if v1.name.is_empty() {
-            return skip_record("empty name");
-        }
-        migrate_value(ProductV2 {
-            id: v1.id,
-            name: v1.name,
-            sku: "SKU-default".into(),
-            price_cents: 0,
-        })
-    }
-}
-
-// 2) In-place schema evolve (same db + table)
-storage.migrate::<ProductV1, ProductV2>()
-    .from_db("catalog", "products")
-    .execute()?;
-
-// 3) Cross-database move
-storage.migrate::<ProductV1, ProductV2>()
-    .from_db("warehouse", "products")
-    .to(MigrationTo::new("shop").table("products").delete_source(true))
-    .on_target_conflict(TargetConflictPolicy::Fail)
-    .execute()?;
-
-// 4) External redb → clove1db (VendorRow matches vendor JSON)
-storage.migrate::<VendorRow, ProductV2>()
-    .from_external(ExternalFrom {
-        path: PathBuf::from("./vendor.redb"),
-        table: "vendor_catalog".into(),
-        key_decoder: KeyDecoder::Utf8String,
-        value_decoder: ValueDecoder::JsonValidate,
-    })
-    .to(MigrationTo::new("shop").table("products"))
-    .execute()?;
-
-// Optional: warm registry at build for backup history replay without running migrate
-Storage::builder(config)
-    .migration_step::<ProductV1, ProductV2>()
-    .add_database(/* ... */)
-    .build()?;
-```
-
-### External redb key/value layouts
-
-| `KeyDecoder` | `ValueDecoder` | Typical source |
-|--------------|----------------|----------------|
-| `Utf8String` | `JsonValidate` | UTF-8 keys, JSON bytes (`&[u8]`) |
-| `U64AsString` | `JsonValidate` | `u64` keys, JSON bytes |
-| `U64AsString` | `JsonString` | `u64` keys, JSON stored as redb `String` |
-
-Use `list_external_tables(path)` and `read_external_table(path, &spec)` to probe a foreign `.redb` before importing.
-
-## Backup & Versioning
-
-Every history version is kept forever. In `json_wrapped_v2`, JSON payloads are
-stored verbatim in `doc`, non-JSON bytes in `data_b64`, and deletes contain no
-payload. Reads and restores receive the original bytes in `BackupRecord.data`.
-An undated raw record converted from an older file has a fixed conversion time
-and `date_from_migration=true`, also exposed by history views.
-Version allocation and each new history record share one redb transaction.
-Raw `commit_batch` and `commit_batch_atomic` are outside this history mechanism.
-
-
-```rust
-use redb::TableDefinition;
-use clove1db::{backup::view::HistoryDisplayMode, units::Result};
-
-fn demo(storage: &clove1db::storage::Storage, id: &str) -> Result<()> {
-    let domain = storage.domain::<User>();
-    let bm = storage.db_manager("users_db").backup_manager.as_ref().unwrap();
-
-    let history = bm.history(TableDefinition::new("users"), id)?;
-    let _at_v2 = bm.view_by_version(TableDefinition::new("users"), id, 2)?;
-    domain.restore_by_version(id, 1)?;
-
-    // Domain API with normalized history (applies migration chain)
-    let _record = domain.get_by_version_with_mode(id, 1, HistoryDisplayMode::Normalized)?;
-    Ok(())
-}
-```
-
-## Bulk Operations
-
-```rust
-let domain = storage.domain::<User>();
-let payload = vec![
-    ("id-1".into(), CreateUserDto { name: "Alice".into() }),
-    ("id-2".into(), CreateUserDto { name: "Bob".into() }),
-];
-let (_updated, bulk_id) = domain.update_bulk::<CreateUserDto, UserResponse>(payload)?;
-domain.restore_bulk(&bulk_id)?;
-```
-
-## Multi-Database
-
-```rust
-use std::path::PathBuf;
-use clove1db::storage::{DatabaseConfig, Storage, StorageConfig};
-
 let storage = Storage::builder(StorageConfig::default())
     .add_database(
-        DatabaseConfig::new("users_db", "users")
+        DatabaseConfig::new("accounts", "accounts")      // name, file name
+            .dir_path("./data".into())
+            .cache_bytes(8 * 1024 * 1024, 300, 60)       // 8 MiB, 5 min TTL, 1 min idle
+            .backup_enabled(true)                        // keep a history of every write
             .register::<User>("users"),
     )
     .add_database(
-        DatabaseConfig::new("inventory_db", "catalog")
-            .dir_path(PathBuf::from("./data"))
-            .backup_enabled(true)
-            .register::<Product>("products"),
+        DatabaseConfig::new("shop", "shop")
+            .register::<Order>("orders")
+            .register::<Setting>("settings"),
     )
     .build()?;
 ```
 
-## Metadata, Inspect & Auto-Upgrade
+- **`storage.domain::<E>()`** works through DTOs: `create`, `get`, `list`, `update`, `delete`, and the history calls below. `update(id, dto)` stores the whole entity the DTO builds.
+- **`domain.repo()`** works on entities directly: `get`, `set`, `delete`, `list`, `list_map`, `get_uncached`, `get_uncached_as`, `commit_entities`. To change one field and keep the others, read the row, change it and `set` it.
+- **`storage.db_manager(name)`** is the database itself: raw batches, the change log, snapshots, statistics.
+- An entity's id is whatever `entity_id()` returns. A key can be a natural one (a setting's name): writing it twice updates one row.
+- Tables whose names begin with `__` are reserved for the library.
 
-On `Storage::build()`, clove1db automatically:
+## Queries
 
-1. Classifies the `.cldb` era (`Legacy042`, `Clove049`, or current)
-2. Writes or updates `_clove_meta` (per-table `schema_id` / `schema_version`)
-3. Ensures `{db}.migration/tables/{table}/` matches registered layouts
-4. Upgrades legacy v0.0.49 single-root migration indexes to per-table chains
-5. Converts all previous `.cldb.bak` record formats to `json_wrapped_v2` on one verified, compacted copy before table migrations; records the v2 marker only after success
-
-Inspect without opening `Storage`:
+`#[derive(CloveFields)]` gives every field a typed handle (`Note::score`, `Note::title`, ...). A query runs against one snapshot of the database, without the entity cache:
 
 ```rust
-use clove1db::{inspect_cldb, FileKind};
+use clove1db::{CloveFields, query::{Asc, Desc}};
 
-let report = inspect_cldb("./data/shop/shop.cldb")?;
-match report.kind {
-    FileKind::New => { /* empty / missing */ }
-    FileKind::Legacy042 => { /* pre-metadata clove */ }
-    FileKind::Clove049 => { /* old migration index */ }
-    FileKind::Authenticated => { /* _clove_meta present */ }
-    FileKind::ExternalRedb => { /* raw redb, not clove */ }
-    FileKind::Invalid => { /* directory or unreadable */ }
-    _ => {}
+#[derive(Clone, Default, Serialize, Deserialize, CloveFields)]
+struct Note { id: String, group: String, score: i64, title: String, labels: Vec<String> }
+
+let notes = storage.domain::<Note>();
+let q = notes.query()
+    .filter(Note::group.eq("public").and(Note::score.ge(20)))
+    .order_by(Note::score, Desc)
+    .then_by(Note::id, Asc)
+    .limit(25);
+
+let page = q.page()?;                                   // rows, and a cursor
+if let Some(cursor) = page.next {
+    let next = q.clone().after(cursor).collect()?;
 }
 ```
 
-## Examples & local demos
+- **Conditions:** `eq`, `ne`, `lt`, `le`, `gt`, `ge`, `between` (lower-inclusive, upper-exclusive), `is_null`, `is_missing`, `exists`, `is_empty`; on text `text` (whole words, any case), `contains`, `prefix`, `fuzzy(term, 0..=2)`; on lists `any`, `all`, `at`, `len`, `elem_match`; combined with `and`, `or`.
+- **Transforms** before a comparison: `trim()`, `lowercase()`, `normalize_arabic()`.
+- **Results:** `collect`, `page` with a cursor, `one()` (zero is `None`, one is the row, more is `ClError::NonUnique { count }`), `exists`, `count`.
+- **Aggregates** over the whole filtered set, without building entities: `count`, `distinct`, `min`, `max`, `sum`, `group_by(field).count()`. `sum` is exact: integers as `Sum::Integer`, any fraction as `Sum::Decimal` in base ten (`0.1 + 0.2` is `Decimal("3e-1")`), never a float.
+- **Order** by fields, by `LastWrite` (the sequence of each row's last write), or by `field.similarity(term)`.
+- **One snapshot for several queries:** take `db.read_view_at_head()` and use `collect_in(&view)` / `page_in(&view)`.
+- **Unique constraints:** `DatabaseConfig::unique::<Note>(Unique::on(Note::title.trim().lowercase()))`, with `.and(..)` for several fields. Checked in the same transaction as the write, for every write path.
+- Values of different types never compare equal: there is no conversion between text and numbers. Missing and `null` are different, and neither matches an equality.
 
-Runnable examples live in the **Git repository** under `examples/` (not included in the crates.io package). Clone the repo and run from each folder:
+Nested fields are reached with `then` (`Note::profile.then(Profile::name)`); `serde` renames and flattening are followed. A field whose stored form `serde` cannot describe needs `#[clove(as = Type)]` or `#[clove(skip)]`.
+
+## Automatic indexes
+
+There is no `create_index`. The optimizer estimates what each plan would cost — a full scan, a selective scan, a direct lookup, an index — and builds an index in the `.inx` file when a query would pay for it. Equality, range, prefix, text, `contains`, fuzzy and order indexes are all built this way.
+
+```rust
+let q = notes.query().filter(Note::title.fuzzy("alpha", 1));
+let plan = q.explain()?;            // the chosen plan, the alternatives, their costs, and why
+println!("{:?}", plan.selected);    // e.g. IndexFuzzy once the index is ready
+```
+
+- **Answers never depend on the index.** A missing, late or rebuilding index makes a query slower, never different: candidates are checked against the snapshot.
+- **The `.inx` file is disposable.** Deleted or damaged, it is rebuilt before `build()` returns.
+- `allow_stale()` lets a query use an index that is behind; the page says how far.
+- `storage.index_report()` describes every index without changing any.
+- Indexes not used for a while drop their contents and keep their definition. A long backlog of changes is rebuilt rather than replayed when that is cheaper. Under sustained writes faster than an index can follow, it is set aside (queries scan) and comes back when writes slow down.
+
+## History, restore and bulk changes
+
+With `backup_enabled(true)`, every write and delete through the domain or the repository is kept in the `.cldb.bak` file, forever:
+
+```rust
+let docs = storage.domain::<Document>();
+for record in docs.history("doc-1")? {
+    println!("v{} {:?} {}", record.version, record.operation, record.date);
+}
+let old = docs.get_by_version("doc-1", 2)?;     // the row as it was
+docs.restore_by_version("doc-1", 1)?;           // itself a new version: nothing is lost
+
+let (_rows, bulk_id) = devices.update_bulk::<SetStatus, DeviceView>(changes)?;
+devices.restore_bulk(&bulk_id)?;                // undo the whole bulk
+```
+
+A history record holds its version, operation (`Set`, `Delete`, `Restore`, `RestoreBulk`), date, the row as it was, and the bulk id if any. A version and its record are written in one transaction.
+
+## Raw batches
+
+For imports and copies, rows can be written as bytes, outside the history:
+
+- `db.commit_batch_atomic(writes, deletes)` — one transaction, whatever its size: all or nothing.
+- `db.commit_batch(writes, deletes)` — split into chunks of `max_commit_batch_entries` (512 by default); writes before deletes. A failure in a later chunk leaves the earlier chunks committed.
+- `db.replace_table(table, rows)` — the whole table at once, as one change.
+
+Unique constraints are checked for every batch. A table with protected fields refuses raw bytes: write it through its entity.
+
+## The change log
+
+Every committed write gets the next number of a durable sequence, and is kept for the programs that follow the database — a replica, a search service, an export:
+
+```rust
+let db = storage.db_manager("store");
+let token = db.register_consumer("replica")?;
+
+let view = db.read_view_at_head()?;               // 1. copy everything that exists
+copy_rows(view.table_entries("notes")?);
+let head = view.head;
+drop(view);
+db.ack(&token, head)?;                            // 2. "stored up to here"
+
+let changes = db.read_changes(&token, head, 100)?; // 3. what changed after it, in order
+```
+
+- The follower's position is stored in the database and survives restarts.
+- `replace_table` is one change that the follower reads whole with `read_reset`.
+- `journal_retention(Retention::Default)` keeps up to 256 MiB of changes (`Unlimited` and `Limit { max_bytes }` are the other choices). A follower that falls further behind is expired: `ClError::ConsumerExpired`, and it starts again from a snapshot.
+- With no follower, nothing is kept; the sequence still counts every commit.
+- Registering a name again replaces the old follower; its token is refused.
+
+## Attachments
+
+A table registered with `register_blob` keeps one file per row in `{db}.blobs`, beside the database. The row holds the metadata, and the file is written before the row commits:
+
+```rust
+DatabaseConfig::new("files", "files")
+    .blob_enabled(true)
+    .register_blob::<Attachment>("attachments");
+
+files.create_with_blob::<Upload, AttachmentView>(upload, bytes)?;
+let mut reader = files.open_blob("report")?;     // Read + Seek, never loaded whole
+```
+
+The size of the file is written into the row's `size_bytes` field. Deleting the row deletes the file. A database with attachments keeps no history file.
+
+## Memory: the cache and large tables
+
+`cache_bytes(max_bytes, ttl_secs, idle_secs)` sizes the cache of decoded rows in **bytes**, not entries: 10,000 rows of 10 KB are 100 MiB whatever an entry count says.
+
+- `get_uncached` reads without filling the cache. Use it for a walk over many rows read once.
+- Expired entries are freed during maintenance, which runs when the cache is used. `storage.run_cache_maintenance()` frees them at once; `cache_stats()` returns `(bytes, entries)`.
+- `get_uncached_as::<Summary>` reads only the fields a smaller type names; the others are skipped without being built.
+- `list_map(|row| ...)` turns each row into what you keep while the table is read, so the table is never held twice.
+- `redb_cache_bytes(n)` caps redb's own page cache for one file (1 GiB by default). On a large table this cache, not the index builder, decides the peak memory of an index build.
+- `prefetch` reads the file in order before redb opens it, which makes the first query on a cold file much faster. It is on by itself for files of 64 MiB or more; `prefetch(true)` and `prefetch(false)` force it.
+
+## Durability and recovery
+
+**Strict** is the default: every commit is flushed (`redb::Durability::Immediate`) and every side file is written to a temporary name, flushed and renamed, so a crash never leaves a half-written file under its real name. **Fast** skips the flushes for speed and keeps the renames.
+
+```rust
+use clove1db::DurabilityMode;
+
+Storage::builder(StorageConfig::default().durability(DurabilityMode::Fast));   // all databases
+DatabaseConfig::new("cache", "cache").durability(DurabilityMode::Fast);        // one database
+```
+
+- **What survives:** in Strict mode, every commit that returned. A damaged or zeroed side file is set aside and rebuilt on the next open.
+- **`storage.close()`**, once, on the way out: it waits for running operations and closes every file cleanly, so the next open needs no repair. Any use afterwards is `ClError::Closed`.
+- **After a kill or a crash** redb walks the whole file to rebuild its allocator state, which is slow on a large file. `quick_repair(true)` saves that state with every commit, at some cost per commit, so the next open loads it instead.
+- **`storage.open_report()`** says, for each file opened by `build()`: its size, how long the open took, and whether it had to be repaired.
+- Inspection (`inspect_cldb`) and the migration readers open files read only, and never repair them.
+- Opening a database that another program has open is the clear error `ClError::DatabaseInUse`.
+
+## Encrypting the whole database
+
+Every file of a database — `.cldb`, `.cldb.bak`, `.inx`, attachments and side files — is sealed in 4 KiB blocks under keys you hold. Nothing in the folder is readable, not even the redb signature or a table name. Any changed byte is an error, never wrong data.
+
+```rust
+use clove1db::{EncryptionConfig, KeySource, crypto::Key32};
+
+let keys = EncryptionConfig::new(
+    KeySource::Raw(Key32::from_bytes(&read_key)),     // decrypts everything
+    KeySource::Raw(Key32::from_bytes(&search_key)),   // makes fingerprints; decrypts nothing
+);
+DatabaseConfig::new("vault", "vault").encryption(keys).register::<Note>("notes");
+```
+
+- **Ciphers:** AES-256-GCM-SIV (the default) and XChaCha20-Poly1305 (`.with_suite(..)`), both safe for any number of writes. The choice is not stored: open with the one you created with.
+- **Keys:** raw 32-byte keys, or `KeySource::Password` stretched with Argon2id (64 MiB, 3 passes by default; settings below a safe floor are refused). A new database needs both keys; an existing one opens with the read key.
+- **Errors:** a missing or not-allowed setting is `ClError::Validation` before any file is touched. A wrong key, a wrong cipher, a plain file opened with a key, or a damaged header are all the single `ClError::EncryptedOpenFailed`. A changed block in an open database is `ClError::DataTampered`.
+- **Checking every block:** `verify_encrypted_files(dir, dir_name, db_name, &EncryptionHandle::new(keys))` checks the closed files; `encryption_verify_on_open(true)` does it at each open. A block put back from an older copy of the same file is only found this way.
+- **Creation is all or nothing:** a new encrypted database is made under a temporary name and given its real name only when complete.
+- **Speed:** the pages of a commit are sealed on up to four threads (`encryption_tuning`). Every encrypted commit is two-phase.
+- **What it does not hide:** the number and sizes of files, and the folder and database names you chose. An open database is as safe as the keys in its memory.
+
+## Protected fields
+
+A field can be protected on its own while the rest of the row stays an ordinary row, readable and usable in any query:
+
+```rust
+use clove1db::{CloveFields, field_crypto::{Hashed, Sealed, SearchPrint}};
+
+#[derive(Clone, Default, Serialize, Deserialize, CloveFields)]
+struct Account {
+    id: String,
+    name: String,                                              // ordinary
+    #[clove(encrypt, id = 1, print = "full", normalize = "trim")]
+    phone: Sealed<String>,                                     // sealed, searchable by equality
+    #[clove(hash = "argon2id", id = 2)]
+    password: Hashed,                                          // checked, never read back
+    #[clove(search_print, id = 3, normalize = "trim,lowercase")]
+    email: SearchPrint,                                        // matched, never read back
+    #[clove(encrypt, id = 4)]
+    note: Sealed<String>,                                      // sealed
+}
+
+DatabaseConfig::new("people", "people")
+    .field_encryption(keys)               // or .encryption(keys) for the whole database too
+    .register_sealed::<Account>("accounts");
+```
+
+| Attribute | Stored | Used with |
+|---|---|---|
+| `encrypt` | the value sealed (AES-256-GCM-SIV or XChaCha20-Poly1305), bound to its table, field and row | `value.open(&domain.read_grant()?)` |
+| `encrypt, print = "full"` | the sealed value and a keyed fingerprint of the normalised text | `Account::phone.print_eq(value, &domain.search_grant()?)`, `print_in`, a unique constraint on `print_field()` |
+| `encrypt, print = "parts"` | as `full`, plus fingerprints of every run of `window` characters (3 by default) kept to `grade` bits | `part_candidates` (candidates) and `part_search(..).run(..)` (confirmed matches) |
+| `hash = "argon2id"` or `"scrypt"` | a salted slow hash | `password.verify(secret, &domain.verifier()?)` |
+| `search_print` | a keyed fingerprint only | `email.matches(candidate, &verifier)` |
+
+- **Every field has a stable number** (`id = N`): renaming it in code changes nothing on disk. A value moved to another row or field is `ClError::DataTampered`.
+- **Reading a row opens nothing.** A grant opens a value, and every opening sends a `FieldRead` event with names and the row key, never the value. Your application decides who gets a grant.
+- **A field that cannot be searched does not compile in a query.** A sealed field without `print` has only `scan_sealed` (the slow, explicit scan); a hash field has no query methods at all.
+- **What a program can do depends on its keys.** Both keys: everything. The read key alone: everything but making fingerprints. The search key alone (with `field_encryption`): read rows and match fingerprints; no writes, no opening.
+- **The keys file `{db}.keys`** (under 1 KB) holds the data key sealed under your keys, so protected values can still be opened if the main file is lost. `field_keys_file(path)` keeps the data key in that file **only**: a copy of the main file alone then opens nothing — and if that file is lost, the protected values are lost for good.
+- **Attachments of such a table** (`register_sealed_blob`) are sealed in 64 KiB chunks, with folder and file names that are keyed fingerprints.
+
+## Changing how a database is protected
+
+A database is protected when it is made. To change that later, close it and rewrite it:
+
+- **`ChangeProtection`** changes how the whole database is protected: plain to encrypted, encrypted to plain, one key or cipher to another, or between whole-database encryption and keys for protected fields only.
+- **`ChangeFields`** changes how the fields of a table are protected: seal a plain field, open a sealed one, add or remove fingerprints, turn a field into a hash.
+
+```rust
+use clove1db::migration::{ChangeFields, ChangeProtection};
+
+let plan = ChangeProtection::new(&dir, "records", "store")
+    .from_plain()
+    .to_whole_database(keys.clone())
+    .dry_run()?;                       // what it would do, and the disk it needs; writes nothing
+ChangeProtection::new(&dir, "records", "store").from_plain().to_whole_database(keys).execute()?;
+
+ChangeFields::new(&dir, "records", "store")
+    .field_keys(field_keys)
+    .table::<SealedPerson>("people")   // the entity as it should be stored now
+    .execute()?;
+```
+
+- **Safe at any moment.** The new files are written beside the old ones, read back and compared row by row and file by file, and put in place by one decision a crash cannot split. Before it, the old files are the database exactly as they were; after it, the new ones. The next open settles whatever a stop left.
+- **Refused before anything is written:** a wrong key, a database another program has open, a table with protected fields that is not named (`.protected_table::<E>(name)`), not enough room (`available_bytes`).
+- **One-way changes** (to a hash, or to a fingerprint that does not keep the value) need `.confirm_one_way()`.
+- **Keys of hashes and fingerprint-only fields are carried over** when the data key changes, since their source values are not stored: old passwords still verify and searches still find their rows.
+- `wipe_originals(true)` overwrites the old files with random bytes before removing them.
+- **Room:** `dry_run` gives a safe upper bound of the disk the change needs; the new files exist beside the old ones until the end.
+
+## Schema migrations and older files
+
+Each table has its own chain of versions. A change of a struct is a migration you write once:
+
+```rust
+use clove1db::migration::{MigrateOutcome, MigrateTo, migrate_value, skip_record};
+
+impl MigrateTo<ProductV2> for ProductV1 {
+    fn migrate_json(value: serde_json::Value) -> clove1db::units::Result<MigrateOutcome<serde_json::Value>> {
+        let v1: ProductV1 = serde_json::from_value(value)?;
+        if v1.name.is_empty() {
+            return skip_record("no name");
+        }
+        migrate_value(ProductV2 { id: v1.id, name: v1.name, sku: String::new(), price_cents: 0 })
+    }
+}
+
+storage.migrate::<ProductV1, ProductV2>().from_db("catalog", "products").execute()?;          // in place
+storage.migrate::<ProductV1, ProductV2>()
+    .from_db("warehouse", "products")
+    .to(MigrationTo::new("shop").table("products").delete_source(true))                        // to another database
+    .execute()?;
+
+Storage::builder(config).migration_step::<ProductV1, ProductV2>();   // so history reads in the new shape
+```
+
+**Older files are upgraded by `build()`.** A `.cldb` made by an earlier clove1db is recognised, given the metadata it lacks, and its history converted to the current format on a checked copy, before it is served. `inspect_cldb(path)` tells what a file is (`Legacy042`, `Clove049`, `Authenticated`, `ExternalRedb`, ...) without opening a `Storage`, and never changes it.
+
+## Importing from a foreign redb file
+
+**Row by row, into your entity:**
+
+```rust
+use clove1db::migration::{ExternalFrom, KeyDecoder, MigrationTo, ValueDecoder};
+
+storage.migrate::<VendorRow, ProductV2>()
+    .from_external(ExternalFrom {
+        path: "./vendor.redb".into(),
+        table: "vendor_catalog".into(),
+        key_decoder: KeyDecoder::Utf8String,       // or U64AsString
+        value_decoder: ValueDecoder::JsonValidate, // or JsonString
+    })
+    .to(MigrationTo::new("shop").table("products"))
+    .execute()?;
+```
+
+`list_external_tables(path)` and `read_external_table(path, &spec)` look at a foreign file first.
+
+**A large table, as it is (`stream_external`).** For gigabytes of JSON rows or of files, `clove1db::migration::stream_external` reads the source in one read transaction, one row at a time, and commits in batches, so memory does not grow with the file:
+
+```rust
+use clove1db::migration::stream_external::{JsonRow, Kind, Options, scan, stream, verify};
+
+let options = Options { kind: Kind::Json, max_rows: 1_000, ..Options::default() };
+let found = scan(&copy, "orders", &options)?;               // rows, sizes, invalid JSON
+stream(&copy, "orders", &storage, "shop", "orders", &options, &mut |r| println!("{} rows", r.rows))?;
+assert!(verify(&copy, "orders", &storage, "shop", "orders", &options)?.is_equal());
+```
+
+- **`Kind::Json`:** number or text keys, JSON values. Rows are stored as they are, in a table registered with `JsonRow`.
+- **`Kind::Attachments`:** number keys, each value the bytes of one file, into a table registered with `register_blob::<AttachmentMeta>`. If your values carry a fixed prefix before the file, describe it with `Options { prefix: Some(FilePrefix { marker, len, group_at }), .. }`: a value whose first byte is `marker` loses its first `len` bytes, and a little-endian 32-bit number at `group_at` is kept as the row's `group`. The file's type is taken from its first bytes (PNG, JPEG, GIF, WebP, PDF, ZIP).
+- **The source is only read.** A file that was not closed cleanly is repaired with `Options { repair: true, .. }` in a `scan`, which writes to the file it is given: **give it a copy**.
+- **Memory is checked first:** a source of 1 GiB or more needs `free_memory`, and a run whose expected peak plus `reserve_memory` does not fit is refused before it starts.
+- **Reports hold counts only:** rows, sizes, types, batches, times, and the fingerprints `verify` compares. `inventory: true` lists every table of the file with its key and value types.
+
+## Events
+
+`StorageConfig::default().event_sink(|event| ...)` receives `LibraryEvent`s: slow queries (over `slow_query_threshold`, 50 ms by default), non-unique `one()` calls, expired followers, index rebuilds, encryption and migration stages, and every opening of a protected value. Events carry names, counts and row keys, never a value, a key or a searched text. Callbacks run synchronously after the operation: keep them short. `LibraryEvent` is `#[non_exhaustive]`.
+
+## What it costs
+
+Measured in release builds on one Windows machine with synthetic data. They describe that machine, not a guarantee.
+
+**Encrypting the whole database**, against the same plain database (20 commits of 500 rows of about 1 KB):
+
+| | AES-256-GCM-SIV (default) | XChaCha20-Poly1305 |
+|---|---|---|
+| writes, parallel sealing (default) | +5 % to +7 % | +21 % to +23 % |
+| reads from the cache | +3 % to +8 % | +3 % to +8 % |
+| reads cold from disk, whole table | no measurable cost | no measurable cost |
+| building a text index | about +5 % | about +5 % |
+
+XChaCha20-Poly1305 is meant for processors without AES acceleration, where it is typically the faster of the two (not measured here).
+
+**Protected fields**, per field, compared with the same entity unprotected:
+
+| Field | write | read and open |
+|---|---|---|
+| 16 bytes, AES-256-GCM-SIV | 1.7 µs | 1.2 µs |
+| 16 bytes, XChaCha20-Poly1305 | 2.8 µs | 2.0 µs |
+| 4 KiB, AES-256-GCM-SIV | 19.7 µs | 13.2 µs |
+
+Searching by a whole-value fingerprint costs 1.1 to 2 times a plain indexed equality. Searching by a piece of a value costs 1.1 to 4.5 times a plain `contains`, depending on the piece's length and the grade. An Argon2id hash takes about 0.1 s and 64 MiB while it runs.
+
+**Changing the protection** takes about 0.02 to 0.03 s per MB of rows (0.5 s for 20 MB, about 9 to 12 s for 500 MB), with memory under about 190 MiB. Turning 100,000 values into hashes takes hours: `dry_run` times one hash and says how long the whole change would take.
+
+**History format:** 1,000 history records take about 4.2 MB, against 18.7 MB in the format used before 0.0.126.
+
+**Under load:** 8 writers and 16 readers on one database for 30 minutes completed 286,352 checked queries (p95 0.4 ms) with no mismatch and no error. A drill of 200 forced process kills found every acknowledged write after each reopen.
+
+## Limits
+
+- **Power loss is not tested.** Killed processes are; whether every write a disk acknowledges survives a power cut depends on the disk and the system, and is not verified here.
+- One process opens a database at a time. A second gets `ClError::DatabaseInUse`.
+- Changing the protection needs the database closed, and disk room for the old and the new files at once.
+- A protected field cannot be filtered, ordered, grouped, aggregated or made unique, except by its whole-value fingerprint. A search by a piece returns candidates until it is confirmed with the read key.
+- A fingerprint is not tied to the sealed value beside it: someone who can change the files can swap fingerprints between rows. Equal values have equal fingerprints.
+- The length of a protected value is visible to within a few bytes.
+- Migration steps over an entity with protected fields are not supported yet; change its fields with `ChangeFields`.
+- One attachment per row.
+- The `.inx` file can be up to about twice its content, since redb grows files by doubling. A `contains` index costs about 5 ms per 20 KB row to build.
+- An encrypted file whose header is not in the form of redb 4.4 cannot grow: the write fails with a clear I/O error and changes nothing.
+
+## Examples
+
+Seven runnable examples are in the repository under [`examples/`](https://github.com/clove7/clove1db/tree/main/examples) (they are not in the crates.io package). Each writes to a new folder under the system's temporary folder, removes it at the end, prints what it checks, and fails if a check fails.
 
 ```bash
 git clone https://github.com/clove7/clove1db
-cd clove1db/examples/01_basic_crud && cargo run
+cd clove1db/examples/01_getting_started && cargo run
 ```
 
-| Example | Topic |
-|---------|-------|
-| `01_basic_crud` | Entity, DTO, CRUD |
-| `02_multi_database` | Multiple `.cldb` files in one `Storage` |
-| `03_backup_history` | Versioned backup, restore, history |
-| `04_bulk_operations` | Bulk update / restore |
-| `05_domain_dto_patterns` | Input/Output DTO patterns |
-| `06_large_files_no_cache` | Large blobs, cache off |
-| `07_migration` | In-place evolve, cross-DB move, external import, restore guards |
-| `08_inspect_upgrade` | Era fixtures (0.0.42 / 0.0.49 / 0.0.70), upgrade pipeline |
-| `09_blob_attachments` | Blob sidecar CRUD, migration scan, external→blob, inline→blob |
-| `10_crash_durability` | Strict durability: crash inject, NUL index recovery, RAM pressure |
-| `11_cache_memory_budget` | What the cache costs: byte budgets, uncached reads, expiry vs reclamation |
-| `12_open_close_repair` | Between runs: redb cache cap, quick repair after a kill, `close()`, one open per build |
-| `13_large_table_open_and_read` | A large table: `list_map` vs copy-then-parse, `get_uncached_as`, and `open_report` after a clean close and after a kill |
-| `14_backup_v2_and_atomic_batches` | v1/v2 sizes, mixed legacy conversion, exact bytes and dates, schema history/renames, format-check reports, interrupted atomic/chunked batches |
+| Example | What it shows |
+|---|---|
+| `01_getting_started` | Entities and DTOs, create, read, update, delete, two databases in one `Storage` |
+| `02_queries_and_indexes` | Filters, pages, `one()`, aggregates, text and fuzzy search, a unique constraint, automatic indexes, `explain()`, a deleted `.inx` rebuilt |
+| `03_backup_and_batches` | History, reading and restoring a version, bulk changes, atomic and chunked batches |
+| `04_change_log` | A follower: snapshot, changes, acknowledgement, restart, table reset, expiry |
+| `05_files_and_memory` | Attachments read as streams, the cache budget, reading a large table |
+| `06_encryption` | The whole database with both ciphers, a wrong key, a changed byte, and protected fields |
+| `07_migration_and_recovery` | A schema change, an old file upgraded, a foreign redb file imported and copied, changing the protection, a writer killed mid-work |
+
+Run 02, 05, 06 and 07 with `cargo run --release`.
+
+## Upgrading
+
+### From 0.0.x to 0.1.0
+
+The data format of existing plain databases is unchanged, and they open as before. Code may need these changes:
+
+- **`ClError`** has new variants (`EncryptedOpenFailed`, `DataTampered`, `DatabaseInUse`, ...). A `match` without a wildcard arm must handle them. **`LibraryEvent`** is `#[non_exhaustive]`.
+- **Attachments are read through `BlobReader`** (`Read + Seek`, with `len()`) instead of `std::fs::File`.
+- **`RedbOptions`** is no longer `Copy` or `PartialEq`, and has new fields: build it with `..Default::default()`.
+- **`BackupManager::new`** takes `&RedbOptions`.
+- **`Unique::on` and `Unique::and`** take `impl UniqueField<E>`; ordinary calls compile as before.
+- **`fields::Compare`** has a new variant.
+- **`migration::DbMigrationRootIndex::tables`** is a `BTreeMap`.
+- **Inspecting a file never repairs it:** a file that needs repair gives `ClError::Validation` asking to open it normally first.
+- **Quarantined side files keep their whole name:** `index.json.corrupt.{time}`.
+- **A failed `build()` removes the database it was creating**, and only that.
+- **The examples** were rewritten: seven instead of nineteen.
+
+New in 0.1.0: whole-database encryption, protected fields and searching them, `ChangeProtection` and `ChangeFields`, `stream_external`, the keys file, `verify_encrypted_files`, parallel sealing, `DatabaseInUse`, out-of-memory errors instead of aborts on large allocations, `prefetch`.
+
+### From 0.0.119 or earlier
+
+The first `build()` converts each `.cldb.bak` history to the current format, on a checked copy that replaces the original only when every record compares equal. Older releases cannot read the converted history. The `.cldb` data format is unchanged. Undated records receive the conversion time, flagged `date_from_migration: true`.
 
 ## Contributing
 
-This project is under active development:
-
-- **Bug reports & feature requests** — [GitHub issues](https://github.com/clove7/clove1db/issues)
-- **Code contributions** — fork, branch, open a pull request
-- **Examples & docs** — scenarios in `examples/` are especially welcome
-- **Feedback** — tell us how you use (or want to use) clove1db
-
-Before large changes, open an issue to discuss the approach.
+- Bug reports and feature requests: [GitHub issues](https://github.com/clove7/clove1db/issues).
+- Code: fork, branch, and open a pull request.
+- Examples and documentation are especially welcome.
 
 ## License
 
-Licensed under the MIT license — see [LICENSE-MIT](LICENSE-MIT).
+MIT — see [LICENSE-MIT](LICENSE-MIT).

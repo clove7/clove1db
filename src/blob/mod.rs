@@ -3,10 +3,14 @@ mod paths;
 #[cfg(test)]
 mod tests;
 
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub use paths::{blob_path, blob_root, blob_table_dir};
+pub(crate) use paths::protected_blob_root;
 
 /// Alias used by runtime (`{db_name}.blobs` root directory).
 pub fn blobs_root(db_dir: &Path, db_name: &str) -> PathBuf {
@@ -14,14 +18,128 @@ pub fn blobs_root(db_dir: &Path, db_name: &str) -> PathBuf {
 }
 
 use crate::durability::DurabilityMode;
+use crate::encrypted_store::{EncryptionContext, FileKeys, SealedBlobStore, SealedReader};
 use crate::fsutil::write_atomic;
 use crate::units::{ClError, Result};
 
-/// Per-database blob sidecar store rooted at `{db_dir}/{db_name}.blobs/`.
+/// An attachment opened for reading. It reads and seeks like a file, and says how long the
+/// attachment is. In an encrypted database it decrypts as it reads, block by block, so a large
+/// attachment is never loaded whole; a block that was changed is an error
+/// ([`ClError::DataTampered`]) and never wrong bytes.
+pub struct BlobReader {
+    inner: ReaderKind,
+}
+
+enum ReaderKind {
+    Plain(File),
+    Sealed(SealedReader<BufReader<File>>),
+}
+
+impl BlobReader {
+    /// The length of the attachment's data in bytes.
+    pub fn len(&self) -> io::Result<u64> {
+        match &self.inner {
+            ReaderKind::Plain(file) => Ok(file.metadata()?.len()),
+            ReaderKind::Sealed(reader) => Ok(reader.len()),
+        }
+    }
+
+    pub fn is_empty(&self) -> io::Result<bool> {
+        Ok(self.len()? == 0)
+    }
+}
+
+impl std::fmt::Debug for BlobReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BlobReader")
+    }
+}
+
+impl Read for BlobReader {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        match &mut self.inner {
+            ReaderKind::Plain(file) => file.read(out),
+            ReaderKind::Sealed(reader) => reader.read(out),
+        }
+    }
+}
+
+impl Seek for BlobReader {
+    fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
+        match &mut self.inner {
+            ReaderKind::Plain(file) => file.seek(to),
+            ReaderKind::Sealed(reader) => reader.seek(to),
+        }
+    }
+}
+
+/// Read-only inspection of a database's blob sidecar directory.
+/// Use DatabaseManager's journaled methods for mutation.
+///
+/// ```compile_fail
+/// fn unlogged_put(store: &clove1db::blob::BlobStore) {
+///     let _ = store.write_atomic("files", "a", b"bytes");
+/// }
+/// ```
+/// ```compile_fail
+/// fn unlogged_delete(store: &clove1db::blob::BlobStore) {
+///     let _ = store.delete("files", "a");
+/// }
+/// ```
 #[derive(Debug, Clone)]
 pub struct BlobStore {
     db_dir: PathBuf,
     db_name: String,
+    /// In an encrypted database: the sealed store that holds the attachments under fingerprint
+    /// names. `None` for a plain database, which works exactly as it always did.
+    sealed: Option<SealedBlobStore>,
+    /// The attachments of tables with protected fields: always sealed with the keys of those
+    /// fields, bound to the table, the place of the attachment and the row.
+    protected: Option<ProtectedBlobs>,
+}
+
+/// Field number of the attachment of a row, in the binding of its sealed file.
+const ATTACHMENT_FIELD: u32 = 0;
+
+/// The two names under which the sealed store keeps the attachment of one row of a table with
+/// protected fields: its "table" (the identity and the place of the attachment) and its "id" (the
+/// row and the file, joined so that two different pairs never give the same text). Everything that
+/// writes these files (the store, and the migration that moves attachments in) uses this one
+/// function, so a file is always written under the name it is later opened by.
+pub(crate) fn protected_names(table_id: &str, row: &str, blob_id: &str) -> (String, String) {
+    (format!("{table_id}/{ATTACHMENT_FIELD}"), format!("{}:{row}{blob_id}", row.len()))
+}
+
+#[derive(Debug, Clone)]
+struct ProtectedBlobs {
+    store: SealedBlobStore,
+    /// Table name to table identity.
+    ids: Arc<HashMap<String, String>>,
+}
+
+impl ProtectedBlobs {
+    /// The sealed store's "table" for one table: its identity and the place of the attachment.
+    fn place(&self, table: &str) -> Result<String> {
+        self.ids
+            .get(table)
+            .map(|id| protected_names(id, "", "").0)
+            .ok_or_else(|| ClError::Validation("the attachment table has no protected identity".into()))
+    }
+
+    /// The sealed store's "id" for one attachment: the row and the file, joined unambiguously.
+    fn file(row: &str, blob: &str) -> String {
+        protected_names("", row, blob).1
+    }
+}
+
+fn io_error(e: io::Error) -> ClError {
+    ClError::from(e)
+}
+
+fn row_bound() -> ClError {
+    ClError::Validation(
+        "the attachments of a table with protected fields are bound to their row; open them through the row".into(),
+    )
 }
 
 impl BlobStore {
@@ -29,7 +147,50 @@ impl BlobStore {
         Self {
             db_dir: db_dir.to_path_buf(),
             db_name: db_name.to_string(),
+            sealed: None,
+            protected: None,
         }
+    }
+
+    /// The store of an encrypted database.
+    pub(crate) fn with_encryption(db_dir: &Path, db_name: &str, context: EncryptionContext) -> Self {
+        Self {
+            db_dir: db_dir.to_path_buf(),
+            db_name: db_name.to_string(),
+            sealed: Some(SealedBlobStore::new(&blob_root(db_dir, db_name), context)),
+            protected: None,
+        }
+    }
+
+    /// Seal the attachments of `tables` (name to identity) with the keys of their protected fields.
+    pub(crate) fn with_protected(mut self, keys: Arc<dyn FileKeys>, tables: Arc<HashMap<String, String>>) -> Self {
+        let root = paths::protected_blob_root(&self.db_dir, &self.db_name);
+        self.protected = Some(ProtectedBlobs { store: SealedBlobStore::with_keys(&root, keys), ids: tables });
+        self
+    }
+
+    /// True when the attachments of `table` are bound to the rows of a table with protected fields.
+    pub(crate) fn is_protected(&self, table: &str) -> bool {
+        self.protected.as_ref().is_some_and(|p| p.ids.contains_key(table))
+    }
+
+    /// True when the attachments of `table` are sealed with keys this program cannot open them with
+    /// (a program that holds only the search key): they are neither checked nor cleaned.
+    pub(crate) fn is_unreadable(&self, table: &str) -> bool {
+        self.protected_of(table).is_some_and(|p| !p.store.can_open())
+    }
+
+    /// True when there are attachments of protected tables and this program cannot open them.
+    pub(crate) fn protected_unreadable(&self) -> bool {
+        self.protected.as_ref().is_some_and(|p| !p.store.can_open())
+    }
+
+    fn protected_of(&self, table: &str) -> Option<&ProtectedBlobs> {
+        self.protected.as_ref().filter(|p| p.ids.contains_key(table))
+    }
+
+    pub(crate) fn is_sealed(&self) -> bool {
+        self.sealed.is_some()
     }
 
     pub fn root(&self) -> PathBuf {
@@ -37,45 +198,145 @@ impl BlobStore {
     }
 
     pub fn table_dir(&self, table: &str) -> PathBuf {
-        blob_table_dir(&self.db_dir, &self.db_name, table)
+        match &self.sealed {
+            Some(s) => s.table_dir(table).unwrap_or_else(|_| self.root().join("unavailable")),
+            None => blob_table_dir(&self.db_dir, &self.db_name, table),
+        }
     }
 
     pub fn path(&self, table: &str, id: &str) -> PathBuf {
-        blob_path(&self.db_dir, &self.db_name, table, id)
+        match &self.sealed {
+            Some(s) => s.path(table, id).unwrap_or_else(|_| self.root().join("unavailable")),
+            None => blob_path(&self.db_dir, &self.db_name, table, id),
+        }
     }
 
-    pub fn ensure_root(&self) -> Result<()> {
+    pub(crate) fn ensure_root(&self) -> Result<()> {
         fs::create_dir_all(self.root()).map_err(|e| ClError::IoError(e.to_string()))
     }
 
-    pub fn ensure_table(&self, table: &str) -> Result<()> {
-        fs::create_dir_all(self.table_dir(table)).map_err(|e| ClError::IoError(e.to_string()))
+    pub(crate) fn ensure_table(&self, table: &str) -> Result<()> {
+        if let Some(p) = self.protected_of(table) {
+            fs::create_dir_all(p.store.root()).map_err(io_error)?;
+            return p.store.ensure_table(&p.place(table)?).map_err(io_error);
+        }
+        match &self.sealed {
+            Some(s) => s.ensure_table(table).map_err(io_error),
+            None => fs::create_dir_all(self.table_dir(table)).map_err(|e| ClError::IoError(e.to_string())),
+        }
     }
 
-    pub fn write_atomic(&self, table: &str, id: &str, data: &[u8]) -> Result<()> {
-        self.write_atomic_with_mode(table, id, data, DurabilityMode::Strict)
+    #[cfg(test)]
+    pub(crate) fn write_atomic(&self, table: &str, id: &str, data: &[u8]) -> Result<()> {
+        self.write_atomic_with_mode(table, "", id, data, DurabilityMode::Strict)
     }
 
-    pub fn write_atomic_with_mode(
+    /// `row` is the row the attachment belongs to (only tables with protected fields use it).
+    pub(crate) fn write_atomic_with_mode(
         &self,
         table: &str,
+        row: &str,
         id: &str,
         data: &[u8],
         mode: DurabilityMode,
     ) -> Result<()> {
+        if let Some(p) = self.protected_of(table) {
+            return p
+                .store
+                .write_atomic(&p.place(table)?, &ProtectedBlobs::file(row, id), data, mode.is_strict())
+                .map_err(io_error);
+        }
+        if let Some(s) = &self.sealed {
+            return s.write_atomic(table, id, data, mode.is_strict()).map_err(io_error);
+        }
         let path = self.path(table, id);
         write_atomic(&path, data, mode)
     }
 
-    pub fn open_read(&self, table: &str, id: &str) -> Result<File> {
-        let path = self.path(table, id);
-        OpenOptions::new()
-            .read(true)
-            .open(&path)
-            .map_err(|e| ClError::IoError(e.to_string()))
+    /// Seal whatever `source` yields into the attachment (encrypted databases only; the plain
+    /// store copies through its own file code). Returns the size.
+    pub(crate) fn write_stream(
+        &self,
+        table: &str,
+        row: &str,
+        id: &str,
+        source: &mut dyn Read,
+        mode: DurabilityMode,
+    ) -> Result<u64> {
+        if let Some(p) = self.protected_of(table) {
+            return p
+                .store
+                .write_stream(&p.place(table)?, &ProtectedBlobs::file(row, id), source, mode.is_strict())
+                .map_err(io_error);
+        }
+        match &self.sealed {
+            Some(s) => s.write_stream(table, id, source, mode.is_strict()).map_err(io_error),
+            None => Err(ClError::Validation("write_stream is for encrypted databases".into())),
+        }
     }
 
-    pub fn delete(&self, table: &str, id: &str) -> Result<bool> {
+    /// The size of an attachment's data.
+    pub(crate) fn size_of(&self, table: &str, id: &str) -> Result<u64> {
+        match &self.sealed {
+            Some(s) => s.size(table, id).map_err(io_error),
+            None => Ok(fs::metadata(self.path(table, id))?.len()),
+        }
+    }
+
+    /// Delete every sealed attachment not named in `keep`, and leftover temporary files. The
+    /// names are fingerprints that cannot be turned back, so what is wanted is named instead.
+    pub(crate) fn retain_only(&self, keep: &HashSet<(String, String)>) -> Result<usize> {
+        match &self.sealed {
+            Some(s) => s.retain_only(keep).map_err(io_error),
+            None => Ok(0),
+        }
+    }
+
+    /// The same for the attachments of tables with protected fields: `keep` names (table, row,
+    /// file) of every attachment still wanted. Returns how many files went.
+    pub(crate) fn retain_only_protected(&self, keep: &HashSet<(String, String, String)>) -> Result<usize> {
+        let Some(p) = &self.protected else { return Ok(0) };
+        let mut wanted = HashSet::new();
+        for (table, row, id) in keep {
+            if p.ids.contains_key(table) {
+                wanted.insert((p.place(table)?, ProtectedBlobs::file(row, id)));
+            }
+        }
+        p.store.retain_only(&wanted).map_err(io_error)
+    }
+
+    /// An attachment of a table with protected fields, opened as the attachment of `row`: it opens
+    /// only if it was sealed for exactly that table, place, row and file.
+    pub(crate) fn open_read_row(&self, table: &str, row: &str, id: &str) -> Result<BlobReader> {
+        match self.protected_of(table) {
+            Some(p) => {
+                let reader = p.store.open_read(&p.place(table)?, &ProtectedBlobs::file(row, id)).map_err(io_error)?;
+                Ok(BlobReader { inner: ReaderKind::Sealed(reader) })
+            }
+            None => self.open_read(table, id),
+        }
+    }
+
+    pub fn open_read(&self, table: &str, id: &str) -> Result<BlobReader> {
+        if self.is_protected(table) {
+            return Err(row_bound());
+        }
+        if let Some(s) = &self.sealed {
+            return Ok(BlobReader { inner: ReaderKind::Sealed(s.open_read(table, id).map_err(io_error)?) });
+        }
+        let path = self.path(table, id);
+        let file = OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .map_err(|e| ClError::IoError(e.to_string()))?;
+        Ok(BlobReader { inner: ReaderKind::Plain(file) })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn delete(&self, table: &str, id: &str) -> Result<bool> {
+        if let Some(s) = &self.sealed {
+            return s.delete(table, id).map_err(io_error);
+        }
         let path = self.path(table, id);
         if path.exists() {
             fs::remove_file(&path).map_err(|e| ClError::IoError(e.to_string()))?;
@@ -85,24 +346,13 @@ impl BlobStore {
         }
     }
 
-    pub fn copy(
-        &self,
-        table: &str,
-        id: &str,
-        dest: &BlobStore,
-        dest_table: &str,
-        dest_id: &str,
-    ) -> Result<()> {
-        let from = self.path(table, id);
-        let to = dest.path(dest_table, dest_id);
-        if let Some(parent) = to.parent() {
-            fs::create_dir_all(parent).map_err(|e| ClError::IoError(e.to_string()))?;
-        }
-        fs::copy(&from, &to).map_err(|e| ClError::IoError(e.to_string()))?;
-        Ok(())
-    }
-
     pub fn count_files(&self, table: &str) -> Result<usize> {
+        if let Some(p) = self.protected_of(table) {
+            return p.store.count_files(&p.place(table)?).map_err(io_error);
+        }
+        if let Some(s) = &self.sealed {
+            return s.count_files(table).map_err(io_error);
+        }
         let dir = self.table_dir(table);
         if !dir.exists() {
             return Ok(0);
@@ -118,6 +368,17 @@ impl BlobStore {
     }
 
     pub fn count_all_files(&self) -> Result<usize> {
+        let protected = match &self.protected {
+            Some(p) => p.store.count_all_files().map_err(io_error)?,
+            None => 0,
+        };
+        if let Some(s) = &self.sealed {
+            return Ok(protected + s.count_all_files().map_err(io_error)?);
+        }
+        Ok(protected + self.count_plain_files()?)
+    }
+
+    fn count_plain_files(&self) -> Result<usize> {
         let root = self.root();
         if !root.exists() {
             return Ok(0);
@@ -128,8 +389,8 @@ impl BlobStore {
             if !table_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 continue;
             }
-            for file_entry in fs::read_dir(table_entry.path())
-                .map_err(|e| ClError::IoError(e.to_string()))?
+            for file_entry in
+                fs::read_dir(table_entry.path()).map_err(|e| ClError::IoError(e.to_string()))?
             {
                 let file_entry = file_entry.map_err(|e| ClError::IoError(e.to_string()))?;
                 if file_entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
