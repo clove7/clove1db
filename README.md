@@ -511,19 +511,17 @@ Run 02, 05, 06 and 07 with `cargo run --release`.
 
 The data format of existing plain databases is unchanged, and they open as before. Code may need these changes:
 
-- **`ClError`** has new variants (`EncryptedOpenFailed`, `DataTampered`, `DatabaseInUse`, ...). A `match` without a wildcard arm must handle them. **`LibraryEvent`** is `#[non_exhaustive]`.
+- **`ClError`** has new variants (`EncryptedOpenFailed`, `DataTampered`, `DatabaseInUse`, `OutOfMemory`, ...). A `match` without a wildcard arm must handle them.
 - **Attachments are read through `BlobReader`** (`Read + Seek`, with `len()`) instead of `std::fs::File`.
 - **`RedbOptions`** is no longer `Copy` or `PartialEq`, and has new fields: build it with `..Default::default()`.
 - **`BackupManager::new`** takes `&RedbOptions`.
-- **`Unique::on` and `Unique::and`** take `impl UniqueField<E>`; ordinary calls compile as before.
-- **`fields::Compare`** has a new variant.
 - **`migration::DbMigrationRootIndex::tables`** is a `BTreeMap`.
 - **Inspecting a file never repairs it:** a file that needs repair gives `ClError::Validation` asking to open it normally first.
 - **Quarantined side files keep their whole name:** `index.json.corrupt.{time}`.
 - **A failed `build()` removes the database it was creating**, and only that.
 - **The examples** were rewritten: seven instead of nineteen.
 
-New in 0.1.0: whole-database encryption, protected fields and searching them, `ChangeProtection` and `ChangeFields`, `stream_external`, the keys file, `verify_encrypted_files`, parallel sealing, `DatabaseInUse`, out-of-memory errors instead of aborts on large allocations, `prefetch`.
+New in 0.1.0: typed queries, automatic indexes, the change log, whole-database encryption, protected fields and searching them, `ChangeProtection` and `ChangeFields`, `stream_external`, events, `DatabaseInUse`, out-of-memory errors instead of aborts on large allocations, `prefetch`. Every change is listed in [CHANGELOG.md](CHANGELOG.md).
 
 ### From 0.0.119 or earlier
 

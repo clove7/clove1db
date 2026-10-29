@@ -271,7 +271,7 @@ impl<E> PrintHandle<E> {
 
     /// A search for a piece of the value, confirmed: the candidates that `part_candidates` gives are
     /// opened inside the library and only the rows that really contain the text are returned.
-    /// See [`PartSearch`].
+    /// See [`PartSearch`](super::confirm::PartSearch).
     pub fn part_search(&self, text: impl Into<String>) -> super::confirm::PartSearch<E> {
         super::confirm::PartSearch { handle: *self, text: text.into(), filter: None, limit: None, report_rows: false }
     }

@@ -657,7 +657,7 @@ impl DatabaseConfig {
     /// `prefetch(false)` ([`Prefetch::Never`]) turns it off whatever the size, and `prefetch(true)`
     /// ([`Prefetch::Always`]) turns it on whatever the size.
     /// It only reads: nothing is written, a failure to read is ignored, and a database that another
-    /// program has open is still reported as [`ClError::DatabaseInUse`](crate::units::ClError::DatabaseInUse).
+    /// program has open is still reported as [`ClError::DatabaseInUse`].
     pub fn prefetch(mut self, mode: impl Into<Prefetch>) -> Self {
         self.prefetch = mode.into();
         self

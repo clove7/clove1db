@@ -9,7 +9,7 @@ pub struct ConflictEntry {
     pub policy: TargetConflictPolicy,
 }
 
-/// A source row skipped inside [`MigrateTo::migrate_json`] / [`MigrateTo::migrate_blob`].
+/// A source row skipped inside [`MigrateTo::migrate_json`](crate::migration::MigrateTo::migrate_json) / [`MigrateTo::migrate_blob`](crate::migration::MigrateTo::migrate_blob).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkippedEntry {
     pub key: String,

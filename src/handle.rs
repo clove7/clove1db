@@ -47,7 +47,7 @@ pub struct RedbOptions {
     /// Costs every commit a little (0.94 → 2.02 ms measured) and saves the
     /// whole repair after an unclean exit. Only helps if *every* commit sets
     /// it — redb decides from the last one — which is why all writes go
-    /// through [`DbRef::begin_write`].
+    /// through `DbRef::begin_write`.
     pub quick_repair: bool,
 
     /// Encrypt every file of the database. When set, each file goes through the encrypted file
