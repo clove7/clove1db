@@ -301,7 +301,7 @@ fn the_row_keys_are_in_the_event_only_when_asked_for_and_never_a_value() {
         .build()
         .unwrap();
     let domain = s.domain::<Balanced>();
-    for (i, v) in ["0599911123", "0511122233", "0577799911", "0500000000"].iter().enumerate() {
+    for (i, v) in ["5599911123", "5511122233", "5577799911", "5500000000"].iter().enumerate() {
         domain.repo().set(&format!("k{i}"), &Balanced { id: format!("k{i}"), group: "g".into(), phone: Sealed::new((*v).into()) }).unwrap();
     }
     let grant = domain.search_grant().unwrap();
@@ -314,7 +314,7 @@ fn the_row_keys_are_in_the_event_only_when_asked_for_and_never_a_value() {
     assert!(with_rows.iter().all(|k| k.starts_with('k')) && with_rows.len() as u64 == seen.confirms[0].1);
     assert!(seen.confirms[1].3.is_none());
     for event in &seen.all {
-        for secret in ["99911", "0599911123", "0511122233", "0577799911"] {
+        for secret in ["99911", "5599911123", "5511122233", "5577799911"] {
             assert!(!event.contains(secret), "{secret} in {event}");
         }
     }
@@ -331,7 +331,7 @@ fn a_text_shorter_than_a_part_is_refused() {
         .build()
         .unwrap();
     let domain = s.domain::<Balanced>();
-    domain.repo().set("a", &Balanced { id: "a".into(), group: "g".into(), phone: Sealed::new("0501234567".into()) }).unwrap();
+    domain.repo().set("a", &Balanced { id: "a".into(), group: "g".into(), phone: Sealed::new("5501234567".into()) }).unwrap();
     let grant = domain.search_grant().unwrap();
     let err = Balanced::phone.part_search("05").run(domain, &grant).unwrap_err().to_string();
     assert!(err.contains("slow scan"), "{err}");

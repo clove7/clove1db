@@ -3,6 +3,7 @@ pub mod chain;
 pub mod clove;
 pub mod decoder;
 #[allow(dead_code)] // used by the migration entry points as they are added
+#[cfg(feature = "encryption")]
 pub(crate) mod encrypted;
 pub mod guard;
 pub mod layout;
@@ -17,6 +18,7 @@ pub mod stream_external;
 pub mod types;
 
 pub use batch::MigrationBatch;
+#[cfg(feature = "encryption")]
 pub use encrypted::{
     run::{ChangeDone, ChangeProtection, ChangeReport, TableReport},
     fields::api::{ChangeFields, FieldChangeDone, FieldChangeReport, FieldReport, TableChange},

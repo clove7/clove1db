@@ -89,6 +89,9 @@ pub enum ClError {
     #[error("Migration error: {0}")]
     MigrationError(String),
 
+    #[error(transparent)]
+    StreamExternal(#[from] crate::migration::stream_external::StreamExternalError),
+
     #[error(
         "Version {version} ({schema_at_version}) is not restorable; current is {current_schema_version} (migration {migration_id})"
     )]
@@ -136,7 +139,7 @@ pub enum ClError {
     #[error("incompatible overwrite on table '{table}' key '{key}'")]
     IncompatibleOverwrite { table: String, key: String },
 
-    #[error("table mismatch: expected {expected:?}, found {found:?}")]
+    #[error("table mismatch: expected {expected:?}, found {found:?}. To add the missing tables to this database, set `DatabaseConfig::create_missing_tables(true)`")]
     TableMismatch {
         expected: Vec<String>,
         found: Vec<String>,
@@ -167,6 +170,19 @@ pub enum ClError {
     DataTampered,
 }
 
+/// Whether an I/O error is the encrypted layer reporting a file that was tampered with.
+#[cfg(feature = "encryption")]
+pub(crate) fn is_tamper(e: &std::io::Error) -> bool {
+    crate::encrypted_store::is_tamper(e)
+}
+
+/// Without the `encryption` feature there is no encrypted layer, so no error is a tamper.
+#[cfg(not(feature = "encryption"))]
+pub(crate) fn is_tamper(_: &std::io::Error) -> bool {
+    false
+}
+
+#[cfg(feature = "encryption")]
 impl From<crate::encrypted_store::StoreError> for ClError {
     fn from(e: crate::encrypted_store::StoreError) -> Self {
         use crate::encrypted_store::StoreError;
@@ -184,7 +200,7 @@ impl From<crate::encrypted_store::StoreError> for ClError {
 
 impl From<std::io::Error> for ClError {
     fn from(e: std::io::Error) -> Self {
-        if crate::encrypted_store::is_tamper(&e) {
+        if is_tamper(&e) {
             return ClError::DataTampered;
         }
         ClError::IoError(e.to_string())
@@ -212,7 +228,7 @@ impl From<redb::TableError> for ClError {
 impl From<StorageError> for ClError {
     fn from(e: StorageError) -> Self {
         if let StorageError::Io(io) = &e {
-            if crate::encrypted_store::is_tamper(io) {
+            if is_tamper(io) {
                 return ClError::DataTampered;
             }
         }

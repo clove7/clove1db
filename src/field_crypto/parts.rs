@@ -99,9 +99,9 @@ mod tests {
         // The key is random in each run, and a fingerprint of 12 bits has 4096 values: two of the 8 windows can share
         // one (about 0.7 in a hundred runs). So the count of different windows is asserted with 64 bits, where a clash
         // cannot happen in practice, and with 12 bits the count may only fall short by a clash.
-        let wide = part_tags(&k, "t", 1, &[], 3, 64, "0501234567").unwrap();
+        let wide = part_tags(&k, "t", 1, &[], 3, 64, "5550123456").unwrap();
         assert_eq!(wide.len(), 8, "10 characters, windows of 3, all different");
-        let tags = part_tags(&k, "t", 1, &[], 3, 12, "0501234567").unwrap();
+        let tags = part_tags(&k, "t", 1, &[], 3, 12, "5550123456").unwrap();
         assert!((6..=8).contains(&tags.len()), "8 windows, fewer only if fingerprints of 12 bits clash: {}", tags.len());
         assert!(tags.iter().all(|t| t.len() == 3 && t.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())));
         let mut sorted = tags.clone();
@@ -124,14 +124,14 @@ mod tests {
     fn the_windows_of_a_piece_are_among_the_windows_of_the_value() {
         let k = keys(true);
         // 64 bits: with a random key and 12 bits two windows can clash, which this test is not about.
-        let value = part_tags(&k, "t", 1, &[], 3, 64, "0501234567").unwrap();
+        let value = part_tags(&k, "t", 1, &[], 3, 64, "5550123456").unwrap();
         let piece = part_tags(&k, "t", 1, &[], 3, 64, "12345").unwrap();
         assert_eq!(piece.len(), 3);
         assert!(piece.iter().all(|t| value.contains(t)));
         let other = part_tags(&k, "t", 1, &[], 3, 64, "99999").unwrap();
         assert!(!other.iter().all(|t| value.contains(t)));
         // With 12 bits a piece's windows are still among the value's (no false negative), whatever the key.
-        let value12 = part_tags(&k, "t", 1, &[], 3, 12, "0501234567").unwrap();
+        let value12 = part_tags(&k, "t", 1, &[], 3, 12, "5550123456").unwrap();
         let piece12 = part_tags(&k, "t", 1, &[], 3, 12, "12345").unwrap();
         assert!(piece12.iter().all(|t| value12.contains(t)));
     }
@@ -162,10 +162,10 @@ mod tests {
         let k = keys(true);
         let kinds = [TransformKind::Trim, TransformKind::NormalizeArabic];
         assert_eq!(
-            part_tags(&k, "t", 1, &kinds, 4, 12, "  ٠٥٠١٢٣  ").unwrap(),
-            part_tags(&k, "t", 1, &kinds, 4, 12, "050123").unwrap()
+            part_tags(&k, "t", 1, &kinds, 4, 12, "  ٥٥٥١٢٣  ").unwrap(),
+            part_tags(&k, "t", 1, &kinds, 4, 12, "555123").unwrap()
         );
-        assert_eq!(normalized_len(&kinds, "  ٠٥٠١٢٣  "), 6);
+        assert_eq!(normalized_len(&kinds, "  ٥٥٥١٢٣  "), 6);
     }
 
     /// The index of a field of fingerprints cuts the stored text with `query::eval::tokens`, and a

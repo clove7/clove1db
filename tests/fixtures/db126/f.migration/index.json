@@ -1,0 +1,21 @@
+{
+  "index_version": 2,
+  "db_name": "f",
+  "tables": {
+    "docs": {
+      "schema_id": "docs",
+      "current_version": 1,
+      "initial_version": 1
+    },
+    "later": {
+      "schema_id": "later",
+      "current_version": 1,
+      "initial_version": 1
+    },
+    "att": {
+      "schema_id": "att",
+      "current_version": 1,
+      "initial_version": 1
+    }
+  }
+}

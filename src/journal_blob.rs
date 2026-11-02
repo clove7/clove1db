@@ -14,6 +14,13 @@ pub(crate) struct BlobRef {
     pub id: String,
     pub size: u64,
 }
+/// True for the name of a file `fsutil::write_atomic` was writing: `{name}.tmp.{pid}.{time}.{counter}`. A name that
+/// only ends in `.tmp` is a key like any other.
+pub(crate) fn is_temporary_name(name: &str) -> bool {
+    let mut parts = name.rsplitn(5, '.');
+    let numbers = (0..3).all(|_| parts.next().is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())));
+    numbers && parts.next() == Some("tmp")
+}
 pub(crate) fn key(table: &str, id: &str) -> String {
     serde_json::to_string(&(table, id)).expect("string pair")
 }
@@ -240,6 +247,50 @@ impl DatabaseManager {
         let reference = dest.prepare_copy_from(self, table, id, dest_table, dest_id)?;
         dest.journal_write(|tx, changes| put(tx, dest_table, dest_id, &reference, changes))
     }
+    /// A database that had no log when it was opened (see `journal::mark_adoption_due`) may hold
+    /// attachment files an older version wrote with `write_blob`, which keeps no reference and no row. Each
+    /// attachment table of this database that was not adopted yet gets a reference, `(table, file name)`
+    /// with the size of the file, for every such file, and is recorded as adopted in the same transaction.
+    /// Once recorded, a table is never adopted again, so an attachment its user deletes does not come back;
+    /// and a table that is registered later is adopted when it first is. This version writes only
+    /// `__v_*` names, so a table made by it has nothing to adopt. Temporary files are left to the clean-up.
+    fn adopt_legacy_files(&self, tx: &redb::WriteTransaction) -> Result<()> {
+        let seq = crate::journal::SEQ;
+        if tx.open_table(seq)?.get(crate::journal::ADOPTION_DUE)?.is_none() || self.blob_store()?.is_sealed() {
+            return Ok(());
+        }
+        for table in &self.tables_names {
+            if !self.is_blob_table(table) || self.blob_store()?.is_protected(table) {
+                continue;
+            }
+            let mark = format!("{}{table}", crate::journal::ADOPTED_PREFIX);
+            if tx.open_table(seq)?.get(mark.as_str())?.is_some() {
+                continue;
+            }
+            match std::fs::read_dir(self.blob_store()?.table_dir(table)) {
+                Ok(entries) => {
+                    for entry in entries {
+                        let entry = entry?;
+                        if !entry.file_type()?.is_file() {
+                            continue;
+                        }
+                        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                            continue;
+                        };
+                        if name.starts_with("__v_") || is_temporary_name(&name) || get(tx, table, &name)?.is_some() {
+                            continue;
+                        }
+                        let reference = BlobRef { id: name.clone(), size: entry.metadata()?.len() };
+                        tx.open_table(REFS)?.insert(key(table, &name).as_str(), serde_json::to_vec(&reference)?.as_slice())?;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            tx.open_table(seq)?.insert(mark.as_str(), [1u8].as_slice())?;
+        }
+        Ok(())
+    }
     /// At open, adopt legacy immutable files and collect only unreferenced files.
     pub(crate) fn reconcile_blobs(&self) -> Result<()> {
         if !self.blob_enabled() {
@@ -268,6 +319,7 @@ impl DatabaseManager {
                 }
             }
         }
+        self.adopt_legacy_files(&tx)?;
         tx.commit()?;
         let read = db.begin_read()?;
         // (table, row, file): the row matters to a table with protected fields, whose files are bound to it.
@@ -328,6 +380,11 @@ impl DatabaseManager {
                 continue;
             }
             let table = entry.file_name().to_string_lossy().into_owned();
+            // Only the folders of the attachment tables this database registers are cleaned. A folder of
+            // a table that is not registered now (left out of the configuration for a while) is not ours to empty.
+            if !self.is_blob_table(&table) {
+                continue;
+            }
             for file in std::fs::read_dir(entry.path())? {
                 let file = file?;
                 if file.file_type()?.is_file()

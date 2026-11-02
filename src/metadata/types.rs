@@ -58,7 +58,32 @@ pub struct TableMeta {
     /// The protected fields the table was created with. Absent for a table without any, so such
     /// a description is written exactly as before.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub sealed: Vec<crate::field_crypto::SealedField>,
+    pub sealed: Vec<SealedField>,
+}
+
+/// One protected field as written in the table description when the table was created.
+///
+/// The hash settings and the cipher are not here: they come from the code, so a reader of the
+/// description learns which fields are protected and how, but not with what. It is plain data
+/// stored in the file, so it exists with or without the `encryption` feature.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SealedField {
+    pub id: u32,
+    /// The key of the field in the stored row.
+    pub name: String,
+    /// The code of the protection method (`Method::code`, with the `encryption` feature).
+    pub method: u8,
+    /// For a verification hash: a keyed fingerprint of its settings, so a later change of the
+    /// settings in code is found at open. Absent for the other methods and for tables made before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<String>,
+    /// For fingerprints of parts: the length of a part, in characters. Absent for the other methods
+    /// and for a table made before the parts were fingerprinted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<u8>,
+    /// For fingerprints of parts: the bits kept of each part's fingerprint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bits: Option<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

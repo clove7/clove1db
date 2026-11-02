@@ -142,9 +142,11 @@ impl<E> Predicate<E> {
         }
     }
     /// A predicate built by the handle of a fingerprinted field: `printed` are the fingerprints in it.
+    #[cfg_attr(not(any(test, feature = "encryption")), allow(dead_code))]
     pub(crate) fn with_printed(expression: Expr, printed: Vec<String>) -> Self {
         Self { expression, printed, marker: PhantomData }
     }
+    #[cfg_attr(not(feature = "encryption"), allow(dead_code))]
     pub(crate) fn printed(&self) -> &[String] {
         &self.printed
     }

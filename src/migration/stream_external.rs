@@ -6,13 +6,13 @@
 //! of the file; the bytes of an attachment go straight to the file of its attachment (no JSON in
 //! between), and rows are committed in batches.
 //!
-//! The source is opened read only, so a scan, a stream and a check never write to it. A file that
-//! needs repair has to be repaired first with [`Options::repair`], which opens the file it is given
-//! for writing: give it a **copy**, never the only file you have.
-//!
-//! Three entry points do it all, with their choices in one [`Options`]: [`scan`] (the tables of
-//! the file, and the sizes of one table), [`stream`] and [`verify`]. Nothing here prints a value:
-//! the [`Report`] holds counts, sizes and fingerprints.
+//! The source stays read-only during inventory, scan, stream and verify.
+//! Only repair_copy opens a caller-provided copy for writing.
+//! Numeric keys become text ("10" sorts before "9"). Imports overwrite matching keys,
+//! without clearing other rows. Verification counts all target rows; unrelated rows
+//! make is_equal() false. A limit or failure leaves already committed batches.
+//! Protected-field tables require typed entity writes. AttachmentMeta is an intermediate
+//! shape for conversion into an application entity. Signatures: PNG, JPEG, GIF, WebP, PDF, ZIP.
 use crate::{
     entity::Entity,
     journal::ChangeKind,
@@ -22,7 +22,7 @@ use crate::{
 };
 use redb::{MultimapTableHandle, ReadableDatabase, ReadableTable, TableDefinition, TableHandle};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, io::Read, path::Path};
+use std::{collections::BTreeMap, io::Read, path::{Path, PathBuf}, ops::ControlFlow, time::Duration};
 
 /// Bytes of a value after which a file signature is no longer looked for.
 const SIGNATURE_WINDOW: usize = 64;
@@ -38,16 +38,17 @@ const SIGNATURES: [(&[u8], &str); 6] = [
 const BATCH_BYTES: usize = 8 * 1024 * 1024;
 /// A source file this large must be run with the free memory told (see [`Options::free_memory`]).
 const NEEDS_GATE: u64 = 1 << 30;
-/// Inside the walk of a table: the limit of rows was reached, which is not a failure.
-const STOPPED: &str = "stopped at the limit";
 
 /// The small row kept in the database for each attachment.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AttachmentMeta {
+    /// The key of the source row, as text.
     pub id: String,
     /// The number read from the value's prefix ([`FilePrefix::group_at`]); 0 without one.
     pub group: u64,
+    /// Bytes of the file, without the prefix.
     pub size: u64,
+    /// The file type, from its signature (`application/octet-stream` when unknown).
     pub mime: String,
 }
 
@@ -61,6 +62,7 @@ impl Entity for AttachmentMeta {
 /// its rows are the JSON of the source, as they are.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct JsonRow {
+    /// The key of the source row, as text.
     pub id: String,
 }
 
@@ -75,9 +77,9 @@ impl Entity for JsonRow {
 pub enum Kind {
     /// Number keys; each value is the bytes of one file, after the prefix [`Options::prefix`]
     /// describes when there is one. Moved to attachments.
-    #[default]
     Attachments,
     /// Number or text keys; each value is JSON (as text or bytes). Moved inline, as it is.
+    #[default]
     Json,
 }
 
@@ -89,7 +91,7 @@ pub enum Kind {
 pub struct FilePrefix {
     /// The first byte of a value that has the prefix.
     pub marker: u8,
-    /// The length of the prefix in bytes, `marker` included. At least 1.
+    /// The length of the prefix in bytes, `marker` included. 0 matches no value.
     pub len: usize,
     /// Where, inside the prefix, a little-endian 32-bit number sits that is kept as
     /// [`AttachmentMeta::group`]. `None`: the group is 0.
@@ -99,6 +101,7 @@ pub struct FilePrefix {
 /// How a scan, a stream or a check is done.
 #[derive(Clone, Debug)]
 pub struct Options {
+    /// What the source table holds. Default: [`Kind::Json`].
     pub kind: Kind,
     /// Attachments: the prefix the values of the table carry before each file. `None` (the
     /// default): every value is the file itself.
@@ -112,28 +115,22 @@ pub struct Options {
     /// In a scan: also look for a file signature in the whole of a value that shows none near its
     /// start (reads every byte of those values).
     pub deep_signature_check: bool,
-    /// In a scan: list every table of the file with its types and sizes ([`Report::tables`]).
-    pub inventory: bool,
-    /// In a scan: open the copy normally once first, so that redb repairs it if it was not closed
-    /// cleanly ([`Report::repair_seconds`]).
-    pub repair: bool,
     /// In a stream: the free memory the run may count on. The run is refused when the memory it is
     /// expected to need, plus `reserve_memory`, is more. Required for a source of 1 GiB or more.
     pub free_memory: Option<u64>,
+    /// Memory to keep free on top of the expected peak (default 4 GiB).
     pub reserve_memory: u64,
 }
 
 impl Default for Options {
     fn default() -> Self {
         Self {
-            kind: Kind::Attachments,
+            kind: Kind::Json,
             prefix: None,
             max_rows: 1000,
             source_cache_bytes: 64 * 1024 * 1024,
             limit: None,
             deep_signature_check: false,
-            inventory: false,
-            repair: false,
             free_memory: None,
             reserve_memory: 4 << 30,
         }
@@ -143,13 +140,17 @@ impl Default for Options {
 /// One table of an external file: its types, and what its rows are made of. Counts only.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TableInventory {
+    /// The name of the table.
     pub name: String,
     /// The type names redb records for the key and the value (`u64`, `&str`, `String`, ...).
     pub key_type: String,
     pub value_type: String,
+    /// Rows of the table (0 when they were not read).
     pub rows: u64,
+    /// Bytes of all keys, and of all values.
     pub key_bytes: u64,
     pub value_bytes: u64,
+    /// The smallest and the largest value, in bytes.
     pub smallest_value: u64,
     pub largest_value: u64,
     /// Values that start with the marker of [`Options::prefix`] (0 when no prefix is given).
@@ -161,65 +162,141 @@ pub struct TableInventory {
     pub note: String,
 }
 
-/// What a scan, a stream or a check found. Counts, sizes and fingerprints only; the fields a step
-/// does not fill stay zero.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct Report {
-    // the table
+/// Sizes measured by a scan or stream.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Sizes {
+    /// Rows read from the source.
     pub rows: u64,
+    /// Bytes of the source values, prefixes included.
     pub value_bytes: u64,
+    /// Bytes kept: each file without its prefix (attachments), or each row as it is (JSON).
     pub payload_bytes: u64,
+    /// The smallest and the largest source value, in bytes (0 for an empty table).
     pub smallest_value: u64,
     pub largest_value: u64,
-    /// Attachments: rows whose value has no prefix (kept whole, as a file), and rows whose payload
-    /// starts with no known file signature.
+}
+/// Measurements of one source table.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScanReport {
+    /// Rows and bytes of the table.
+    pub sizes: Sizes,
+    /// Attachments: values without the prefix of [`Options::prefix`] (kept whole, as a file).
     pub without_prefix: u64,
+    /// Attachments: files that start with no known file signature.
     pub without_signature: u64,
-    /// With `deep_signature_check`: of the rows without a signature near the start, those that
-    /// show one further in (found by looking through the whole value), and those that show none.
+    /// With [`Options::deep_signature_check`]: of the files without a signature at the start,
+    /// those that show one further in, and those that show none anywhere.
     pub late_signature: u64,
     pub no_signature_anywhere: u64,
+    /// Attachments: rows per file type, from the signature (`application/octet-stream` when unknown).
     pub mimes: BTreeMap<String, u64>,
     /// Json: rows that are not valid JSON.
     pub invalid_json: u64,
-    // scan options
-    pub repair_seconds: Option<f64>,
-    pub tables: Vec<TableInventory>,
-    // stream
+}
+/// Import counts and time spent writing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StreamReport {
+    /// Rows and bytes moved.
+    pub sizes: Sizes,
+    /// Attachments: values without the prefix of [`Options::prefix`] (kept whole, as a file).
+    pub without_prefix: u64,
+    /// Attachments: files that start with no known file signature.
+    pub without_signature: u64,
+    /// Batches committed.
     pub batches: u64,
-    /// Time spent writing the files of the attachments (each flushed to disk), and committing the rows.
-    pub files_nanos: u128,
-    pub commit_nanos: u128,
-    /// The memory a stream was expected to need at most.
+    /// Time spent writing the files of the attachments (each flushed to disk).
+    pub files_time: Duration,
+    /// Time spent committing the rows.
+    pub commit_time: Duration,
+    /// The memory the run was expected to need at most; 0 when [`Options::free_memory`] was not given.
     pub expected_peak_bytes: u64,
-    // check
-    /// The check was of attachments (so the attachments of the target are counted too).
+}
+/// Full source and target comparison.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VerifyReport {
+    /// Source rows read.
+    pub rows: u64,
+    /// The check was of attachments, so the attachments of the target are counted too.
     pub attachments: bool,
+    /// Rows of the target table, all of them (not only those that came from this source).
     pub target_rows: u64,
+    /// Attachments of the target table.
     pub target_attachments: u64,
+    /// Source rows found in the target and compared.
     pub checked: u64,
+    /// Source rows not found in the target.
     pub missing: u64,
+    /// Source rows found in the target with other bytes.
     pub different: u64,
-    /// The sum of a fingerprint of every row (its key and the hash of its content), taken on the
-    /// source side and on the target side. Equal when every row is there with the same bytes.
+    /// The sum of a fingerprint of every row (its key and the hash of its content): of every
+    /// source row, and of every target row that matched. Equal when every row is there with the
+    /// same bytes.
     pub source_fingerprint: u128,
     pub target_fingerprint: u128,
 }
-
-impl Report {
-    /// For a check: every source row is in the target with the same bytes, and nothing else is.
+impl VerifyReport {
+    /// All rows arrived with matching content and there are no extra target rows.
     pub fn is_equal(&self) -> bool {
-        self.missing == 0
-            && self.different == 0
-            && self.rows == self.target_rows
+        self.missing == 0 && self.different == 0 && self.rows == self.target_rows
             && (!self.attachments || self.rows == self.target_attachments)
-            && self.checked == self.rows
-            && self.source_fingerprint == self.target_fingerprint
+            && self.checked == self.rows && self.source_fingerprint == self.target_fingerprint
     }
 }
+/// Destination of an import or verification.
+#[derive(Clone, Copy)]
+pub struct Target<'a> {
+    /// The storage that holds the database.
+    pub storage: &'a Storage,
+    /// The name of the database, as it was added to the storage.
+    pub db: &'a str,
+    /// The table: registered with [`JsonRow`] for JSON rows, or with
+    /// `register_blob::<AttachmentMeta>` for attachments.
+    pub table: &'a str,
+}
 
-fn bad(why: impl Into<String>) -> ClError {
-    ClError::MigrationError(why.into())
+impl std::fmt::Debug for Target<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Target").field("db", &self.db).field("table", &self.table).finish_non_exhaustive()
+    }
+}
+/// Actionable errors from the external importer.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum StreamExternalError {
+    /// The source was not closed cleanly. Repair a copy with [`repair_copy`] and read the copy.
+    #[error("the file needs repair: {path:?}; repair a copy first")]
+    NeedsRepair { path: PathBuf },
+    /// The expected peak plus `reserve` does not fit in `free`.
+    #[error("the run needs {expected} bytes, with {free} free and {reserve} reserved; it was not started")]
+    NotEnoughMemory { expected: u64, free: u64, reserve: u64 },
+    /// A source row is not valid JSON. Batches committed before it stay.
+    #[error("source row {key:?} is not valid JSON")]
+    NotJson { key: String },
+    /// [`Kind::Attachments`] into a table not registered with attachments.
+    #[error("the target table is not a table with attachments")]
+    NotAttachmentTable,
+    /// The source table has key or value types this tool does not read.
+    #[error("unreadable source types: {key} / {value}")]
+    UnreadableTypes { key: String, value: String },
+    /// [`Options::max_rows`] is 0.
+    #[error("a batch needs at least one row")]
+    EmptyBatch,
+    /// A source of 1 GiB or more needs [`Options::free_memory`].
+    #[error("source has {bytes} bytes: free memory must be supplied; it was not started")]
+    LargeSourceNeedsFreeMemory { bytes: u64 },
+}
+impl Options {
+    /// Options for a table of JSON rows (the default).
+    pub fn json() -> Self { Self::default() }
+    /// Options for a table of files, with the prefix its values carry (`None`: no prefix).
+    pub fn attachments(prefix: Option<FilePrefix>) -> Self {
+        Self { kind: Kind::Attachments, prefix, ..Self::default() }
+    }
+}
+/// A prefix of length 0, which matches no value: set `marker` and `len`, and complete the rest
+/// with `..FilePrefix::default()`.
+impl Default for FilePrefix {
+    fn default() -> Self { Self { marker: 0, len: 0, group_at: None } }
 }
 
 fn io(e: impl std::fmt::Display) -> ClError {
@@ -228,21 +305,18 @@ fn io(e: impl std::fmt::Display) -> ClError {
 
 fn open_source(path: &Path, cache: usize) -> Result<redb::ReadOnlyDatabase> {
     redb::Database::builder().set_cache_size(cache).open_read_only(path).map_err(|e| match e {
-        redb::DatabaseError::RepairAborted => bad(format!(
-            "{}: the file needs repair; repair the copy first (it is never repaired while it is read)",
-            path.display()
-        )),
+        redb::DatabaseError::RepairAborted => StreamExternalError::NeedsRepair { path: path.to_path_buf() }.into(),
         e => io(e),
     })
 }
 
 /// Open a copy normally once, so that redb repairs it if it was not closed cleanly. Returns the
-/// seconds it took. It opens the file for writing: only for a copy.
-fn repair(path: &Path, cache_bytes: usize) -> Result<f64> {
+/// duration it took. It opens the file for writing: only for a copy.
+pub fn repair_copy(path: &Path, options: &Options) -> Result<Duration> {
     let start = std::time::Instant::now();
-    let db = redb::Database::builder().set_cache_size(cache_bytes).open(path).map_err(io)?;
+    let db = redb::Database::builder().set_cache_size(options.source_cache_bytes).open(path).map_err(io)?;
     drop(db);
-    Ok(start.elapsed().as_secs_f64())
+    Ok(start.elapsed())
 }
 
 /// A value of the attachments table split into its parts.
@@ -327,7 +401,7 @@ macro_rules! each {
         for row in $read.open_table(TableDefinition::<$K, $V>::new($name)).map_err(io)?.iter().map_err(io)? {
             let (k, v) = row.map_err(io)?;
             let $v = v.value();
-            $f(k.value().to_string(), $vbytes)?;
+            if $f(k.value().to_string(), $vbytes)?.is_break() { return Ok(()); }
         }
     }};
 }
@@ -344,8 +418,17 @@ fn table_types(read: &redb::ReadTransaction, name: &str) -> Result<(String, Stri
 
 /// Call `f(key_as_text, value_bytes)` for every row, in the order of the table, one at a time.
 /// Keys: numbers or text. Values: text or bytes. An error from `f` ends the walk.
-fn for_each_row(read: &redb::ReadTransaction, name: &str, f: &mut dyn FnMut(String, &[u8]) -> Result<()>) -> Result<()> {
+type RowVisitor<'a> = dyn FnMut(String, &[u8]) -> Result<ControlFlow<()>> + 'a;
+
+fn for_each_row(read: &redb::ReadTransaction, name: &str, limit: Option<u64>, f: &mut RowVisitor<'_>) -> Result<()> {
     let (kt, vt) = table_types(read, name)?;
+    let mut visited = 0u64;
+    let mut limited = |key, bytes: &[u8]| {
+        if limit.is_some_and(|n| visited >= n) { return Ok(ControlFlow::Break(())); }
+        visited += 1;
+        f(key, bytes)
+    };
+    let f = &mut limited;
     match (kt.as_str(), vt.as_str()) {
         ("u64", "&[u8]") => each!(read, name, u64, &[u8], f, |v| &v[..]),
         ("u64", "Vec<u8>") => each!(read, name, u64, Vec<u8>, f, |v| &v[..]),
@@ -363,17 +446,9 @@ fn for_each_row(read: &redb::ReadTransaction, name: &str, f: &mut dyn FnMut(Stri
         ("&str", "u64") => each!(read, name, &str, u64, f, |v| format!("{{\"value\":{v}}}").as_bytes()),
         ("String", "u64") => each!(read, name, String, u64, f, |v| format!("{{\"value\":{v}}}").as_bytes()),
         ("u64", "u64") => each!(read, name, u64, u64, f, |v| format!("{{\"value\":{v}}}").as_bytes()),
-        _ => return Err(bad(format!("the table has types this tool does not read ({kt} / {vt}); nothing was changed"))),
+        _ => return Err(StreamExternalError::UnreadableTypes { key: kt, value: vt }.into()),
     }
     Ok(())
-}
-
-/// [`for_each_row`] that ends quietly when `f` fails with [`STOPPED`] (the limit was reached).
-fn walk_until_stopped(read: &redb::ReadTransaction, name: &str, f: &mut dyn FnMut(String, &[u8]) -> Result<()>) -> Result<()> {
-    match for_each_row(read, name, f) {
-        Err(ClError::MigrationError(m)) if m == STOPPED => Ok(()),
-        other => other,
-    }
 }
 
 fn is_json(bytes: &[u8]) -> bool {
@@ -382,7 +457,7 @@ fn is_json(bytes: &[u8]) -> bool {
 
 /// List every table of the file with its types and, for the types it can read, the sizes of its
 /// rows, one row at a time.
-fn inventory(read: &redb::ReadTransaction, marker: Option<u8>) -> Result<Vec<TableInventory>> {
+fn inventory_tables(read: &redb::ReadTransaction, marker: Option<u8>) -> Result<Vec<TableInventory>> {
     let mut names: Vec<String> = read.list_tables().map_err(io)?.map(|t| t.name().to_string()).collect();
     names.sort();
     let mut out = Vec::new();
@@ -440,20 +515,20 @@ fn inventory(read: &redb::ReadTransaction, marker: Option<u8>) -> Result<Vec<Tab
 }
 
 /// Count the rows and sizes of one table, one row at a time (nothing is loaded).
-fn scan_table(read: &redb::ReadTransaction, table: &str, options: &Options, report: &mut Report) -> Result<()> {
-    report.smallest_value = u64::MAX;
+fn scan_table(read: &redb::ReadTransaction, table: &str, options: &Options, report: &mut ScanReport) -> Result<()> {
+    report.sizes.smallest_value = u64::MAX;
     match options.kind {
         Kind::Attachments => {
             // the table is opened with the types it declares (a key of numbers or of text, a value
             // of `&[u8]` or `Vec<u8>`), never read as another type
             let limit = options.limit;
-            walk_until_stopped(read, table, &mut |_, raw| {
+            for_each_row(read, table, options.limit, &mut |_, raw| {
                 let parts = split(raw, options.prefix.as_ref());
-                report.rows += 1;
-                report.value_bytes += raw.len() as u64;
-                report.payload_bytes += parts.payload.len() as u64;
-                report.smallest_value = report.smallest_value.min(raw.len() as u64);
-                report.largest_value = report.largest_value.max(raw.len() as u64);
+                report.sizes.rows += 1;
+                report.sizes.value_bytes += raw.len() as u64;
+                report.sizes.payload_bytes += parts.payload.len() as u64;
+                report.sizes.smallest_value = report.sizes.smallest_value.min(raw.len() as u64);
+                report.sizes.largest_value = report.sizes.largest_value.max(raw.len() as u64);
                 report.without_prefix += u64::from(parts.prefix_len == 0);
                 report.without_signature += u64::from(!parts.known);
                 if options.deep_signature_check && !parts.known {
@@ -463,30 +538,30 @@ fn scan_table(read: &redb::ReadTransaction, table: &str, options: &Options, repo
                     report.no_signature_anywhere += u64::from(!anywhere);
                 }
                 *report.mimes.entry(parts.mime.to_string()).or_default() += 1;
-                if limit.is_some_and(|n| report.rows >= n) {
-                    return Err(bad(STOPPED));
+                if limit.is_some_and(|n| report.sizes.rows >= n) {
+                    return Ok(ControlFlow::Break(()));
                 }
-                Ok(())
+                Ok(ControlFlow::Continue(()))
             })?;
         }
         Kind::Json => {
             let limit = options.limit;
-            walk_until_stopped(read, table, &mut |_, value| {
-                report.rows += 1;
-                report.value_bytes += value.len() as u64;
-                report.payload_bytes += value.len() as u64;
-                report.smallest_value = report.smallest_value.min(value.len() as u64);
-                report.largest_value = report.largest_value.max(value.len() as u64);
+            for_each_row(read, table, options.limit, &mut |_, value| {
+                report.sizes.rows += 1;
+                report.sizes.value_bytes += value.len() as u64;
+                report.sizes.payload_bytes += value.len() as u64;
+                report.sizes.smallest_value = report.sizes.smallest_value.min(value.len() as u64);
+                report.sizes.largest_value = report.sizes.largest_value.max(value.len() as u64);
                 report.invalid_json += u64::from(!is_json(value));
-                if limit.is_some_and(|n| report.rows >= n) {
-                    return Err(bad(STOPPED));
+                if limit.is_some_and(|n| report.sizes.rows >= n) {
+                    return Ok(ControlFlow::Break(()));
                 }
-                Ok(())
+                Ok(ControlFlow::Continue(()))
             })?;
         }
     }
-    if report.rows == 0 {
-        report.smallest_value = 0;
+    if report.sizes.rows == 0 {
+        report.sizes.smallest_value = 0;
     }
     Ok(())
 }
@@ -501,28 +576,23 @@ fn expected_peak(options: &Options, largest_value: u64) -> u64 {
 /// free memory. The free memory is told by the caller (the library does not ask the system).
 fn gate(expected_peak: u64, free_memory: u64, reserve_bytes: u64) -> Result<()> {
     if expected_peak.saturating_add(reserve_bytes) > free_memory {
-        return Err(bad(format!(
-            "the run needs about {expected_peak} bytes of memory and only {free_memory} are free with {reserve_bytes} to keep; it was not started"
-        )));
+        return Err(StreamExternalError::NotEnoughMemory { expected: expected_peak, free: free_memory, reserve: reserve_bytes }.into());
     }
     Ok(())
 }
 
-/// Look at a source: repair the copy ([`Options::repair`]), list the tables of the file
-/// ([`Options::inventory`]), and measure one `table` (leave it empty to look at the tables only).
-pub fn scan(source: &Path, table: &str, options: &Options) -> Result<Report> {
-    let mut report = Report::default();
-    if options.repair {
-        report.repair_seconds = Some(repair(source, options.source_cache_bytes)?);
-    }
+/// List every table of the source with its key and value types and, for the types this tool
+/// reads, the sizes of its rows. The source is only read.
+pub fn inventory(source: &Path, options: &Options) -> Result<Vec<TableInventory>> {
     let db = open_source(source, options.source_cache_bytes)?;
-    let read = db.begin_read().map_err(io)?;
-    if options.inventory {
-        report.tables = inventory(&read, options.prefix.map(|p| p.marker))?;
-    }
-    if !table.is_empty() {
-        scan_table(&read, table, options, &mut report)?;
-    }
+    inventory_tables(&db.begin_read().map_err(io)?, options.prefix.map(|p| p.marker))
+}
+/// Measure one table of the source: rows, sizes, file signatures (attachments) or invalid JSON.
+/// The source is only read.
+pub fn scan(source: &Path, table: &str, options: &Options) -> Result<ScanReport> {
+    let mut report = ScanReport::default();
+    let db = open_source(source, options.source_cache_bytes)?;
+    scan_table(&db.begin_read().map_err(io)?, table, options, &mut report)?;
     Ok(report)
 }
 
@@ -535,40 +605,43 @@ struct Pending {
 }
 
 /// Move the table `source_table` of the copy into `table` of database `db` of `storage`, with the
-/// rows committed in batches of `options.max_rows` rows (and no more than 8 MiB). Attachments go to
-/// a table with attachments whose rows are [`AttachmentMeta`]; JSON rows go to any table, as they
+/// rows committed at `options.max_rows` rows or 8 MiB (a single row is never split). Attachments go to
+/// a table with attachments whose rows are [`AttachmentMeta`]; JSON rows go to ordinary tables, as they
 /// are, keyed by the key of the source (a number as text). A source of 1 GiB or more is refused
 /// unless `options.free_memory` is told and the run fits in it. `progress` is called after each
 /// batch.
 pub fn stream(
     source: &Path,
     source_table: &str,
-    storage: &Storage,
-    db: &str,
-    table: &str,
+    target: Target<'_>,
     options: &Options,
-    progress: &mut dyn FnMut(&Report),
-) -> Result<Report> {
+    mut progress: Option<&mut dyn FnMut(&StreamReport)>,
+) -> Result<StreamReport> {
+    let Target { storage, db, table } = target;
     if options.max_rows == 0 {
-        return Err(bad("a batch needs at least one row"));
+        return Err(StreamExternalError::EmptyBatch.into());
     }
     let manager = storage.db_manager(db);
+    manager.refuse_sealed([table])?;
+    manager.ensure_writable()?;
+    crate::journal::validate_table(table)?;
     if options.kind == Kind::Attachments && !manager.is_blob_table(table) {
-        return Err(bad("the target table is not a table with attachments"));
+        return Err(StreamExternalError::NotAttachmentTable.into());
     }
-    let mut report = Report::default();
+    let mut report = StreamReport::default();
+    report.sizes.smallest_value = u64::MAX;
     let file_size = std::fs::metadata(source).map_err(io)?.len();
     match options.free_memory {
         Some(free) => {
             let src = open_source(source, options.source_cache_bytes)?;
             let read = src.begin_read().map_err(io)?;
-            let mut found = Report::default();
+            let mut found = ScanReport::default();
             scan_table(&read, source_table, &Options { deep_signature_check: false, ..options.clone() }, &mut found)?;
-            report.expected_peak_bytes = expected_peak(options, found.largest_value);
+            report.expected_peak_bytes = expected_peak(options, found.sizes.largest_value);
             gate(report.expected_peak_bytes, free, options.reserve_memory)?;
         }
         None if file_size >= NEEDS_GATE => {
-            return Err(bad("this source is 1 GiB or more: tell the free memory the run may count on; it was not started"));
+            return Err(StreamExternalError::LargeSourceNeedsFreeMemory { bytes: file_size }.into());
         }
         None => {}
     }
@@ -576,7 +649,7 @@ pub fn stream(
     let read = src.begin_read().map_err(io)?;
     let mut batch: Vec<Pending> = Vec::new();
     let mut batch_bytes = 0usize;
-    let flush = |batch: &mut Vec<Pending>, report: &mut Report| -> Result<()> {
+    let flush = |batch: &mut Vec<Pending>, report: &mut StreamReport| -> Result<()> {
         if batch.is_empty() {
             return Ok(());
         }
@@ -591,27 +664,28 @@ pub fn stream(
             }
             Ok(())
         })?;
-        report.commit_nanos += clock.elapsed().as_nanos();
+        manager.cache_after_raw_write(table, batch.iter().map(|p| (p.id.as_str(), p.row.as_slice())));
+        report.commit_time += clock.elapsed();
         report.batches += 1;
         batch.clear();
         Ok(())
     };
     let (limit, max_rows, kind) = (options.limit, options.max_rows, options.kind);
-    walk_until_stopped(&read, source_table, &mut |key: String, raw: &[u8]| -> Result<()> {
+    for_each_row(&read, source_table, options.limit, &mut |key: String, raw: &[u8]| -> Result<ControlFlow<()>> {
         match kind {
             Kind::Attachments => {
                 let parts = split(raw, options.prefix.as_ref());
                 // the bytes go to the file of the attachment as they are, never through JSON
                 let clock = std::time::Instant::now();
                 let reference = manager.prepare_blob(table, &key, parts.payload)?;
-                report.files_nanos += clock.elapsed().as_nanos();
+                report.files_time += clock.elapsed();
                 let meta = serde_json::to_vec(&AttachmentMeta {
                     id: key.clone(),
                     group: parts.group,
                     size: parts.payload.len() as u64,
                     mime: parts.mime.to_string(),
                 })?;
-                report.payload_bytes += parts.payload.len() as u64;
+                report.sizes.payload_bytes += parts.payload.len() as u64;
                 report.without_prefix += u64::from(parts.prefix_len == 0);
                 report.without_signature += u64::from(!parts.known);
                 batch_bytes += meta.len();
@@ -619,37 +693,41 @@ pub fn stream(
             }
             Kind::Json => {
                 if !is_json(raw) {
-                    return Err(bad("a row of the source is not valid JSON; nothing was changed in it"));
+                    return Err(StreamExternalError::NotJson { key }.into());
                 }
-                report.payload_bytes += raw.len() as u64;
+                report.sizes.payload_bytes += raw.len() as u64;
                 batch_bytes += raw.len();
                 batch.push(Pending { id: key, reference: None, row: raw.to_vec() });
             }
         }
-        report.rows += 1;
-        report.largest_value = report.largest_value.max(raw.len() as u64);
+        report.sizes.rows += 1;
+        report.sizes.value_bytes += raw.len() as u64;
+        report.sizes.smallest_value = report.sizes.smallest_value.min(raw.len() as u64);
+        report.sizes.largest_value = report.sizes.largest_value.max(raw.len() as u64);
         if batch.len() >= max_rows || batch_bytes >= BATCH_BYTES {
             flush(&mut batch, &mut report)?;
             batch_bytes = 0;
-            progress(&report);
+            if let Some(callback) = progress.as_mut() { callback(&report); }
         }
-        if limit.is_some_and(|n| report.rows >= n) {
-            return Err(bad(STOPPED));
+        if limit.is_some_and(|n| report.sizes.rows >= n) {
+            return Ok(ControlFlow::Break(()));
         }
-        Ok(())
+        Ok(ControlFlow::Continue(()))
     })?;
     flush(&mut batch, &mut report)?;
-    progress(&report);
+    if report.sizes.rows == 0 { report.sizes.smallest_value = 0; }
+    if let Some(callback) = progress.as_mut() { callback(&report); }
     Ok(report)
 }
 
 /// Check every row (not a sample): each source row against the row, or the attachment, now in the
 /// database, byte for byte by hash, and the counts on both sides.
-pub fn verify(source: &Path, source_table: &str, storage: &Storage, db: &str, table: &str, options: &Options) -> Result<Report> {
+pub fn verify(source: &Path, source_table: &str, target: Target<'_>, options: &Options) -> Result<VerifyReport> {
+    let Target { storage, db, table } = target;
     let manager = storage.db_manager(db);
     let src = open_source(source, options.source_cache_bytes)?;
     let read = src.begin_read().map_err(io)?;
-    let mut report = Report {
+    let mut report = VerifyReport {
         target_rows: manager.count_keys(table)? as u64,
         attachments: options.kind == Kind::Attachments,
         ..Default::default()
@@ -666,7 +744,7 @@ pub fn verify(source: &Path, source_table: &str, storage: &Storage, db: &str, ta
     let rows = target.open_table(TableDefinition::<&str, &[u8]>::new(table))?;
     let mut buf = vec![0u8; 64 * 1024];
     let (kind, limit) = (options.kind, options.limit);
-    walk_until_stopped(&read, source_table, &mut |key: String, raw: &[u8]| -> Result<()> {
+    for_each_row(&read, source_table, options.limit, &mut |key: String, raw: &[u8]| -> Result<ControlFlow<()>> {
         let content: &[u8] = if kind == Kind::Attachments { split(raw, options.prefix.as_ref()).payload } else { raw };
         let source_hash = blake3::hash(content);
         report.rows += 1;
@@ -675,7 +753,7 @@ pub fn verify(source: &Path, source_table: &str, storage: &Storage, db: &str, ta
             Kind::Attachments => {
                 let Ok(mut blob) = manager.open_current_blob(table, &key) else {
                     report.missing += 1;
-                    return Ok(());
+                    return Ok(ControlFlow::Continue(()));
                 };
                 let mut hasher = blake3::Hasher::new();
                 let mut total = 0u64;
@@ -693,7 +771,7 @@ pub fn verify(source: &Path, source_table: &str, storage: &Storage, db: &str, ta
                 Some(found) => (blake3::hash(found.value()), found.value().len() as u64),
                 None => {
                     report.missing += 1;
-                    return Ok(());
+                    return Ok(ControlFlow::Continue(()));
                 }
             },
         };
@@ -704,9 +782,9 @@ pub fn verify(source: &Path, source_table: &str, storage: &Storage, db: &str, ta
             report.target_fingerprint = report.target_fingerprint.wrapping_add(fingerprint(&key, &hash));
         }
         if limit.is_some_and(|n| report.rows >= n) {
-            return Err(bad(STOPPED));
+            return Ok(ControlFlow::Break(()));
         }
-        Ok(())
+        Ok(ControlFlow::Continue(()))
     })?;
     Ok(report)
 }

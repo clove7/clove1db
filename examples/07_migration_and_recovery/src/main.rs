@@ -26,7 +26,7 @@ use clove1db::{
     migration::{
         ChangeFields, ChangeProtection, ExternalFrom, KeyDecoder, MigrateOutcome, MigrateTo, MigrationTo,
         ValueDecoder, migrate_value,
-        stream_external::{self, JsonRow, Kind, Options},
+        stream_external::{self, JsonRow, Kind, Options, Target},
     },
     storage::{DatabaseConfig, Storage, StorageConfig},
     units::ClError,
@@ -243,17 +243,17 @@ fn foreign_file(root: &Path) -> Res<()> {
     // A large table is copied as it is, in batches, and checked row by row afterwards.
     let options = Options { kind: Kind::Json, max_rows: 250, ..Options::default() };
     let scanned = stream_external::scan(&vendor, "vendor_catalog", &options)?;
-    println!("  scan: {} rows, {} bytes, {} not JSON", scanned.rows, scanned.value_bytes, scanned.invalid_json);
+    println!("  scan: {} rows, {} bytes, {} not JSON", scanned.sizes.rows, scanned.sizes.value_bytes, scanned.invalid_json);
     let copy = Storage::builder(StorageConfig::default())
         .add_database(
             DatabaseConfig::new("copy", "copy").dir_path(dir.clone()).has_cache(false).register::<JsonRow>("vendor_catalog"),
         )
         .build()?;
     let mut batches = 0;
-    let streamed = stream_external::stream(&vendor, "vendor_catalog", &copy, "copy", "vendor_catalog", &options, &mut |_| batches += 1)?;
-    let verified = stream_external::verify(&vendor, "vendor_catalog", &copy, "copy", "vendor_catalog", &options)?;
-    println!("  stream: {} rows in {batches} progress reports; verify equal: {}", streamed.rows, verified.is_equal());
-    check(scanned.rows == 1_000 && streamed.rows == 1_000, "every row was copied")?;
+    let streamed = stream_external::stream(&vendor, "vendor_catalog", Target { storage: &copy, db: "copy", table: "vendor_catalog" }, &options, Some(&mut |_| batches += 1))?;
+    let verified = stream_external::verify(&vendor, "vendor_catalog", Target { storage: &copy, db: "copy", table: "vendor_catalog" }, &options)?;
+    println!("  stream: {} rows in {batches} progress reports; verify equal: {}", streamed.sizes.rows, verified.is_equal());
+    check(scanned.sizes.rows == 1_000 && streamed.sizes.rows == 1_000, "every row was copied")?;
     check(verified.is_equal(), "verify finds the copy equal to the source")?;
     copy.close();
     Ok(())

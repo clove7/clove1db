@@ -82,7 +82,7 @@ fn a_new_value_cannot_be_serialized_outside_the_storage_step() {
     let entity = fresh();
     let err = serde_json::to_string(&entity).unwrap_err().to_string();
     assert!(err.contains("can only be serialized by the storage"), "{err}");
-    assert!(!err.contains("966500000001") && !err.contains("hunter2"), "{err}");
+    assert!(!err.contains("15550100001") && !err.contains("hunter2"), "{err}");
 }
 
 #[test]
@@ -102,7 +102,7 @@ fn inside_the_storage_step_a_new_value_is_a_placeholder() {
     }
     assert_eq!(json["name"], "visible");
     let text = json.to_string();
-    for secret in ["966500000001", "hunter2", "000111", "tok-abc"] {
+    for secret in ["15550100001", "hunter2", "000111", "tok-abc"] {
         assert!(!text.contains(secret));
     }
 }
@@ -177,7 +177,7 @@ fn a_binding_names_the_place_exactly() {
 fn debug_never_shows_a_value() {
     let entity = fresh();
     let text = format!("{entity:?}");
-    for secret in ["966500000001", "hunter2", "000111", "tok-abc", "[1, 2, 3]"] {
+    for secret in ["15550100001", "hunter2", "000111", "tok-abc", "[1, 2, 3]"] {
         assert!(!text.contains(secret), "{text}");
     }
     assert!(text.contains("visible"));

@@ -76,7 +76,10 @@ impl<E, V> Clone for Field<E, V> {
     }
 }
 impl<E, V> Field<E, V> {
-    #[doc(hidden)]
+    /// A field written by hand, as `#[derive(CloveFields)]` would write it: `first` is the key as
+    /// stored in the JSON (after any serde `rename`), `kind` says how its value is read
+    /// (`ValueKind::Auto` for most fields). For an `Option<T>` field the type is `Field<Self, T>`.
+    /// It is a `const fn`, so it can initialise an associated constant.
     pub const fn new(first: &'static str, kind: ValueKind) -> Self {
         Self {
             first: Some(first),
@@ -86,7 +89,8 @@ impl<E, V> Field<E, V> {
             marker: PhantomData,
         }
     }
-    #[doc(hidden)]
+    /// A field written by hand for a struct that serde flattens into its parent (`#[serde(flatten)]`):
+    /// it has no key of its own, so it is joined to a parent field with [`Field::then`].
     pub const fn flattened(kind: ValueKind) -> Self {
         Self {
             first: None,

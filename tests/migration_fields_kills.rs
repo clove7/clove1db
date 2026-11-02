@@ -13,9 +13,11 @@ use clove1db::{
     migration::ChangeFields,
     storage::{DatabaseConfig, Storage, StorageConfig},
 };
+#[path = "child_log/mod.rs"]
+mod child_log;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 macro_rules! person {
@@ -269,8 +271,8 @@ fn child(root: &Path, kind: Kind, k: u8) -> Command {
         .env("CLOVE_FLD_ROOT", root)
         .env("CLOVE_FLD_KIND", kind.name())
         .env("CLOVE_FLD_KEY", k.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(child_log::out(root))
+        .stderr(child_log::out(root));
     c
 }
 
@@ -342,14 +344,15 @@ fn a_program_stopped_at_any_moment_leaves_the_database_as_it_was_or_as_it_is_to_
                     }
                     std::thread::sleep(Duration::from_millis(1));
                 }
-                assert!(running.wait().unwrap().success());
+                let st = running.wait().unwrap();
+                assert!(st.success(), "the measuring run failed: {}", child_log::why(&probe, st));
                 let total = started.elapsed();
                 whole = whole.max(total);
                 if let Some(at) = decided_at {
                     after_decision = after_decision.max(total.saturating_sub(at));
                 }
                 assert_eq!(contents(&probe, after_state, k, rows).unwrap(), before, "{kind:?} key {k}: the whole change");
-                let _ = std::fs::remove_dir_all(&probe);
+                child_log::clean(&probe);
             }
             let whole_ms = whole.as_millis() as f64;
             let (mut old_state, mut new_state, mut killed) = (0u64, 0u64, 0u64);
@@ -370,7 +373,7 @@ fn a_program_stopped_at_any_moment_leaves_the_database_as_it_was_or_as_it_is_to_
                     std::thread::sleep(Duration::from_micros(delay as u64));
                 }
                 match running.try_wait().unwrap() {
-                    Some(status) => assert!(status.success(), "{kind:?} key {k}, stop {i}: the change failed: {status:?}"),
+                    Some(status) => assert!(status.success(), "{kind:?} key {k}, stop {i}: the change failed: {}", child_log::why(&root, status)),
                     None => {
                         running.kill().unwrap();
                         killed += 1;
@@ -397,7 +400,7 @@ fn a_program_stopped_at_any_moment_leaves_the_database_as_it_was_or_as_it_is_to_
                         assert!(!in_files(&root, mark), "{kind:?} key {k}, stop {i}: the new state shows a clear value");
                     }
                 }
-                let _ = std::fs::remove_dir_all(&root);
+                child_log::clean(&root);
             }
             record(&format!(
                 "{kind:?} key {k}: {STOPS} stops over {whole_ms:.0} ms ({killed} killed while running): {old_state} left the old files, {new_state} the new ones"
@@ -438,10 +441,19 @@ fn a_crash_at_every_point_of_the_change_is_settled_by_the_next_open() {
         ("migration_before_markers_removed", true),
         ("migration_after_markers_removed", true),
     ];
-    let mut reached = std::collections::BTreeSet::new();
-    let mut new_files_checked = 0usize;
+    let reached = std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let new_files_checked = std::sync::atomic::AtomicUsize::new(0);
+    // each change with each cipher has its own databases and its own programs, so they run side by side
+    let mut units = Vec::new();
     for kind in [Kind::Seal, Kind::Open, Kind::Prints, Kind::Hash] {
         for k in [4u8, 5u8] {
+            units.push((kind, k));
+        }
+    }
+    std::thread::scope(|scope| {
+        for (kind, k) in units {
+            let (reached, new_files_checked) = (&reached, &new_files_checked);
+            scope.spawn(move || {
             let (before_state, after_state) = kind.states();
             let (_, rounds) = kind.rows();
             // small: only the points matter here
@@ -456,7 +468,7 @@ fn a_crash_at_every_point_of_the_change_is_settled_by_the_next_open() {
                 copy_dir(&root0, &root);
                 let status = child(&root, kind, k).env("CLOVE_CRASH_POINT", point).status().unwrap();
                 if status.code() == Some(99) {
-                    reached.insert((*point).to_string());
+                    reached.lock().unwrap().insert((*point).to_string());
                     // before the decision the new files made so far hold no clear value (the old files
                     // still do, they are the database): looked at before the next open settles them
                     if !*decided && let Some(mark) = gone_after(kind) {
@@ -465,7 +477,7 @@ fn a_crash_at_every_point_of_the_change_is_settled_by_the_next_open() {
                         for file in files.iter().filter(|f| f.file_name().is_some_and(|n| n.to_string_lossy().contains(".mig-"))) {
                             let bytes = std::fs::read(file).unwrap();
                             assert!(!bytes.windows(mark.len()).any(|w| w == mark), "{kind:?} key {k} at {point}: a clear value in {}", file.display());
-                            new_files_checked += 1;
+                            new_files_checked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         }
                     }
                     let got = if *decided {
@@ -481,14 +493,17 @@ fn a_crash_at_every_point_of_the_change_is_settled_by_the_next_open() {
                     }
                 } else {
                     // the point is not on this path (no keys file to write, say): it ran to the end
-                    assert!(status.success(), "{point}: {status:?}");
+                    assert!(status.success(), "{point}: {}", child_log::why(&root, status));
                     assert_eq!(contents(&root, after_state, k, rows).unwrap(), before, "{kind:?} key {k} past {point}");
                 }
-                let _ = std::fs::remove_dir_all(&root);
+                child_log::clean(&root);
             }
             let _ = std::fs::remove_dir_all(&root0);
+            });
         }
-    }
+    });
+    let reached = reached.into_inner().unwrap();
+    let new_files_checked = new_files_checked.into_inner();
     println!("crash points reached: {} of {}: {reached:?}; new files looked at before the decision: {new_files_checked}", reached.len(), points.len());
     assert!(new_files_checked >= 10, "only {new_files_checked} new files were looked at before the decision");
     for own in ["fields_after_main_written", "fields_after_history_written", "fields_after_keyfile_written", "fields_after_swap"] {

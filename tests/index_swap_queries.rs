@@ -91,7 +91,13 @@ fn one_run() -> (u64, u64, bool) {
     let started = Instant::now();
     let mut after_swap = None;
     let mut i = 0u64;
+    // The index is now built in one sorted pass and is hardly fragmented, so the compaction is asked for (once the index exists, and again every second until it happened)
+    let mut asked = Instant::now();
     while started.elapsed() < Duration::from_secs(90) {
+        if started.elapsed() > Duration::from_secs(3) && asked.elapsed() > Duration::from_secs(1) && !compacted.load(Ordering::Acquire) {
+            s.test_request_index_compaction();
+            asked = Instant::now();
+        }
         let w = needle(i * 13 + 5);
         let q = domain.query().filter(Doc::words.text(w.clone()));
         queries.fetch_add(1, Ordering::Relaxed);

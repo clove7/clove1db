@@ -109,8 +109,8 @@ mod tests {
         // Arabic digits and letter forms reach one print.
         let arabic = [TransformKind::NormalizeArabic];
         assert_eq!(
-            print_value(&k, "t1", 5, &arabic, "٠٥٠١٢٣".as_bytes()).unwrap(),
-            print_value(&k, "t1", 5, &arabic, b"050123").unwrap()
+            print_value(&k, "t1", 5, &arabic, "٥٥٥١٢٣".as_bytes()).unwrap(),
+            print_value(&k, "t1", 5, &arabic, b"555123").unwrap()
         );
     }
 

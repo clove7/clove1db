@@ -131,7 +131,8 @@ mod keyfile_tests;
 #[cfg(test)]
 mod entity_tests;
 
-pub use compat::{Plan, SealedField, check_layout};
+pub use crate::metadata::SealedField;
+pub use compat::{Plan, check_layout};
 pub use grant::{ReadGrant, Verifier};
 pub use method::{HashAlgo, Method};
 pub use confirm::{PartResults, PartSearch};

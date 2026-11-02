@@ -84,6 +84,7 @@ pub struct Query<E> {
     allow_stale: bool,
     forced:Option<PlanHint>,
     /// Set when the entity has protected fields: rows read are tied to their place.
+    #[cfg(feature = "encryption")]
     sealed: Option<std::sync::Arc<crate::field_crypto::SealedHooks<E>>>,
     marker: PhantomData<E>,
 }
@@ -123,17 +124,26 @@ impl<E: Entity> Query<E> {
             after: None,
             allow_stale: false,
             forced:None,
+            #[cfg(feature = "encryption")]
             sealed: None,
             marker: PhantomData,
         }
     }
+    #[cfg(feature = "encryption")]
     pub(crate) fn with_sealed(mut self, sealed: Option<std::sync::Arc<crate::field_crypto::SealedHooks<E>>>) -> Self {
         self.sealed = sealed;
         self
     }
     /// The entity of stored row `key`; protected fields stay closed and are tied to this row.
     fn decode_row(&self, key: &str, bytes: &[u8]) -> Result<E> {
+        #[cfg(feature = "encryption")]
         let mut value: E = serde_json::from_slice(bytes)?;
+        #[cfg(not(feature = "encryption"))]
+        let value: E = {
+            let _ = key;
+            serde_json::from_slice(bytes)?
+        };
+        #[cfg(feature = "encryption")]
         if let Some(hooks) = &self.sealed {
             hooks.bind(key, &mut value);
         }
@@ -168,6 +178,11 @@ impl<E: Entity> Query<E> {
     }
     /// A protected field holds sealed text, so it cannot be used to filter, order, group or
     /// aggregate: the stored text says nothing about the value. Refused when the query runs.
+    #[cfg(not(feature = "encryption"))]
+    fn refuse_protected(&self, _paths: &[Path]) -> Result<()> {
+        Ok(())
+    }
+    #[cfg(feature = "encryption")]
     fn refuse_protected(&self, paths: &[Path]) -> Result<()> {
         let Some(hooks) = &self.sealed else {
             return Ok(());
@@ -187,6 +202,11 @@ impl<E: Entity> Query<E> {
     /// one, and the filter may use a fingerprinted field only through the conditions its handle built
     /// with a search grant (see `field_crypto::check_filter`). Nothing of a refused value has been
     /// fingerprinted yet when this runs.
+    #[cfg(not(feature = "encryption"))]
+    fn refuse_protected_query(&self) -> Result<()> {
+        Ok(())
+    }
+    #[cfg(feature = "encryption")]
     fn refuse_protected_query(&self) -> Result<()> {
         let Some(hooks) = &self.sealed else {
             return Ok(());
@@ -598,7 +618,7 @@ impl<E: Entity> GroupQuery<E> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "derive"))]
 mod tests;
 
 impl<E:Entity> Query<E> {

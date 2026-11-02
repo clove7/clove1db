@@ -85,6 +85,7 @@ pub struct DatabaseManager {
     /// Tables registered with protected fields: raw byte writes to them are refused.
     pub(crate) sealed_tables: Arc<std::collections::HashSet<String>>,
     /// The keys of the protected fields, forgotten when the database is closed.
+    #[cfg(feature = "encryption")]
     pub(crate) field_keys: Option<Arc<crate::field_crypto::FieldKeys>>,
 }
 
@@ -113,7 +114,9 @@ impl DatabaseManager {
         Self::open_with_attachments(
             db, dir_path, backup_dir_path, dir_name, db_name, tables, cache_max_bytes, cache_ttl_seconds,
             cache_idle_seconds, has_cache, blob_enabled, table_storage, table_layouts, migration_registry,
-            durability, max_commit_batch_entries, redb, None,
+            durability, max_commit_batch_entries, redb,
+            #[cfg(feature = "encryption")]
+            None,
         )
     }
 
@@ -138,6 +141,7 @@ impl DatabaseManager {
         durability: DurabilityMode,
         max_commit_batch_entries: usize,
         redb: RedbOptions,
+        #[cfg(feature = "encryption")]
         protected_attachments: Option<(Arc<crate::field_crypto::FieldKeys>, Arc<std::collections::HashMap<String, String>>)>,
     ) -> Result<Self> {
         for table in &tables { crate::journal::validate_table(table)?; }
@@ -172,6 +176,7 @@ impl DatabaseManager {
 
         let db_ref = db.get()?;
         let write_txn = db_ref.begin_write()?;
+        crate::journal::mark_adoption_due(&write_txn)?;
         crate::journal::initialize(&write_txn)?;
         {
             let meta_table: TableDefinition<&str, &[u8]> = TableDefinition::new(META_TABLE);
@@ -229,7 +234,10 @@ impl DatabaseManager {
             db_name,
             &tables,
             durability,
+            #[cfg(feature = "encryption")]
             redb.encryption.as_ref().and_then(|e| e.context().cloned()),
+            #[cfg(not(feature = "encryption"))]
+            None,
             &crate::events::EventSink::default(),
         )?;
         for (table, layout) in &table_layouts {
@@ -239,10 +247,14 @@ impl DatabaseManager {
         let migration_index = Arc::new(RwLock::new(migration_index));
 
         let blob_store = if blob_enabled {
+            #[cfg(feature = "encryption")]
             let store = match redb.encryption.as_ref().and_then(|e| e.context()) {
                 Some(context) => BlobStore::with_encryption(dir_local.dir.as_path(), db_name, context.clone()),
                 None => BlobStore::new(dir_local.dir.as_path(), db_name),
             };
+            #[cfg(not(feature = "encryption"))]
+            let store = BlobStore::new(dir_local.dir.as_path(), db_name);
+            #[cfg(feature = "encryption")]
             let store = match protected_attachments {
                 Some((keys, ids)) if !ids.is_empty() => {
                     store.with_protected(keys as Arc<dyn crate::encrypted_store::FileKeys>, ids)
@@ -278,6 +290,7 @@ impl DatabaseManager {
             max_commit_batch_entries: max_commit_batch_entries.max(1),
             format_opens: Vec::new(),
             sealed_tables: Arc::new(std::collections::HashSet::new()),
+            #[cfg(feature = "encryption")]
             field_keys: None,
             blob_enabled,
             table_storage,
@@ -286,6 +299,7 @@ impl DatabaseManager {
             migration_registry,
             redb,
         };
+        crate::fsutil::maybe_crash("blob_before_reconcile");
         manager.reconcile_blobs()?;
         Ok(manager)
     }
@@ -404,6 +418,7 @@ impl DatabaseManager {
         if let Some(bm) = &self.backup_manager {
             bm.close();
         }
+        #[cfg(feature = "encryption")]
         if let Some(keys) = &self.field_keys {
             keys.clear();
         }
@@ -416,6 +431,7 @@ impl DatabaseManager {
 
     /// A checker of secrets against the verification hashes of this database (passwords, codes).
     /// It opens no value; every check is reported to the event sink.
+    #[cfg(feature = "encryption")]
     pub fn verifier(&self) -> Result<crate::field_crypto::Verifier> {
         drop(self.db()?);
         match &self.field_keys {
@@ -426,6 +442,7 @@ impl DatabaseManager {
 
     /// A permission to open protected values of this database, for the request in hand. The
     /// application decides who may have one; every use is reported to the event sink.
+    #[cfg(feature = "encryption")]
     pub fn read_grant(&self) -> Result<crate::field_crypto::ReadGrant> {
         drop(self.db()?);
         match &self.field_keys {
@@ -576,11 +593,51 @@ impl DatabaseManager {
         self.apply_changes(writes,deletes).map(|_|())
     }
 
+    /// Commit rows made by [`Repository::prepare`] together with raw writes and deletes in ONE
+    /// transaction, however many rows there are: the batch limit does not apply and the call is
+    /// never split, so either every change is in the file or none is.
+    ///
+    /// This is the way to write, in one step, an entity of a table with protected fields (it is
+    /// sealed by its repository) with plain rows of other tables and deletes. Uniqueness, the
+    /// change log, the cache and the search-key guard work as in [`Self::commit_batch_atomic`].
+    ///
+    /// Refused, with nothing written:
+    /// - raw bytes for a table with protected fields (only a prepared row may reach it);
+    /// - a prepared row made for another database;
+    /// - a prepared row of an attachments table (an attachment is written with `set_with_blob`).
+    ///
+    /// Like `commit_batch_atomic`, it writes no backup history.
+    pub fn commit_atomic(
+        &self,
+        prepared: &[PreparedRow],
+        writes: &[(String, String, Vec<u8>)],
+        deletes: &[(String, String)],
+    ) -> Result<()> {
+        self.refuse_sealed(writes.iter().map(|r| r.0.as_str()))?;
+        let mut all = Vec::with_capacity(prepared.len() + writes.len());
+        for row in prepared {
+            if !Arc::ptr_eq(&row.origin, &self.db) {
+                return Err(ClError::Validation(format!(
+                    "a prepared row of table '{}' was made for another database", row.table
+                )));
+            }
+            if self.is_blob_table(&row.table) {
+                return Err(ClError::Validation(format!(
+                    "table '{}' keeps attachments: a prepared row cannot be written to it (use `set_with_blob`)", row.table
+                )));
+            }
+            all.push((row.table.clone(), row.key.clone(), row.bytes.clone()));
+        }
+        all.extend(writes.iter().cloned());
+        self.apply_changes(&all, deletes).map(|_| ())
+    }
+
     /// Fails when one of `tables` was registered with protected fields: raw bytes cannot be sealed,
     /// so such a table is written through its entity.
     /// A program that opened the database with the search key alone only reads: every write is
     /// refused, also the rewrite of a row with its protected values unchanged.
-    fn ensure_writable(&self) -> Result<()> {
+    pub(crate) fn ensure_writable(&self) -> Result<()> {
+        #[cfg(feature = "encryption")]
         if self.field_keys.as_ref().is_some_and(|keys| keys.is_search_only()) {
             return Err(ClError::Validation(
                 "this program holds only the search key, so the database is read-only; open it with the read key to write".into(),
@@ -589,7 +646,7 @@ impl DatabaseManager {
         Ok(())
     }
 
-    fn refuse_sealed<'a>(&self, tables: impl IntoIterator<Item = &'a str>) -> Result<()> {
+    pub(crate) fn refuse_sealed<'a>(&self, tables: impl IntoIterator<Item = &'a str>) -> Result<()> {
         if self.sealed_tables.is_empty() {
             return Ok(());
         }
@@ -650,6 +707,16 @@ impl DatabaseManager {
     }
 
     pub(crate) fn journal_write<T>(&self,f:impl FnOnce(&redb::WriteTransaction,&mut Vec<crate::journal::ChangeKind>)->Result<T>)->Result<T> {crate::journal::write_with_sink(&self.db()?,self.journal_retention,&self.event_sink,f)}
+    pub(crate) fn primary_handle(&self) -> &Arc<DbHandle> { &self.db }
+
+    /// Update cached bytes only after their transaction commits.
+    pub(crate) fn cache_after_raw_write<'a>(&self, table: &str, rows: impl IntoIterator<Item = (&'a str, &'a [u8])>) {
+        if self.has_cache {
+            for (key, value) in rows {
+                self.memory_cache.insert(format!("{table}:{key}"), value.to_vec());
+            }
+        }
+    }
 
     fn apply_changes(&self, writes:&[(String,String,Vec<u8>)], deletes:&[(String,String)])->Result<Vec<bool>> {
         for table in writes.iter().map(|r|r.0.as_str()).chain(deletes.iter().map(|r|r.0.as_str())) {crate::journal::validate_table(table)?;}
@@ -676,7 +743,7 @@ impl DatabaseManager {
         })?;
         maybe_crash("after_commit");
         if self.has_cache {
-            for (table,key,value) in writes {self.memory_cache.insert(format!("{table}:{key}"),value.clone());}
+            for (table,key,value) in writes {self.cache_after_raw_write(table, std::iter::once((key.as_str(), value.as_slice())));}
             for (table,key) in deletes {self.memory_cache.invalidate(&format!("{table}:{key}"));}
         }
         Ok(removed)
@@ -1170,11 +1237,46 @@ impl Dir {
     }
 }
 
+/// One row in its stored form (a protected field already sealed), made by [`Repository::prepare`]
+/// and written by [`DatabaseManager::commit_atomic`].
+///
+/// Its fields are private and only `prepare` makes one, so bytes cannot be passed off as sealed:
+/// a table with protected fields accepts nothing else. A row belongs to the database of the
+/// repository that made it and is refused by any other. It also belongs to one opening of that
+/// database: a row prepared before the database was closed is refused after it is opened again.
+#[derive(Clone)]
+pub struct PreparedRow {
+    table: String,
+    key: String,
+    bytes: Vec<u8>,
+    origin: Arc<DbHandle>,
+}
+
+impl PreparedRow {
+    /// The table the row is for.
+    pub fn table(&self) -> &str {
+        &self.table
+    }
+
+    /// The key (the entity id) of the row.
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+}
+
+impl std::fmt::Debug for PreparedRow {
+    // The bytes are never shown: they may hold a value of a protected field.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedRow").field("table", &self.table).field("key", &self.key).finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone)]
 pub struct Repository<T: DeserializeOwned + Serialize + Clone + 'static> {
     pub table: &'static str,
     pub database_manager: DatabaseManager,
     /// Set for an entity registered with `register_sealed`.
+    #[cfg(feature = "encryption")]
     pub(crate) sealed: Option<Arc<crate::field_crypto::SealedHooks<T>>>,
     _marker: std::marker::PhantomData<T>,
 }
@@ -1184,11 +1286,13 @@ impl<T: DeserializeOwned + Serialize + Clone + Entity> Repository<T> {
         Self {
             table,
             database_manager,
+            #[cfg(feature = "encryption")]
             sealed: None,
             _marker: std::marker::PhantomData,
         }
     }
 
+    #[cfg(feature = "encryption")]
     pub(crate) fn new_sealed(
         table: &'static str,
         database_manager: DatabaseManager,
@@ -1200,15 +1304,25 @@ impl<T: DeserializeOwned + Serialize + Clone + Entity> Repository<T> {
     /// The stored bytes of `value` as row `id`: the plain JSON, or, for an entity with protected
     /// fields, the JSON with each protected field sealed.
     fn encode(&self, id: &str, value: &T) -> Result<Vec<u8>> {
-        match &self.sealed {
-            Some(hooks) => hooks.encode(id, value),
-            None => Ok(serde_json::to_vec(value)?),
+        #[cfg(feature = "encryption")]
+        if let Some(hooks) = &self.sealed {
+            return hooks.encode(id, value);
         }
+        #[cfg(not(feature = "encryption"))]
+        let _ = id;
+        Ok(serde_json::to_vec(value)?)
     }
 
     /// The entity of stored row `id`. Protected fields stay closed and are tied to this row.
     fn decode(&self, id: &str, bytes: &[u8]) -> Result<T> {
+        #[cfg(feature = "encryption")]
         let mut value: T = serde_json::from_slice(bytes)?;
+        #[cfg(not(feature = "encryption"))]
+        let value: T = {
+            let _ = id;
+            serde_json::from_slice(bytes)?
+        };
+        #[cfg(feature = "encryption")]
         if let Some(hooks) = &self.sealed {
             hooks.bind(id, &mut value);
         }
@@ -1216,6 +1330,7 @@ impl<T: DeserializeOwned + Serialize + Clone + Entity> Repository<T> {
     }
 
     /// Ties the protected fields of an entity built from a stored record of row `id` to that row.
+    #[cfg(feature = "encryption")]
     pub(crate) fn bind_entity(&self, id: &str, value: &mut T) {
         if let Some(hooks) = &self.sealed {
             hooks.bind(id, value);
@@ -1325,9 +1440,34 @@ impl<T: DeserializeOwned + Serialize + Clone + Entity> Repository<T> {
         Ok(())
     }
 
+    /// The stored form of `value` as row `id`, for [`DatabaseManager::commit_atomic`]: a table with
+    /// protected fields has them sealed (as `set` does), any other table gets the plain JSON.
+    /// Nothing is written. An attachments table is refused: its rows are written with `set_with_blob`.
+    pub fn prepare(&self, id: &str, value: &T) -> Result<PreparedRow> {
+        if self.database_manager.is_blob_table(self.table) {
+            return Err(ClError::Validation(format!(
+                "table '{}' keeps attachments: a row cannot be prepared for it (use `set_with_blob`)", self.table
+            )));
+        }
+        Ok(PreparedRow {
+            table: self.table.to_string(),
+            key: id.to_string(),
+            bytes: self.encode(id, value)?,
+            origin: Arc::clone(&self.database_manager.db),
+        })
+    }
+
     /// Writes several entities (and deletes several rows) of this table in bounded transactions.
     /// Each entity is encoded as `set` does, so protected fields are sealed. This is the way to
     /// write in batches to a table that has protected fields: the raw batch calls refuse it.
+    ///
+    /// **Not one operation above the limit.** A call with more than `max_commit_batch_entries`
+    /// writes and deletes (512 unless `DatabaseConfig::max_commit_batch_entries` says otherwise) is
+    /// split into several transactions, with no error and no warning: all the writes go first, in
+    /// chunks, then the deletes in chunks. A stop in between leaves the writes done and some or all
+    /// of the deletes not. Within the limit the call is one transaction. For a change that must
+    /// never be split, however large, and that may span several tables, use
+    /// [`Repository::prepare`] with [`DatabaseManager::commit_atomic`].
     pub fn commit_entities(&self, writes: &[(&str, &T)], deletes: &[&str]) -> Result<()> {
         let mut rows = Vec::with_capacity(writes.len());
         for (id, value) in writes {

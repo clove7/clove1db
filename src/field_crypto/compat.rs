@@ -1,32 +1,10 @@
 //! What a table remembers about its protected fields, and the check that the code still matches.
 use super::{method::Method, spec::SealedSpec};
+use crate::metadata::SealedField;
 use crate::units::{ClError, Result};
-use serde::{Deserialize, Serialize};
 
-/// One protected field as written in the table description when the table was created.
-///
-/// The hash settings and the cipher are not here: they come from the code, so a reader of the
-/// description learns which fields are protected and how, but not with what.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SealedField {
-    pub id: u32,
-    /// The key of the field in the stored row.
-    pub name: String,
-    /// [`Method::code`].
-    pub method: u8,
-    /// For a verification hash: a keyed fingerprint of its settings, so a later change of the
-    /// settings in code is found at open. Absent for the other methods and for tables made before.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub check: Option<String>,
-    /// For fingerprints of parts: the length of a part, in characters. Absent for the other methods
-    /// and for a table made before the parts were fingerprinted.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub window: Option<u8>,
-    /// For fingerprints of parts: the bits kept of each part's fingerprint.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bits: Option<u8>,
-}
-
+// `SealedField` itself is defined in `metadata::types`, which is always built: it is part of the table
+// description stored in the file, and it must not change with the `encryption` feature.
 impl SealedField {
     pub fn from_spec(spec: &SealedSpec) -> Self {
         let parts = spec.method.has_parts();
@@ -59,7 +37,8 @@ fn changed(table: &str, what: &str) -> ClError {
 /// Compares the protected fields the code declares with those the table remembers. Any difference
 /// in which fields are protected, in their key, or in their method is an error that writes nothing.
 ///
-/// `table_is_new` is true when the table has no rows and no stored description yet.
+/// `table_is_new` is true when the table has no rows and no stored description yet. It is judged for each
+/// table, not for the file: a table added to a database that already exists is new.
 pub fn check_layout(
     table: &str,
     code: &[SealedSpec],

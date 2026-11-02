@@ -59,6 +59,15 @@ const LOG_CHANNEL_CAPACITY: usize = 1024;
 
 
 
+/// What [`Storage::compact_database`] did: the size in bytes of the database's files together (main
+/// and history) before and after, and how long it took.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactReport {
+    pub before: u64,
+    pub after: u64,
+    pub took: std::time::Duration,
+}
+
 struct StorageInner {
     index_worker:crate::indexes::Worker,
 
@@ -113,6 +122,43 @@ impl Storage {
     }
 
 
+
+    /// Compact the files of one database: its main file and, when backup is enabled, its history file
+    /// (`.cldb.bak`). Plain or encrypted. The file shrinks to what it uses; a file never shrinks
+    /// otherwise, because pages freed by deletes and updates are reused but not given back.
+    ///
+    /// Reads and writes of **this database only** wait while it runs (other databases are not affected),
+    /// and nothing is lost if the process stops in the middle: redb moves pages with ordinary commits.
+    /// The index file (`.inx`) is not touched; the index worker compacts it itself. The worker lets go
+    /// of its reads on this database for the time, and a read or write transaction an application keeps
+    /// open (for instance a stream it has not finished) makes this fail with `TransactionInProgress`
+    /// after a short wait, changing nothing. `before` and `after` are the sizes of the files together.
+    pub fn compact_database(&self, name: &str) -> Result<CompactReport> {
+        let manager = self.0.database_managers.get(name).ok_or_else(|| {
+            ClError::Validation(format!("no database is registered under the name '{name}'"))
+        })?;
+        let start = std::time::Instant::now();
+        let _pause = self.0.index_worker.pause(name, std::time::Duration::from_secs(10))?;
+        // A read left open by a query that is just finishing ends in moments; one an application keeps does not.
+        let retry = |run: &dyn Fn() -> Result<(u64, u64)>| -> Result<(u64, u64)> {
+            let give_up = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                match run() {
+                    Err(ClError::Database(redb::Error::TransactionInProgress)) if std::time::Instant::now() < give_up => {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    other => return other,
+                }
+            }
+        };
+        let (mut before, mut after) = retry(&|| manager.primary_handle().compact())?;
+        if let Some(backup) = &manager.backup_manager {
+            let (b, a) = retry(&|| backup.compact())?;
+            before += b;
+            after += a;
+        }
+        Ok(CompactReport { before, after, took: start.elapsed() })
+    }
 
     pub fn db_manager(&self, name: &str) -> &DatabaseManager {
 
@@ -297,6 +343,7 @@ trait DomainFactory: Send + Sync {
     fn layout(&self) -> FieldLayout;
     fn storage(&self) -> TableStorageMode;
     /// The protected fields the entity declares.
+    #[cfg(feature = "encryption")]
     fn sealed(&self) -> &'static [crate::field_crypto::SealedSpec];
     fn build(
         &self,
@@ -308,8 +355,10 @@ trait DomainFactory: Send + Sync {
 /// What a table with protected fields needs when its repository is made.
 struct SealEnv<'a> {
     /// The keys of the database, when it has any.
+    #[cfg(feature = "encryption")]
     keys: Option<Arc<crate::field_crypto::FieldKeys>>,
     /// The identity recorded for each table that has protected fields.
+    #[cfg_attr(not(feature = "encryption"), allow(dead_code))]
     table_ids: &'a HashMap<String, String>,
 }
 
@@ -317,8 +366,10 @@ struct TypedFactory<E: Entity + serde::Serialize + Default> {
     table: &'static str,
     layout: FieldLayout,
     storage: TableStorageMode,
+    #[cfg(feature = "encryption")]
     sealed: &'static [crate::field_crypto::SealedSpec],
     /// Set by `register_sealed`: how to encode and bind a row of this entity.
+    #[cfg(feature = "encryption")]
     kit: Option<crate::field_crypto::SealedKit<E>>,
     _marker: PhantomData<fn() -> E>,
 }
@@ -338,6 +389,7 @@ impl<E: Entity + serde::Serialize + Default> DomainFactory for TypedFactory<E> {
         self.storage
     }
 
+    #[cfg(feature = "encryption")]
     fn sealed(&self) -> &'static [crate::field_crypto::SealedSpec] {
         self.sealed
     }
@@ -347,6 +399,9 @@ impl<E: Entity + serde::Serialize + Default> DomainFactory for TypedFactory<E> {
         database_manager: &DatabaseManager,
         seal: &SealEnv<'_>,
     ) -> Result<(TypeId, Box<dyn Any + Send + Sync>)> {
+        #[cfg(not(feature = "encryption"))]
+        let _ = seal;
+        #[cfg(feature = "encryption")]
         let repo = match self.kit {
             Some(kit) => {
                 let keys = seal.keys.clone().ok_or_else(|| {
@@ -362,6 +417,8 @@ impl<E: Entity + serde::Serialize + Default> DomainFactory for TypedFactory<E> {
             }
             None => Repository::<E>::new(self.table, database_manager.clone()),
         };
+        #[cfg(not(feature = "encryption"))]
+        let repo = Repository::<E>::new(self.table, database_manager.clone());
         let domain = Domain::new(repo);
         Ok((TypeId::of::<E>(), Box::new(domain)))
     }
@@ -439,8 +496,11 @@ pub struct DatabaseConfig {
     prefetch: Prefetch,
     journal_retention:crate::journal::Retention,
     unique:Vec<(TypeId,Vec<crate::Unique>)>,
+    #[cfg(feature = "encryption")]
     field_encryption: Option<Arc<crate::encrypted_store::EncryptionConfig>>,
+    #[cfg(feature = "encryption")]
     field_keys_file: Option<PathBuf>,
+    create_missing_tables: bool,
 }
 
 
@@ -490,8 +550,11 @@ impl DatabaseConfig {
             prefetch: Prefetch::Auto,
             journal_retention:crate::journal::Retention::Default,
             unique:Vec::new(),
+            #[cfg(feature = "encryption")]
             field_encryption: None,
+            #[cfg(feature = "encryption")]
             field_keys_file: None,
+            create_missing_tables: false,
 
         }
 
@@ -570,6 +633,7 @@ impl DatabaseConfig {
     /// `encrypted_store::verify_encrypted_files`; the whole file put back to an older state cannot
     /// be told; the number of files and their sizes are visible. Nothing converts a plain database
     /// in place: use a migration.
+    #[cfg(feature = "encryption")]
     pub fn encryption(mut self, config: crate::encrypted_store::EncryptionConfig) -> Self {
         self.redb.encryption = Some(crate::encrypted_store::EncryptionHandle::new(config));
         self
@@ -589,6 +653,7 @@ impl DatabaseConfig {
     /// The keys file is as safe as the programmer's keys: the data key in it is sealed under them,
     /// and a weak password can be guessed off the machine (the password is stretched, which only
     /// slows that down).
+    #[cfg(feature = "encryption")]
     pub fn field_encryption(mut self, config: crate::encrypted_store::EncryptionConfig) -> Self {
         self.field_encryption = Some(Arc::new(config));
         self
@@ -599,14 +664,26 @@ impl DatabaseConfig {
     /// copy of it taken alone is useless; the file must be kept somewhere else and backed up. If it
     /// is missing, or does not belong to this database, the library refuses to start, before it
     /// touches any file. **If this file is lost, the protected fields are lost for good.**
+    #[cfg(feature = "encryption")]
     pub fn field_keys_file(mut self, path: impl Into<PathBuf>) -> Self {
         self.field_keys_file = Some(path.into());
+        self
+    }
+
+    /// Create, empty, the registered tables that the database file does not have yet, when it is opened.
+    /// This is how a table is added to a database that already exists, plain or encrypted. Off by
+    /// default: a registered table missing from the file is then [`ClError::TableMismatch`], which
+    /// catches a wrong file and a misspelled table name instead of turning them into an empty table.
+    /// Every table created is reported in [`crate::LibraryEvent::TablesCreated`], names included.
+    pub fn create_missing_tables(mut self, create: bool) -> Self {
+        self.create_missing_tables = create;
         self
     }
 
     /// Speed settings of the encryption layer (call it after [`DatabaseConfig::encryption`]; without encryption it does nothing).
     /// Parallel sealing of a commit is on by default; see [`crate::EncryptionTuning`]. A database written
     /// with any setting opens with any other.
+    #[cfg(feature = "encryption")]
     pub fn encryption_tuning(mut self, tuning: crate::encrypted_store::EncryptionTuning) -> Self {
         if let Some(handle) = self.redb.encryption.take() {
             self.redb.encryption = Some(handle.with_tuning(tuning));
@@ -617,6 +694,7 @@ impl DatabaseConfig {
     /// With [`DatabaseConfig::encryption`]: read and check every block of each file at open, so
     /// a block put back from an older copy of the file is found before any data is used. A full
     /// read of each file at every open.
+    #[cfg(feature = "encryption")]
     pub fn encryption_verify_on_open(mut self, enabled: bool) -> Self {
         self.redb.verify_on_open = enabled;
         self
@@ -754,6 +832,7 @@ impl DatabaseConfig {
     ///
     /// The protected fields are fixed when the table is created: opening an existing table with a
     /// different declaration is an error that writes nothing.
+    #[cfg(feature = "encryption")]
     pub fn register_sealed<E>(self, table: &'static str) -> Self
     where
         E: Entity + serde::Serialize + Default + crate::field_crypto::SealedFields,
@@ -771,6 +850,7 @@ impl DatabaseConfig {
     /// protected fields, whatever the database itself is encrypted with, and is bound to the table,
     /// to the place of the attachment and to the row; the names of its folder and file are
     /// fingerprints that show neither the table nor the row.
+    #[cfg(feature = "encryption")]
     pub fn register_sealed_blob<E>(self, table: &'static str) -> Self
     where
         E: Entity + serde::Serialize + Default + crate::field_crypto::SealedFields,
@@ -788,24 +868,35 @@ impl DatabaseConfig {
         table: &'static str,
         storage: TableStorageMode,
     ) -> Self {
-        self.register_with_storage_and_sealed::<E>(table, storage, &[], None)
+        self.register_with_storage_and_sealed::<E>(
+            table,
+            storage,
+            #[cfg(feature = "encryption")]
+            &[],
+            #[cfg(feature = "encryption")]
+            None,
+        )
     }
 
     fn register_with_storage_and_sealed<E: Entity + serde::Serialize + Default>(
         mut self,
         table: &'static str,
         storage: TableStorageMode,
-        sealed: &'static [crate::field_crypto::SealedSpec],
-        kit: Option<crate::field_crypto::SealedKit<E>>,
+        #[cfg(feature = "encryption")] sealed: &'static [crate::field_crypto::SealedSpec],
+        #[cfg(feature = "encryption")] kit: Option<crate::field_crypto::SealedKit<E>>,
     ) -> Self {
         // A default entity holds new protected values, which serialize only inside this step.
+        #[cfg(feature = "encryption")]
         let scope = (!sealed.is_empty()).then(crate::field_crypto::SealScope::enter);
+        #[cfg_attr(not(feature = "encryption"), allow(unused_mut))]
         let mut layout =
             FieldLayout::capture_from_entity_json(&E::default()).unwrap_or_else(|_| {
                 FieldLayout::from_json_value(&serde_json::json!({}))
             });
+        #[cfg(feature = "encryption")]
         drop(scope);
         // A protected field is stored as text whatever it holds.
+        #[cfg(feature = "encryption")]
         for spec in sealed {
             layout.set_json_type(spec.key, "string");
         }
@@ -813,7 +904,9 @@ impl DatabaseConfig {
             table,
             layout,
             storage,
+            #[cfg(feature = "encryption")]
             sealed,
+            #[cfg(feature = "encryption")]
             kit,
             _marker: PhantomData,
         }));
@@ -1023,6 +1116,7 @@ impl StorageBuilder {
         // waiting), which would be taken for a new database; and the list of what this call makes
         // must not include files that the settling puts in place. If any database is being changed
         // right now (its marker is locked) the build fails before it touches any of them.
+        #[cfg(feature = "encryption")]
         {
             use crate::migration::encrypted::marker::{Migration, Places};
             let places_of = |config: &DatabaseConfig| {
@@ -1040,6 +1134,7 @@ impl StorageBuilder {
             }
         }
         // The shape of the encryption settings is checked before any file or folder is touched.
+        #[cfg(feature = "encryption")]
         for config in &self.database_configs {
             if let Some(encryption) = &config.redb.encryption {
                 let is_new = main_file_is_new(&config.dir_path.join(&config.dir_name).join(format!("{}.cldb", config.db_name)));
@@ -1082,11 +1177,13 @@ impl StorageBuilder {
                 ));
             }
 
+            #[cfg(feature = "encryption")]
             if config.redb.encryption.is_some() && config.field_encryption.is_some() {
                 return Err(ClError::Validation(
                     "set either `DatabaseConfig::encryption` or `DatabaseConfig::field_encryption`, not both".into(),
                 ));
             }
+            #[cfg(feature = "encryption")]
             if config.redb.encryption.is_none()
                 && config.field_encryption.is_none()
                 && config.factories.iter().any(|f| !f.sealed().is_empty())
@@ -1095,6 +1192,7 @@ impl StorageBuilder {
                     "a table with protected fields needs encryption keys: set `DatabaseConfig::encryption` or `DatabaseConfig::field_encryption`".into(),
                 ));
             }
+            #[cfg(feature = "encryption")]
             if let Some(keys) = &config.field_encryption
                 && !crate::encrypted_store::cipher_allowed(keys.suite.cipher)
             {
@@ -1102,6 +1200,7 @@ impl StorageBuilder {
             }
             // A keys file kept apart from the main file: it must be there for a database that exists,
             // and must not be there for one that does not. Decided before any file is touched.
+            #[cfg(feature = "encryption")]
             if let Some(path) = &config.field_keys_file {
                 if config.redb.encryption.is_some() {
                     return Err(ClError::Validation(
@@ -1116,7 +1215,10 @@ impl StorageBuilder {
                 if config.factories.iter().any(|f| !f.sealed().is_empty()) {
                     let main = config.dir_path.join(&config.dir_name).join(format!("{}.cldb", config.db_name));
                     let existing = !main_file_is_new(&main);
-                    if existing && !path.is_file() {
+                    // A missing file is an error only if the database already holds a table with protected
+                    // fields; one that does not yet gets its first protected table, and its keys, when it is
+                    // opened. Looked at read-only; a file that cannot be looked at counts as holding one.
+                    if existing && !path.is_file() && main_holds_protected_table(&main) {
                         return Err(ClError::Validation(format!(
                             "the keys file {} is missing: the protected fields of this database cannot be opened without it; nothing was opened",
                             path.display()
@@ -1132,6 +1234,7 @@ impl StorageBuilder {
             }
 
             // A unique constraint compares stored values; a protected field stores sealed text.
+            #[cfg(feature = "encryption")]
             for (entity, definitions) in &config.unique {
                 let Some(factory) = config.factories.iter().find(|f| f.entity_type() == *entity) else {
                     continue;
@@ -1166,6 +1269,7 @@ impl StorageBuilder {
 
                     storage: f.storage(),
 
+                    #[cfg(feature = "encryption")]
                     sealed: f.sealed(),
 
                 })
@@ -1211,9 +1315,13 @@ impl StorageBuilder {
 
                 event_sink: self.storage_config.event_sink.clone(),
 
+                #[cfg(feature = "encryption")]
                 field_encryption: config.field_encryption.clone(),
 
+                #[cfg(feature = "encryption")]
                 field_keys_file: config.field_keys_file.clone(),
+
+                create_missing_tables: config.create_missing_tables,
 
             })?;
 
@@ -1245,12 +1353,16 @@ impl StorageBuilder {
                 .iter()
                 .filter_map(|t| t.table_id.clone().map(|id| (t.name.clone(), id)))
                 .collect();
+            #[cfg(feature = "encryption")]
             let sealed_tables: std::collections::HashSet<String> = config
                 .factories
                 .iter()
                 .filter(|f| !f.sealed().is_empty())
                 .map(|f| f.table_name().to_string())
                 .collect();
+            #[cfg(not(feature = "encryption"))]
+            let sealed_tables: std::collections::HashSet<String> = std::collections::HashSet::new();
+            #[cfg(feature = "encryption")]
             let field_keys: Option<Arc<crate::field_crypto::FieldKeys>> = if sealed_tables.is_empty() {
                 None
             } else if let Some(keys) = upgrade.field_keys.clone() {
@@ -1267,6 +1379,7 @@ impl StorageBuilder {
             };
 
             // Attachments of tables that have protected fields are sealed with those fields' keys.
+            #[cfg(feature = "encryption")]
             let protected_attachments = field_keys.as_ref().and_then(|keys| {
                 let ids: HashMap<String, String> = config
                     .factories
@@ -1277,7 +1390,7 @@ impl StorageBuilder {
                 (!ids.is_empty()).then(|| (keys.clone(), Arc::new(ids)))
             });
 
-            #[cfg(test)]
+            #[cfg(all(test, feature = "encryption"))]
             let encrypted_here = config.redb.encryption.is_some() && config.db_name == "hooked";
             let mut db_manager = DatabaseManager::open_with_attachments(
                 upgrade.db,
@@ -1314,11 +1427,12 @@ impl StorageBuilder {
 
                 config.redb,
 
+                #[cfg(feature = "encryption")]
                 protected_attachments,
 
             )?;
 
-            #[cfg(test)]
+            #[cfg(all(test, feature = "encryption"))]
             if encrypted_here && FAIL_AFTER_OPEN.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(ClError::Validation("injected failure after the database opened".into()));
             }
@@ -1333,8 +1447,15 @@ impl StorageBuilder {
             db_manager.set_journal_retention(config.journal_retention)?;
             db_manager.format_opens = upgrade.format_opens;
             db_manager.sealed_tables = Arc::new(sealed_tables);
-            db_manager.field_keys = field_keys.clone();
-            let seal_env = SealEnv { keys: field_keys, table_ids: &table_ids };
+            #[cfg(feature = "encryption")]
+            {
+                db_manager.field_keys = field_keys.clone();
+            }
+            let seal_env = SealEnv {
+                #[cfg(feature = "encryption")]
+                keys: field_keys,
+                table_ids: &table_ids,
+            };
             for factory in &config.factories {
                 let (type_id, domain) = factory.build(&db_manager, &seal_env)?;
 
@@ -1371,8 +1492,21 @@ impl StorageBuilder {
 /// (an empty encrypted file made with a mistyped password, for example). Only paths that did not
 /// exist when the call started are listed; nothing that was there before is ever touched.
 /// Same rule as `EncryptionHandle::open_file`: a main file of zero length is a database that does not exist yet.
+#[cfg(feature = "encryption")]
 fn main_file_is_new(path: &std::path::Path) -> bool {
     !path.exists() || (path.is_file() && std::fs::metadata(path).map(|m| m.len() == 0).unwrap_or(false))
+}
+
+/// True when the main file's stored description lists a table with protected fields, or cannot be
+/// read. Opens the file read-only: nothing is written, not even redb's recovery mark.
+#[cfg(feature = "encryption")]
+fn main_holds_protected_table(path: &std::path::Path) -> bool {
+    redb::Database::builder()
+        .open_read_only(path)
+        .ok()
+        .and_then(|db| crate::metadata::store::read_meta(&db).ok().flatten())
+        .map(|meta| meta.tables.iter().any(|t| !t.sealed.is_empty()))
+        .unwrap_or(true)
 }
 
 #[derive(Default)]
@@ -1398,6 +1532,7 @@ impl CreatedByThisCall {
             Some(b) => b.join(&config.dir_name),
             None => dir.clone(),
         };
+        #[cfg_attr(not(feature = "encryption"), allow(unused_mut))]
         let mut candidates = vec![
             (dir.join(format!("{}.cldb", config.db_name)), false, "main"),
             (backup_dir.join(format!("{}.cldb.bak", config.db_name)), false, "bak"),
@@ -1405,9 +1540,11 @@ impl CreatedByThisCall {
             (dir.join(format!("{}.keys", config.db_name)), false, "sidecar"),
             (crate::migration::chain::DbMigrationIndex::migration_path(&dir, &config.db_name), true, "sidecar"),
             (crate::blob::blob_root(&dir, &config.db_name), true, "sidecar"),
+            #[cfg(feature = "encryption")]
             (crate::blob::protected_blob_root(&dir, &config.db_name), true, "sidecar"),
         ];
         // the keys file kept apart from the database, when this call makes it
+        #[cfg(feature = "encryption")]
         if let Some(path) = &config.field_keys_file {
             candidates.push((path.clone(), false, "sidecar"));
         }
@@ -1435,5 +1572,5 @@ impl CreatedByThisCall {
 
 /// Test hook: make the build fail after the database manager opened (files for the backup, the
 /// migration folder and the attachment folder exist by then).
-#[cfg(test)]
+#[cfg(all(test, feature = "encryption"))]
 pub(crate) static FAIL_AFTER_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

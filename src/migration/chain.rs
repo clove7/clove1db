@@ -9,7 +9,10 @@ use crate::durability::DurabilityMode;
 use crate::fsutil::{
     is_corrupt_index_bytes, quarantine_corrupt_file, write_atomic, write_atomic_json,
 };
+#[cfg(feature = "encryption")]
 use crate::encrypted_store::{EncryptionContext, SidecarFiles};
+#[cfg(not(feature = "encryption"))]
+use no_encryption::{EncryptionContext, SidecarFiles};
 use crate::events::{EventSink, LibraryEvent};
 use crate::migration::layout::FieldLayout;
 use crate::migration::step_registry::MigrationStepRegistry;
@@ -19,6 +22,37 @@ use crate::migration::types::{
 };
 use crate::units::{ClError, Result};
 use crate::upgrade::legacy_migration::{is_legacy_root_index, upgrade_legacy_migration_index};
+
+/// Stand-ins for the sealed files, for a build without the `encryption` feature: they have no
+/// value, so `MigrationFiles::sealed` is always `None` and the sealed branches never run.
+#[cfg(not(feature = "encryption"))]
+mod no_encryption {
+    use std::io;
+
+    #[derive(Debug, Clone)]
+    pub(crate) enum EncryptionContext {}
+
+    #[derive(Debug, Clone)]
+    pub(crate) enum SidecarFiles {}
+
+    impl SidecarFiles {
+        pub(crate) fn new(_dir: &std::path::Path, context: EncryptionContext) -> Self {
+            match context {}
+        }
+        pub(crate) fn exists(&self, _parts: &[&str]) -> io::Result<bool> {
+            match *self {}
+        }
+        pub(crate) fn read(&self, _parts: &[&str]) -> io::Result<Option<Vec<u8>>> {
+            match *self {}
+        }
+        pub(crate) fn write(&self, _parts: &[&str], _bytes: &[u8], _strict: bool) -> io::Result<()> {
+            match *self {}
+        }
+        pub(crate) fn set_aside(&self, _parts: &[&str], _stamp: u64) -> io::Result<()> {
+            match *self {}
+        }
+    }
+}
 
 /// How the migration files are read and written: as plain files, or, in an encrypted database,
 /// as sealed files under fingerprint names, bound to their logical place (`parts`).

@@ -1,0 +1,41 @@
+# Settings for `cargo nextest` (cargo install cargo-nextest). Not read by plain `cargo test`.
+#
+#   cargo nextest run --all-features        the ordinary round: no test starts and stops a real program, all cores, a time limit on each test
+#   cargo nextest run --all-features -P heavy   the tests that start real programs and stop them (kill or crash) at many moments
+#
+# A test belongs to the heavy round when it starts a real program and stops it. The list is in the two `default-filter` lines below;
+# a new kill or crash test is added to BOTH (one under `not (...)`, one without).
+
+[profile.default]
+# every round runs to its end and shows every failure, instead of stopping at the first one
+fail-fast = false
+# a test that takes more than 30 s is reported as slow, and one that takes more than 120 s is stopped and fails
+slow-timeout = { period = "30s", terminate-after = 4 }
+default-filter = """
+not (
+  binary(/^(encrypted_crash|encrypted_crash_points|encrypted_kills|field_crypto_kills|migration_fields_kills|migration_fields_whole_kills|migration_processes|migration_processes_fields|replay_budget_kill|sealed_search_kills)$/)
+  | test(/attachments_kills::/)
+  | test(/a_kill_between_the_log_and_the_adoption/)
+  | test(/journal_tests::crashes::/)
+  | test(/backup_tests::interrupted/)
+  | test(/handle_tests::(quick_repair|without_quick_repair)/)
+)
+"""
+
+[profile.heavy]
+inherits = "default"
+default-filter = """
+  binary(/^(encrypted_crash|encrypted_crash_points|encrypted_kills|field_crypto_kills|migration_fields_kills|migration_fields_whole_kills|migration_processes|migration_processes_fields|replay_budget_kill|sealed_search_kills)$/)
+  | test(/attachments_kills::/)
+  | test(/a_kill_between_the_log_and_the_adoption/)
+  | test(/journal_tests::crashes::/)
+  | test(/backup_tests::interrupted/)
+  | test(/handle_tests::(quick_repair|without_quick_repair)/)
+"""
+# these start and stop real programs and time them: they run with the time they need (a stuck one is stopped after 30 min)
+slow-timeout = { period = "60s", terminate-after = 30 }
+# the tests that stop a program at moments measured on an earlier run of it need the whole machine: another test beside them
+# makes the run longer than it was measured, and the stops fall after the end. Each takes every core, so it runs alone.
+[[profile.heavy.overrides]]
+filter = "test(/a_program_stopped_at_any_moment/)"
+threads-required = "num-cpus"

@@ -17,6 +17,7 @@ pub fn blob_table_dir(db_dir: &Path, db_name: &str, table: &str) -> PathBuf {
 }
 
 /// Where the attachments of tables with protected fields are kept: `{db_dir}/{db_name}.pblobs`.
+#[cfg(feature = "encryption")]
 pub fn protected_blob_root(db_dir: &Path, db_name: &str) -> PathBuf {
     db_dir.join(format!("{db_name}.pblobs"))
 }

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::durability::DurabilityMode;
 use crate::handle::{DbHandle, FileOpen, RedbOptions};
-use crate::metadata::inspect::{FileKind, inspect_database_with, inspect_open};
+use crate::metadata::inspect::{FileKind, inspect_database_inner, inspect_open};
 use crate::metadata::store::{create_meta_table, put_meta, read_meta};
 use crate::metadata::types::TableStorageMode;
 use crate::metadata::types::{BACKUP_FORMAT_V2, BackupFormat, CloveMeta, FileEra, TableMeta};
@@ -17,7 +17,7 @@ use crate::units::{ClError, Result};
 
 /// Test hook: make the first commit of a new encrypted database named `hooked` fail, after the file was created.
 /// (Only that name, so tests running in parallel with other databases are never hit.)
-#[cfg(test)]
+#[cfg(all(test, feature = "encryption"))]
 pub(crate) static FAIL_AFTER_CREATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub struct TableRegistration {
@@ -25,10 +25,12 @@ pub struct TableRegistration {
     pub layout: FieldLayout,
     pub storage: TableStorageMode,
     /// The protected fields the entity declares; empty for a table without any.
+    #[cfg(feature = "encryption")]
     pub sealed: &'static [crate::field_crypto::SealedSpec],
 }
 
 /// A new random identity for a table with protected fields: 16 bytes as lower-case hex.
+#[cfg(feature = "encryption")]
 fn new_table_id() -> Result<String> {
     let mut bytes = [0u8; 16];
     crate::crypto::random_bytes(&mut bytes)
@@ -40,13 +42,15 @@ fn new_table_id() -> Result<String> {
 /// them in `meta` for a table that is being created. Writes nothing: `meta` is stored later, in the
 /// same commit that stores the rest of the description. A difference is an error before any file
 /// is touched.
+#[cfg(feature = "encryption")]
 fn settle_sealed(
     meta: &mut CloveMeta,
     tables: &[TableRegistration],
-    table_is_new: bool,
+    new_tables: &[String],
 ) -> Result<()> {
     use crate::field_crypto::{Plan, SealedField, check_layout};
     for reg in tables {
+        let table_is_new = new_tables.contains(&reg.name);
         let stored: Vec<SealedField> = meta
             .tables
             .iter()
@@ -79,14 +83,16 @@ fn settle_sealed(
 /// hash; for an existing table, compares it with the settings the code declares now. A change of
 /// the settings is a migration, as a change of method is: every stored hash was made with the old
 /// ones. Writes nothing; the fingerprint is stored by the same first commit as the description.
+#[cfg(feature = "encryption")]
 fn settle_hash_settings(
     meta: &mut CloveMeta,
     tables: &[TableRegistration],
     keys: &crate::field_crypto::FieldKeys,
-    table_is_new: bool,
+    new_tables: &[String],
 ) -> Result<()> {
     use crate::field_crypto::Method;
     for reg in tables {
+        let table_is_new = new_tables.contains(&reg.name);
         let Some(table) = meta.tables.iter_mut().find(|t| t.name == reg.name) else {
             continue;
         };
@@ -154,9 +160,13 @@ pub struct UpgradeInput<'a> {
     /// Where encryption events go (the storage's own sink). Empty when none is set.
     pub(crate) event_sink: crate::events::EventSink,
     /// The keys for protected fields of a database that is not encrypted as a whole.
+    #[cfg(feature = "encryption")]
     pub(crate) field_encryption: Option<std::sync::Arc<crate::encrypted_store::EncryptionConfig>>,
     /// Keep the locked data key in this file only, and none in the main file.
+    #[cfg(feature = "encryption")]
     pub(crate) field_keys_file: Option<std::path::PathBuf>,
+    /// Create the registered tables the file lacks instead of refusing the open.
+    pub(crate) create_missing_tables: bool,
 }
 
 pub struct UpgradeOutput {
@@ -167,10 +177,12 @@ pub struct UpgradeOutput {
     pub db: DbHandle,
     pub(crate) format_opens: Vec<FileOpen>,
     /// The keys of the protected fields of a database that is not encrypted as a whole.
+    #[cfg(feature = "encryption")]
     pub(crate) field_keys: Option<std::sync::Arc<crate::field_crypto::FieldKeys>>,
 }
 
 /// A keys file to write: the full content, where, and whether a file was there already.
+#[cfg(feature = "encryption")]
 struct KeyFilePlan {
     path: std::path::PathBuf,
     bytes: Vec<u8>,
@@ -196,17 +208,30 @@ impl OpenUpgradePipeline {
         });
         let migration_dir = db_dir.join(migration_dir_name(input.db_name));
         // A new encrypted database is made under this name and gets its final one only when it is complete.
+        #[cfg_attr(not(feature = "encryption"), allow(unused_variables))]
         let pending_path = db_dir.join(format!("{}.cldb.new", input.db_name));
         // A change of the database's files that a crash cut short is settled before any file is opened:
         // finished if it had been decided, undone if not.
+        #[cfg(feature = "encryption")]
         {
             use crate::migration::encrypted::marker::{Migration, Places};
             let backup_folder = input.backup_dir_path.map(|bp| bp.join(input.dir_name));
             let places = Places { main: db_dir.as_path(), backup: backup_folder.as_deref().unwrap_or(db_dir.as_path()) };
             Migration::recover(places, input.db_name)?;
         }
+        #[cfg(feature = "encryption")]
         if input.redb.encryption.is_some() {
             clear_interrupted_creation(input, &db_dir, &primary_path, &pending_path, backup_path.as_deref(), &migration_dir)?;
+        }
+        // Without the `encryption` feature a table with protected fields cannot be opened: its rows hold
+        // sealed values this build cannot read, and writing plain JSON beside them would mix the two
+        // without a sign (the attachments of such a table go with it). Looked at read-only, before the
+        // file is opened for writing, so a refusal leaves it as it was.
+        #[cfg(not(feature = "encryption"))]
+        if let Some(table) = first_protected_table(&primary_path)? {
+            return Err(ClError::Validation(format!(
+                "table `{table}` has protected fields: enable the `encryption` feature of clove1db to open this database"
+            )));
         }
         // declared before `handle`, so the file is closed before this removes it
         let mut pending = PendingFile(None);
@@ -222,6 +247,19 @@ impl OpenUpgradePipeline {
             None
         };
 
+        // The read-only look above cannot open a file that needs repair; redb repairs it in the open
+        // just made, so the description is looked at again here, before the library writes anything.
+        #[cfg(not(feature = "encryption"))]
+        if let Some(handle) = &handle
+            && let Ok(Some(stored)) = read_meta(handle.get()?.raw())
+            && let Some(table) = stored.tables.iter().find(|t| !t.sealed.is_empty())
+        {
+            return Err(ClError::Validation(format!(
+                "table `{}` has protected fields: enable the `encryption` feature of clove1db to open this database",
+                table.name
+            )));
+        }
+
         let inspection = match &handle {
             Some(handle) => inspect_open(
                 handle.get()?.raw(),
@@ -229,10 +267,11 @@ impl OpenUpgradePipeline {
                 backup_path.as_deref(),
                 &migration_dir,
             )?,
-            None => inspect_database_with(
+            None => inspect_database_inner(
                 &primary_path,
                 backup_path.as_deref(),
                 &migration_dir,
+                #[cfg(feature = "encryption")]
                 input.redb.encryption.as_ref(),
             )?,
         };
@@ -246,11 +285,16 @@ impl OpenUpgradePipeline {
             _ => {}
         }
 
+        // The registered tables the file lacks: refused, or (with the option) created empty by the
+        // manager when it opens every table, and reported once the open has succeeded.
+        let mut created_tables: Vec<String> = Vec::new();
         if inspection.kind != FileKind::New {
-            validate_tables(
-                &input.tables.iter().map(|t| t.name.clone()).collect::<Vec<_>>(),
-                &inspection.tables,
-            )?;
+            let registered: Vec<String> = input.tables.iter().map(|t| t.name.clone()).collect();
+            if input.create_missing_tables {
+                created_tables = registered.iter().filter(|t| !inspection.tables.contains(t)).cloned().collect();
+            } else {
+                validate_tables(&registered, &inspection.tables)?;
+            }
         }
 
         let file_era = resolve_file_era(&inspection);
@@ -270,18 +314,49 @@ impl OpenUpgradePipeline {
             }
         }
 
+        // A table registered now that the stored description does not list yet is added to it, so a
+        // table added to an existing database is described like any other.
+        for reg in input.tables {
+            if !meta.tables.iter().any(|t| t.name == reg.name) {
+                meta.tables.push(TableMeta {
+                    name: reg.name.clone(),
+                    schema_id: reg.name.clone(),
+                    schema_version: 1,
+                    layout_hash: reg.layout.layout_hash.clone(),
+                    storage: reg.storage,
+                    table_id: None,
+                    sealed: Vec::new(),
+                });
+            }
+        }
+
+        // Whether the file already holds a table with protected fields: only then can a value
+        // sealed under keys exist, so only then are missing keys an error and not a first start.
+        #[cfg(feature = "encryption")]
+        let has_saved_sealed = meta.tables.iter().any(|t| !t.sealed.is_empty());
+        // "New" is judged per table: a table the file does not have, or has empty and without a
+        // stored description of protected fields (nothing sealed can exist in it yet). Only
+        // tables with protected fields need the answer.
+        #[cfg(feature = "encryption")]
+        let new_tables = new_sealed_tables(input.tables, &meta, &inspection, handle.as_ref(), &input.redb, backup_path.as_deref())?;
+
         // The protected fields must be the ones the table was created with. This only reads and
         // changes `meta` in memory: nothing is written here, and a difference returns before any
-        // file is touched. (A table that already exists in the file is never "new".)
-        settle_sealed(&mut meta, input.tables, inspection.kind == FileKind::New)?;
+        // file is touched. (A table with rows, or with a stored description, is never "new".)
+        #[cfg(feature = "encryption")]
+        settle_sealed(&mut meta, input.tables, &new_tables)?;
 
         // The keys of the protected fields of a database that is not encrypted as a whole: read
         // from the file when it exists, made now (and stored by the first commit below) when it
         // is new. Nothing is written here.
+        #[cfg(feature = "encryption")]
         let mut field_keys = None;
+        #[cfg(feature = "encryption")]
         let mut new_locked_key = None;
         // The keys file: written just before the first commit, and only when its content changes.
+        #[cfg(feature = "encryption")]
         let mut key_file: Option<KeyFilePlan> = None;
+        #[cfg(feature = "encryption")]
         if let Some(config) = &input.field_encryption
             && input.tables.iter().any(|t| !t.sealed.is_empty())
         {
@@ -292,12 +367,17 @@ impl OpenUpgradePipeline {
                 .field_keys_file
                 .clone()
                 .unwrap_or_else(|| keyfile::default_path(&db_dir, input.db_name));
-            // Read-only; a file that is not exactly the format is a tamper error, before anything is written.
-            let file = if is_new && !external { None } else { keyfile::read_file(&file_path)? };
             let in_main = match (&handle, is_new) {
                 (Some(handle), false) => keystore::read(handle.get()?.raw())?,
                 _ => None,
             };
+            // The keys are made now when the file is new, or when it holds no table with protected
+            // fields and no keys yet (the first protected table of a database that had none). Nothing
+            // sealed can exist then, so a keys file next to it is a leftover of an attempt that stopped
+            // before its first write, and is replaced.
+            let first_keys = is_new || (in_main.is_none() && !has_saved_sealed);
+            // Read-only; a file that is not exactly the format is a tamper error, before anything is written.
+            let file = if first_keys && !external { None } else { keyfile::read_file(&file_path)? };
             let stored = if external {
                 if in_main.is_some() {
                     return Err(ClError::Validation(
@@ -319,10 +399,16 @@ impl OpenUpgradePipeline {
                     }
                     field_keys = Some(keys);
                 }
-                None if is_new => {
+                None if first_keys => {
                     let (locked, keys) = keystore::create(config)?;
                     new_locked_key = Some(locked);
                     field_keys = Some(keys);
+                }
+                None if external => {
+                    return Err(ClError::Validation(format!(
+                        "the keys file {} is missing: the protected fields of this database cannot be opened without it; nothing was opened",
+                        file_path.display()
+                    )));
                 }
                 None => {
                     return Err(ClError::Validation(
@@ -368,9 +454,23 @@ impl OpenUpgradePipeline {
             }
         }
 
+        // A table with protected fields is created with its description and, for the first one, the
+        // keys; a program that holds only the search key can do neither.
+        #[cfg(feature = "encryption")]
+        if field_keys.as_ref().is_some_and(|k| k.is_search_only())
+            && let Some(reg) = input.tables.iter().find(|t| !t.sealed.is_empty() && new_tables.contains(&t.name))
+        {
+            return Err(ClError::Validation(format!(
+                "table '{}': a table with protected fields can only be created by a program that holds the read key; nothing was written",
+                reg.name
+            )));
+        }
+
         // An encrypted database needs its main file open before anything else is written, because
         // that is what unlocks the key for the side files. (A plain database keeps its order.)
+        #[cfg(feature = "encryption")]
         let mut handle = handle;
+        #[cfg(feature = "encryption")]
         if handle.is_none() && input.redb.encryption.is_some() {
             handle = Some(DbHandle::create_with_events(
                 &pending_path,
@@ -388,6 +488,7 @@ impl OpenUpgradePipeline {
         // are not stored, only a keyed fingerprint of them, which needs the field hash key: the
         // keys of the field-only encryption, or those of the whole-database encryption now that
         // its main file is open. A program with the search key alone cannot compare and skips this.
+        #[cfg(feature = "encryption")]
         let check_keys = match (&field_keys, input.redb.encryption.as_ref().and_then(|e| e.context().cloned())) {
             (Some(keys), _) => Some(keys.clone()),
             (None, Some(context)) => Some(std::sync::Arc::new(crate::field_crypto::FieldKeys::with_context(context)?)),
@@ -395,18 +496,21 @@ impl OpenUpgradePipeline {
         };
         // Keys carried over from earlier roots (see `field_crypto::carried`) are put in place before any
         // setting is compared with them; a field whose carried key is missing fails the open like any other failed open.
+        #[cfg(feature = "encryption")]
         if let (Some(keys), Some(open)) = (&check_keys, &handle) {
             let carried = crate::field_crypto::carried::load(open.get()?.raw(), keys)?;
             let tables: Vec<_> = input.tables.iter().map(|t| (t.name.as_str(), t.sealed)).collect();
             crate::field_crypto::carried::explain_all(&meta, &tables, keys, &carried, &input.event_sink)?;
         }
+        #[cfg(feature = "encryption")]
         if let Some(keys) = &check_keys {
-            settle_hash_settings(&mut meta, input.tables, keys, inspection.kind == FileKind::New)?;
+            settle_hash_settings(&mut meta, input.tables, keys, &new_tables)?;
         }
 
         // A database encrypted as a whole that has protected fields: its lock is in the file header,
         // and the keys file keeps a copy of it with the table list, so the protected values and the
         // attachments can still be opened if the main file is lost.
+        #[cfg(feature = "encryption")]
         if input.field_encryption.is_none()
             && input.tables.iter().any(|t| !t.sealed.is_empty())
             && let (Some(keys), Some(context)) =
@@ -468,11 +572,14 @@ impl OpenUpgradePipeline {
             }
         }
 
+        #[cfg(feature = "encryption")]
         let refs_upgraded = if input.redb.encryption.is_some() {
             0 // an encrypted database is never of the old format
         } else {
             upgrade_migration_refs_with_durability(&migration_dir, input.durability)?
         };
+        #[cfg(not(feature = "encryption"))]
+        let refs_upgraded = upgrade_migration_refs_with_durability(&migration_dir, input.durability)?;
         if refs_upgraded > 0 {
             meta.push_log(
                 "migration_refs_upgrade",
@@ -481,7 +588,10 @@ impl OpenUpgradePipeline {
         }
 
         let table_names: Vec<String> = input.tables.iter().map(|t| t.name.clone()).collect();
+        #[cfg(feature = "encryption")]
         let side_context = input.redb.encryption.as_ref().and_then(|e| e.context().cloned());
+        #[cfg(not(feature = "encryption"))]
+        let side_context = None;
         let mut migration_index = DbMigrationIndex::load_with_encryption(
             &db_dir,
             input.db_name,
@@ -539,6 +649,7 @@ impl OpenUpgradePipeline {
         // Every check has passed and nothing was written yet: the keys file goes first, so the main
         // file never holds a protected table whose keys are nowhere else (a file left behind by a
         // crash here is a superset, or a file no database claims, and is reported clearly).
+        #[cfg(feature = "encryption")]
         let keys_file_written = match &key_file {
             Some(plan) => {
                 crate::field_crypto::keyfile::write_file(&plan.path, &plan.bytes, input.durability)?;
@@ -547,15 +658,17 @@ impl OpenUpgradePipeline {
             None => None,
         };
         let first_commit = (|| -> Result<()> {
-            #[cfg(test)]
+            #[cfg(all(test, feature = "encryption"))]
             if input.redb.encryption.is_some() && input.db_name == "hooked" && FAIL_AFTER_CREATE.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(ClError::Validation("injected failure after the file was created".into()));
             }
             let db = handle.get()?;
             let write_txn = db.begin_write()?;
+            crate::journal::mark_adoption_due(&write_txn)?;
             crate::journal::initialize(&write_txn)?;
             create_meta_table(&write_txn)?;
             // In the file-only form the main file holds no lock at all.
+            #[cfg(feature = "encryption")]
             if let Some(locked) = &new_locked_key
                 && input.field_keys_file.is_none()
             {
@@ -567,6 +680,7 @@ impl OpenUpgradePipeline {
         })();
         // A new encrypted database that fails here is removed again by `Storage::build`, together
         // with everything else this call created. A keys file this call made is removed too.
+        #[cfg(feature = "encryption")]
         if first_commit.is_err()
             && let Some((path, false)) = &keys_file_written
         {
@@ -590,6 +704,13 @@ impl OpenUpgradePipeline {
             handle
         };
 
+        if !created_tables.is_empty() {
+            input.event_sink.emit(&crate::events::LibraryEvent::TablesCreated {
+                database: input.db_name.to_string(),
+                tables: created_tables,
+            });
+        }
+
         Ok(UpgradeOutput {
             meta,
             table_layouts,
@@ -597,9 +718,25 @@ impl OpenUpgradePipeline {
             format_opens,
             // A database encrypted as a whole hands over the keys it built too, with the carried keys
             // loaded, so the storage does not build a second set without them.
+            #[cfg(feature = "encryption")]
             field_keys: field_keys.or_else(|| check_keys.filter(|_| input.tables.iter().any(|t| !t.sealed.is_empty()))),
         })
     }
+}
+
+/// The name of the first table whose stored description lists protected fields. Reads only; a file that
+/// cannot be looked at this way (missing, not a database) has none, and the normal open reports it.
+/// A file another program has locked is `DatabaseInUse` at once: redb would wait for that lock
+/// without end, so the lock is tried first, as the normal open does.
+#[cfg(not(feature = "encryption"))]
+fn first_protected_table(path: &Path) -> Result<Option<String>> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+    crate::handle::guard_open(path, false)?;
+    let Ok(db) = redb::Database::builder().open_read_only(path) else { return Ok(None) };
+    let Some(meta) = read_meta(&db).ok().flatten() else { return Ok(None) };
+    Ok(meta.tables.into_iter().find(|t| !t.sealed.is_empty()).map(|t| t.name))
 }
 
 /// The file of a new encrypted database while it is being made; removed again if the build fails before it is complete.
@@ -613,6 +750,7 @@ impl Drop for PendingFile {
     }
 }
 
+#[cfg(feature = "encryption")]
 fn remove_any(path: &Path) -> std::io::Result<()> {
     let result = if path.is_dir() { fs::remove_dir_all(path) } else { fs::remove_file(path) };
     match result {
@@ -625,6 +763,7 @@ fn remove_any(path: &Path) -> std::io::Result<()> {
 /// database yet in that case, so everything else that attempt wrote (index, backup, migration and attachment folders and the keys file of protected fields, all under keys
 /// of a file that is gone) is removed too, and the next build makes the database again as if it had never been started. The pending
 /// file goes last: if this is cut short, the next open finds it and does the rest.
+#[cfg(feature = "encryption")]
 fn clear_interrupted_creation(
     input: &UpgradeInput<'_>,
     db_dir: &Path,
@@ -729,6 +868,67 @@ fn build_meta(input: &UpgradeInput<'_>, file_era: FileEra) -> CloveMeta {
     }
 
     meta
+}
+
+/// The registered tables with protected fields that are new: the file does not have them, or has
+/// them without rows, without a stored description of protected fields, and without any entry in the
+/// backup file. A table that has rows and no description is not new: protecting its fields would be a
+/// migration. Nor is one whose backup file still holds entries: restoring an old, unprotected version
+/// would write plain values into a protected table, and only a migration closes that.
+#[cfg(feature = "encryption")]
+fn new_sealed_tables(
+    tables: &[TableRegistration],
+    meta: &CloveMeta,
+    inspection: &crate::metadata::DatabaseInspection,
+    handle: Option<&DbHandle>,
+    redb: &crate::handle::RedbOptions,
+    backup: Option<&Path>,
+) -> Result<Vec<String>> {
+    let mut new = Vec::new();
+    for reg in tables.iter().filter(|t| !t.sealed.is_empty()) {
+        let is_new = if inspection.kind == FileKind::New || !inspection.tables.contains(&reg.name) {
+            true
+        } else {
+            let described = meta.tables.iter().any(|t| t.name == reg.name && !t.sealed.is_empty());
+            match handle {
+                Some(handle) if !described => table_is_empty(handle.get()?.raw(), &reg.name)? && !backup_has_entries(redb, backup, &reg.name),
+                _ => false,
+            }
+        };
+        if is_new {
+            new.push(reg.name.clone());
+        }
+    }
+    Ok(new)
+}
+
+/// True when the backup file exists and holds at least one entry for the table. Opens read-only; a file that
+/// cannot be read this way counts as holding entries, so the table is not taken as new.
+#[cfg(feature = "encryption")]
+fn backup_has_entries(redb: &crate::handle::RedbOptions, backup: Option<&Path>, name: &str) -> bool {
+    use redb::{ReadableDatabase, ReadableTableMetadata};
+    let Some(path) = backup.filter(|p| p.is_file()) else { return false };
+    let Ok(db) = redb.open_read_only_timed(path, "bak").0 else { return true };
+    let Ok(read) = db.begin_read() else { return true };
+    let definition: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new(name);
+    match read.open_table(definition) {
+        Ok(table) => table.len().map_or(true, |n| n > 0),
+        Err(redb::TableError::TableDoesNotExist(_)) => false,
+        Err(_) => true,
+    }
+}
+
+/// True when the table has no rows (or is not in the file). Reads only.
+#[cfg(feature = "encryption")]
+fn table_is_empty(db: &redb::Database, name: &str) -> Result<bool> {
+    use redb::{ReadableDatabase, ReadableTableMetadata};
+    let read = db.begin_read()?;
+    let definition: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new(name);
+    match read.open_table(definition) {
+        Ok(table) => Ok(table.len()? == 0),
+        Err(redb::TableError::TableDoesNotExist(_)) => Ok(true),
+        Err(other) => Err(other.into()),
+    }
 }
 
 fn validate_tables(expected: &[String], found: &[String]) -> Result<()> {

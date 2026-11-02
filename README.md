@@ -17,8 +17,14 @@ Everything lives in files next to your program: `.cldb` for the data, `.cldb.bak
 
 ```toml
 [dependencies]
-clove1db = "0.1.0"
+clove1db = "0.1.0"                                                # core only
+# clove1db = { version = "0.1.0", features = ["derive"] }        # + #[derive(CloveFields)]
+# clove1db = { version = "0.1.0", features = ["encryption"] }    # + encryption (includes derive)
 ```
+
+- **No features:** the database, queries, indexes, history, the change log and attachments. The field constants of an entity are written by hand ([without the derive macro](#without-the-derive-macro)).
+- **`derive`:** adds `#[derive(CloveFields)]`, which writes those field constants for you. The examples below use it.
+- **`encryption`:** adds encryption of a whole database and of protected fields (`EncryptionConfig`, `Sealed`, `Hashed`, `SearchPrint`, `ChangeProtection`, `ChangeFields`). It turns on `derive` too.
 
 > **Before 1.0.** The API can still change between minor versions. Every change that breaks code or files is listed in [Upgrading](#upgrading). Issues and feedback are welcome.
 
@@ -134,9 +140,17 @@ let storage = Storage::builder(StorageConfig::default())
 - An entity's id is whatever `entity_id()` returns. A key can be a natural one (a setting's name): writing it twice updates one row.
 - Tables whose names begin with `__` are reserved for the library.
 
+### Adding tables to an existing database
+
+A table that is registered but missing from an existing database file is refused (`ClError::TableMismatch`): this catches a wrong file and a misspelled name. To add tables to a database that already exists, plain or encrypted, set `DatabaseConfig::create_missing_tables(true)`. The missing tables are created empty when the database opens, and `LibraryEvent::TablesCreated { database, tables }` lists them.
+
+### Compacting a database file
+
+A database file never shrinks by itself: pages freed by deletes and updates are reused, not returned. `storage.compact_database(name)` compacts the main file and the history file of one database, plain or encrypted, and returns a `CompactReport { before, after, took }`. Reads and writes of that database wait while it runs; other databases are not affected. A read or write transaction kept open makes it fail with `ClError::Database(redb::Error::TransactionInProgress)` after a short wait, changing nothing. The `.inx` file is compacted by the index worker.
+
 ## Queries
 
-`#[derive(CloveFields)]` gives every field a typed handle (`Note::score`, `Note::title`, ...). A query runs against one snapshot of the database, without the entity cache:
+`#[derive(CloveFields)]` (feature `derive`) gives every field a typed handle (`Note::score`, `Note::title`, ...). A query runs against one snapshot of the database, without the entity cache:
 
 ```rust
 use clove1db::{CloveFields, query::{Asc, Desc}};
@@ -167,6 +181,28 @@ if let Some(cursor) = page.next {
 - Values of different types never compare equal: there is no conversion between text and numbers. Missing and `null` are different, and neither matches an equality.
 
 Nested fields are reached with `then` (`Note::profile.then(Profile::name)`); `serde` renames and flattening are followed. A field whose stored form `serde` cannot describe needs `#[clove(as = Type)]` or `#[clove(skip)]`.
+
+### Without the derive macro
+
+`#[derive(CloveFields)]` only writes what you can write by hand: the marker, and one constant per stored field. The name is the key as it is stored in the JSON (after any serde `rename`); a field of type `Option<T>` is a `Field<Self, T>`.
+
+```rust
+use clove1db::fields::{CloveFields, Field, ValueKind};
+
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+struct Note { id: String, score: i64, #[serde(rename = "madeAt")] made_at: i64 }
+
+impl CloveFields for Note {}
+#[allow(non_upper_case_globals)]
+impl Note {
+    pub const id: Field<Self, String> = Field::new("id", ValueKind::Auto);
+    pub const score: Field<Self, i64> = Field::new("score", ValueKind::Auto);
+    pub const made_at: Field<Self, i64> = Field::new("madeAt", ValueKind::EpochSeconds);
+}
+// then: notes.query().filter(Note::score.ge(5)).order_by(Note::score, Desc).collect()
+```
+
+Protected fields (`encrypt`, `hash`, `search_print`) are not written by hand: they need the `encryption` feature and the derive macro.
 
 ## Automatic indexes
 
@@ -210,7 +246,23 @@ For imports and copies, rows can be written as bytes, outside the history:
 - `db.commit_batch(writes, deletes)` — split into chunks of `max_commit_batch_entries` (512 by default); writes before deletes. A failure in a later chunk leaves the earlier chunks committed.
 - `db.replace_table(table, rows)` — the whole table at once, as one change.
 
-Unique constraints are checked for every batch. A table with protected fields refuses raw bytes: write it through its entity.
+Unique constraints are checked for every batch. A table with protected fields refuses raw bytes: write it through its entity, or through a prepared row as below. `repo.commit_entities(..)` follows the same limit as `commit_batch`: above `max_commit_batch_entries` it is split into several transactions, deletes after writes.
+
+### One atomic write over several tables
+
+`repo.prepare(id, &entity)` returns a `PreparedRow`: the row in its stored form, with any protected fields already sealed. It writes nothing. `db.commit_atomic(prepared, writes, deletes)` then writes prepared rows, raw rows of other tables and deletes in **one** transaction, however many there are: either all of it is in the file or none of it. Uniqueness, the change log, the cache and the search-key guard apply as for any write.
+
+```rust
+let phone_changed = accounts.repo().prepare("seller-1", &account)?; // sealed here
+let log_line = ("activity".to_string(), "e-901".to_string(), serde_json::to_vec(&entry)?);
+db.commit_atomic(
+    &[phone_changed],
+    &[log_line],
+    &[("sessions".to_string(), "s-42".to_string())],
+)?;
+```
+
+A `PreparedRow` can only be made by `prepare`, and only the database of its repository accepts it. Refused, with nothing written: raw bytes for a table with protected fields; a row prepared for another database; a row of a table that keeps attachments (write an attachment with `set_with_blob`). Like `commit_batch_atomic`, `commit_atomic` writes no backup history.
 
 ## The change log
 
@@ -281,7 +333,7 @@ DatabaseConfig::new("cache", "cache").durability(DurabilityMode::Fast);        /
 
 ## Encrypting the whole database
 
-Every file of a database — `.cldb`, `.cldb.bak`, `.inx`, attachments and side files — is sealed in 4 KiB blocks under keys you hold. Nothing in the folder is readable, not even the redb signature or a table name. Any changed byte is an error, never wrong data.
+Every file of a database — `.cldb`, `.cldb.bak`, `.inx`, attachments and side files — is sealed in 4 KiB blocks under keys you hold. Nothing in the folder is readable, not even the redb signature or a table name. Any changed byte is an error, never wrong data. Needs the `encryption` feature; a build without it that opens an encrypted file gets an error that points to the feature.
 
 ```rust
 use clove1db::{EncryptionConfig, KeySource, crypto::Key32};
@@ -341,6 +393,8 @@ DatabaseConfig::new("people", "people")
 - **What a program can do depends on its keys.** Both keys: everything. The read key alone: everything but making fingerprints. The search key alone (with `field_encryption`): read rows and match fingerprints; no writes, no opening.
 - **The keys file `{db}.keys`** (under 1 KB) holds the data key sealed under your keys, so protected values can still be opened if the main file is lost. `field_keys_file(path)` keeps the data key in that file **only**: a copy of the main file alone then opens nothing — and if that file is lost, the protected values are lost for good.
 - **Attachments of such a table** (`register_sealed_blob`) are sealed in 64 KiB chunks, with folder and file names that are keyed fingerprints.
+- **A protected table can be added to a database that already exists.** "New" is judged for each table: one the file does not have, or has with no rows, no stored description of protected fields and no saved versions in its history. The keys are made when the file holds no protected table yet. A table that has rows, or old versions in its history, cannot be protected by opening it: that is a migration (`ChangeFields`). A program that holds only the search key cannot create a protected table.
+- **Needs the `encryption` feature.** Without it, `#[clove(encrypt)]`, `hash` and `search_print` do not compile, with a message naming the feature, and a database that has a protected table is refused at open before anything is written.
 
 ## Changing how a database is protected
 
@@ -419,22 +473,25 @@ storage.migrate::<VendorRow, ProductV2>()
 
 `list_external_tables(path)` and `read_external_table(path, &spec)` look at a foreign file first.
 
-**A large table, as it is (`stream_external`).** For gigabytes of JSON rows or of files, `clove1db::migration::stream_external` reads the source in one read transaction, one row at a time, and commits in batches, so memory does not grow with the file:
+**A large table, as it is (`stream_external`).** Import JSON rows or attachments from an external redb file in bounded batches. The source is read in one transaction, one row at a time.
 
 ```rust
-use clove1db::migration::stream_external::{JsonRow, Kind, Options, scan, stream, verify};
+use clove1db::migration::stream_external::{Options, Target, inventory, scan, stream, verify};
 
-let options = Options { kind: Kind::Json, max_rows: 1_000, ..Options::default() };
-let found = scan(&copy, "orders", &options)?;               // rows, sizes, invalid JSON
-stream(&copy, "orders", &storage, "shop", "orders", &options, &mut |r| println!("{} rows", r.rows))?;
-assert!(verify(&copy, "orders", &storage, "shop", "orders", &options)?.is_equal());
+let options = Options::json();
+let tables = inventory(&copy, &options)?;
+let found = scan(&copy, "orders", &options)?;
+let target = Target { storage: &storage, db: "shop", table: "orders" };
+stream(&copy, "orders", target, &options, Some(&mut |r| println!("{} rows", r.sizes.rows)))?;
+assert!(verify(&copy, "orders", target, &options)?.is_equal());
 ```
 
-- **`Kind::Json`:** number or text keys, JSON values. Rows are stored as they are, in a table registered with `JsonRow`.
-- **`Kind::Attachments`:** number keys, each value the bytes of one file, into a table registered with `register_blob::<AttachmentMeta>`. If your values carry a fixed prefix before the file, describe it with `Options { prefix: Some(FilePrefix { marker, len, group_at }), .. }`: a value whose first byte is `marker` loses its first `len` bytes, and a little-endian 32-bit number at `group_at` is kept as the row's `group`. The file's type is taken from its first bytes (PNG, JPEG, GIF, WebP, PDF, ZIP).
-- **The source is only read.** A file that was not closed cleanly is repaired with `Options { repair: true, .. }` in a `scan`, which writes to the file it is given: **give it a copy**.
-- **Memory is checked first:** a source of 1 GiB or more needs `free_memory`, and a run whose expected peak plus `reserve_memory` does not fit is refused before it starts.
-- **Reports hold counts only:** rows, sizes, types, batches, times, and the fingerprints `verify` compares. `inventory: true` lists every table of the file with its key and value types.
+- **JSON is the default:** `Options::json()` imports JSON unchanged into an ordinary table registered with `JsonRow`. Tables with protected fields, including protected attachment metadata, are refused before opening the source; use typed entity writes instead. Whole-database encryption is supported for ordinary target tables.
+- **Attachments:** `Options::attachments(prefix)` imports files into `register_blob::<AttachmentMeta>`. This metadata is an intermediate shape; convert it to your entity afterwards. `FilePrefix { marker, len, group_at }` describes an optional fixed prefix; `group_at` reads four little-endian bytes into the metadata group. `FilePrefix::default()` has length 0 and matches no value: use it to complete `FilePrefix { marker, len, ..FilePrefix::default() }`.
+- **Read-only source:** `inventory`, `scan`, `stream` and `verify` never repair it. Explicit `repair_copy(&copy, &options)` opens the supplied file for writing: provide a disposable copy, never the original.
+- **Memory gate:** sources of 1 GiB or more require `free_memory`. The expected peak plus `reserve_memory` must fit before streaming starts.
+- **Reports:** `ScanReport` contains sizes and signatures, `StreamReport` contains sizes, batches and `Duration` timings, and `VerifyReport` compares counts and content fingerprints. Shared measurements are under `sizes`. Failures are distinguishable through `ClError::StreamExternal(StreamExternalError)`; protected targets return `ClError::Validation`.
+- **Limits:** numeric keys become text (`"10"` sorts before `"9"`). Matching destination keys are overwritten; other rows remain. Verification counts all target rows, so extra rows make `is_equal()` false. A limit or error leaves already committed batches. Signature recognition is limited to PNG, JPEG, GIF, WebP, PDF and ZIP; it is not file validation.
 
 ## Events
 
@@ -511,6 +568,7 @@ Run 02, 05, 06 and 07 with `cargo run --release`.
 
 The data format of existing plain databases is unchanged, and they open as before. Code may need these changes:
 
+- **Features:** `#[derive(CloveFields)]` needs `features = ["derive"]`, and encryption needs `features = ["encryption"]`. Without features the core is the same, and field constants are written by hand.
 - **`ClError`** has new variants (`EncryptedOpenFailed`, `DataTampered`, `DatabaseInUse`, `OutOfMemory`, ...). A `match` without a wildcard arm must handle them.
 - **Attachments are read through `BlobReader`** (`Read + Seek`, with `len()`) instead of `std::fs::File`.
 - **`RedbOptions`** is no longer `Copy` or `PartialEq`, and has new fields: build it with `..Default::default()`.
@@ -521,7 +579,7 @@ The data format of existing plain databases is unchanged, and they open as befor
 - **A failed `build()` removes the database it was creating**, and only that.
 - **The examples** were rewritten: seven instead of nineteen.
 
-New in 0.1.0: typed queries, automatic indexes, the change log, whole-database encryption, protected fields and searching them, `ChangeProtection` and `ChangeFields`, `stream_external`, events, `DatabaseInUse`, out-of-memory errors instead of aborts on large allocations, `prefetch`. Every change is listed in [CHANGELOG.md](CHANGELOG.md).
+New in 0.1.0: typed queries, automatic indexes, the change log, whole-database encryption, protected fields and searching them, `ChangeProtection` and `ChangeFields`, `stream_external`, events, `DatabaseInUse`, out-of-memory errors instead of aborts on large allocations, `prefetch`, the `derive` and `encryption` features, `create_missing_tables`, `compact_database`, `prepare` with `commit_atomic`. Every change is listed in [CHANGELOG.md](CHANGELOG.md).
 
 ### From 0.0.119 or earlier
 

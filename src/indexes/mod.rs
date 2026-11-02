@@ -15,8 +15,17 @@ use std::{sync::{Arc,Mutex},time::Instant};
 pub(crate) use worker::Worker;
 /// `keep` is the `.inx` database `index` was read from. The worker drops its own handle when it swaps in a compacted file; a query that took this pair before the swap
 /// still reads from `index`, and a read transaction does not keep a closed database readable, so the pair holds the database open until the last query is done with it.
-/// It is the last field: the read transaction is released before the database.
-pub(crate) struct Pair {pub primary:Arc<ReadView>,pub index:redb::ReadTransaction,pub published:Instant,pub ready:usize,pub statistics:Vec<(String,crate::fields::Path,Arc<crate::query::stats::FieldStats>)>,pub keep:Arc<redb::Database>}
+/// It comes after `index`: fields drop in order, so the read transaction is released before the database.
+pub(crate) struct Pair {pub primary:Arc<ReadView>,pub index:redb::ReadTransaction,pub published:Instant,pub ready:usize,pub statistics:Vec<(String,crate::fields::Path,Arc<crate::query::stats::FieldStats>)>,#[allow(dead_code)] pub keep:Arc<redb::Database>,
+ /// What the index file of this pair says about itself (its identity and its definitions): the snapshot cannot change, so they are read once per pair, not once per query.
+ memo:std::sync::OnceLock<(format::Identity,Vec<format::Manifest>)>}
+impl Pair {
+ pub(in crate::indexes) fn memo(&self)->Result<&(format::Identity,Vec<format::Manifest>)> {
+  if let Some(m)=self.memo.get(){return Ok(m)}
+  let m=(format::metadata(&self.index)?.identity,format::definitions(&self.index)?);
+  Ok(self.memo.get_or_init(||m))
+ }
+}
 #[derive(Default)]
 pub(crate) struct Shared {pub pair:Mutex<Option<Arc<Pair>>>,wanted:Mutex<Vec<format::Definition>>,observations:Mutex<std::collections::BTreeMap<Vec<u8>,Observation>>,clock:report::Clock,usages:Mutex<std::collections::BTreeMap<u64,report::Usage>>,reports:Mutex<Vec<IndexReport>>,compact_requested:std::sync::atomic::AtomicBool}
 impl std::fmt::Debug for Shared {fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {f.write_str("IndexRuntime")}}
@@ -59,7 +68,7 @@ impl Shared {
 impl Shared {
  pub(crate) fn field_statistics(&self,table:&str,view:&ReadView)->Vec<(crate::fields::Path,Arc<crate::query::stats::FieldStats>)> {
   let Some(pair)=self.pair() else{return vec![]};if pair.primary.head!=view.head||pair.primary.database_uuid!=view.database_uuid{return vec![]}
-  if worker::identity(view).ok()!=format::metadata(&pair.index).ok().map(|m|m.identity){return vec![]}
+  if worker::identity(view).ok().as_ref()!=pair.memo().ok().map(|m|&m.0){return vec![]}
   pair.statistics.iter().filter(|(t,_,_)|t==table).map(|(_,p,s)|(p.clone(),s.clone())).collect()
  }
 }

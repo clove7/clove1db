@@ -14,10 +14,12 @@ use clove1db::{
     migration::ChangeFields,
     storage::{DatabaseConfig, Storage, StorageConfig},
 };
+#[path = "child_log/mod.rs"]
+mod child_log;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 const PHONE: &str = "+155-WHOLE-PHONE-";
@@ -248,8 +250,8 @@ fn child(root: &Path, shape: Shape, n: u8) -> Command {
         .env("CLOVE_MIG_ROOT", root)
         .env("CLOVE_MIG_SHAPE", shape.text())
         .env("CLOVE_MIG_KEY", n.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(child_log::out(root))
+        .stderr(child_log::out(root));
     c
 }
 
@@ -277,9 +279,10 @@ fn stopped_in(shape: Shape, n: u8) {
         let probe = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
         copy_dir(&template, &probe);
         let started = Instant::now();
-        assert!(child(&probe, shape, n).status().unwrap().success());
+        let st = child(&probe, shape, n).status().unwrap();
+        assert!(st.success(), "the measuring run failed: {}", child_log::why(&probe, st));
         lengths.push(started.elapsed());
-        let _ = std::fs::remove_dir_all(&probe);
+        child_log::clean(&probe);
     }
     record(&format!(
         "whole-database field change {shape:?} key {n}: the five measuring runs took {:?} ms",
@@ -304,7 +307,7 @@ fn stopped_in(shape: Shape, n: u8) {
             std::thread::sleep(Duration::from_millis((whole_ms * ((i / 2) as f64 + 0.5) / spread) as u64));
         }
         match running.try_wait().unwrap() {
-            Some(status) => assert!(status.success(), "{shape:?} key {n}, stop {i}: the change failed: {status:?}"),
+            Some(status) => assert!(status.success(), "{shape:?} key {n}, stop {i}: the change failed: {}", child_log::why(&root, status)),
             None => {
                 running.kill().unwrap();
                 killed += 1;
@@ -330,7 +333,7 @@ fn stopped_in(shape: Shape, n: u8) {
             new_state += 1;
         }
         assert!(!clear_value_in_files(&root), "{shape:?} key {n}, stop {i}: a clear value shows in a file");
-        let _ = std::fs::remove_dir_all(&root);
+        child_log::clean(&root);
     }
     record(&format!(
         "whole-database field change {shape:?} key {n} ({}): {stops} stops over {whole_ms:.0} ms ({killed} killed while running): {old_state} left the old files, {new_state} the new ones",

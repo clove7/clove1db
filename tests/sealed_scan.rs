@@ -209,7 +209,7 @@ fn a_program_without_the_read_key_cannot_scan() {
     let dir = temp_dir();
     {
         let s = Storage::builder(StorageConfig::default()).add_database(plain_with_keys(&dir, keys(Some(1), Some(2))).register_sealed::<Balanced>("t")).build().unwrap();
-        s.domain::<Balanced>().repo().set("a", &Balanced { id: "a".into(), group: "g".into(), phone: Sealed::new("0501234567".into()) }).unwrap();
+        s.domain::<Balanced>().repo().set("a", &Balanced { id: "a".into(), group: "g".into(), phone: Sealed::new("5501234567".into()) }).unwrap();
         s.close();
     }
     let seen = Arc::new(Mutex::new(Seen::default()));

@@ -218,7 +218,7 @@ fn equality_search_matches_a_scan_that_opens_every_row() {
     let mut needles: Vec<String> = (0..40).map(|k| phone_of((k * 997) % (ROWS / 3))).collect();
     needles.extend((0..6).map(|k| arabic_digits(&phone_of(k * 31))));
     needles.extend((0..4).map(|k| format!("   {}  ", phone_of(k * 17))));
-    needles.extend(["0500000000", "0599999999", "", "x"].map(String::from));
+    needles.extend(["5500000000", "5599999999", "", "x"].map(String::from));
     // Before the index: the answers come from a scan of the stored fingerprints.
     for needle in needles.iter().take(12) {
         assert_eq!(search(needle), expected(needle), "scan, needle {needle:?}");
@@ -239,7 +239,7 @@ fn equality_search_matches_a_scan_that_opens_every_row() {
         assert_eq!(search(needle), expected(needle), "index, needle {needle:?}");
     }
     // A list of values is the union of the answers.
-    let list = [phone_of(1), arabic_digits(&phone_of(2)), phone_of(3), "0500000000".into()];
+    let list = [phone_of(1), arabic_digits(&phone_of(2)), phone_of(3), "5500000000".into()];
     let want: BTreeSet<String> = list.iter().flat_map(|n| expected(n)).collect();
     let got = ids_of(domain.query().filter(Account::phone.print_in(&list, &grant)).collect().unwrap());
     assert_eq!(got, want);
@@ -259,7 +259,7 @@ fn a_search_fingerprint_field_is_searched_with_its_normalisation() {
     let s = open(&dir, keys(Some(1), Some(2))).unwrap();
     let domain = s.domain::<Account>();
     for i in 0..10 {
-        domain.repo().set(&format!("t{i}"), &account(&format!("t{i}"), "g", "0501111111", &format!("  Token-{i}-ALPHA "))).unwrap();
+        domain.repo().set(&format!("t{i}"), &account(&format!("t{i}"), "g", "5501111111", &format!("  Token-{i}-ALPHA "))).unwrap();
     }
     let grant = domain.search_grant().unwrap();
     for i in 0..10 {
@@ -280,22 +280,22 @@ fn a_row_is_stored_with_its_sealed_text_and_its_fingerprint_and_nothing_else() {
     let dir = temp_dir();
     let s = open_plain(&dir, keys(Some(1), Some(2))).unwrap();
     let domain = s.domain::<Account>();
-    domain.repo().set("r1", &account("r1", "g", "0501234567", "Tok-1")).unwrap();
+    domain.repo().set("r1", &account("r1", "g", "5501234567", "Tok-1")).unwrap();
     let json = raw_json(&s, "r1");
     let phone = json["phone"].as_object().expect("a sealed field with a fingerprint is stored as an object");
     assert_eq!(phone.keys().collect::<Vec<_>>(), ["f", "s"]);
     assert_eq!(phone["f"].as_str().unwrap().len(), 43);
-    assert!(!phone["s"].as_str().unwrap().contains("0501234567"));
+    assert!(!phone["s"].as_str().unwrap().contains("5501234567"));
     assert_eq!(json["token"].as_str().unwrap().len(), 43);
     assert!(json["note"].is_string(), "a sealed field without a fingerprint stays text");
     // The whole row says nothing of the values.
     let text = json.to_string();
-    for secret in ["0501234567", "Tok-1", "tok-1", "note of r1"] {
+    for secret in ["5501234567", "Tok-1", "tok-1", "note of r1"] {
         assert!(!text.contains(secret), "{secret} in {text}");
     }
     // The value still opens, with the read grant.
     let read = domain.read_grant().unwrap();
-    assert_eq!(domain.repo().get("r1").unwrap().phone.open(&read).unwrap(), "0501234567");
+    assert_eq!(domain.repo().get("r1").unwrap().phone.open(&read).unwrap(), "5501234567");
     s.close();
 }
 
@@ -307,8 +307,8 @@ fn a_value_written_back_keeps_its_fingerprint_and_a_new_value_gets_a_new_one() {
     let s = open_plain(&dir, keys(Some(1), Some(2))).unwrap();
     let domain = s.domain::<Account>();
     let repo = domain.repo();
-    repo.set("a1", &account("a1", "g1", "0501111111", "t1")).unwrap();
-    repo.set("a2", &account("a2", "g1", "0502222222", "t2")).unwrap();
+    repo.set("a1", &account("a1", "g1", "5501111111", "t1")).unwrap();
+    repo.set("a2", &account("a2", "g1", "5502222222", "t2")).unwrap();
     let before = raw_json(&s, "a1");
 
     let mut row = repo.get("a1").unwrap();
@@ -320,22 +320,22 @@ fn a_value_written_back_keeps_its_fingerprint_and_a_new_value_gets_a_new_one() {
 
     let grant = domain.search_grant().unwrap();
     let find = |phone: &str| ids_of(domain.query().filter(Account::phone.print_eq(phone, &grant)).collect().unwrap());
-    assert_eq!(find("0501111111"), BTreeSet::from(["a1".to_string()]));
+    assert_eq!(find("5501111111"), BTreeSet::from(["a1".to_string()]));
 
     let mut row = repo.get("a1").unwrap();
-    row.phone = Sealed::new("0503333333".into());
+    row.phone = Sealed::new("5503333333".into());
     repo.set("a1", &row).unwrap();
     let changed = raw_json(&s, "a1");
     assert_ne!(changed["phone"]["f"], before["phone"]["f"]);
-    assert_eq!(find("0501111111"), BTreeSet::new());
-    assert_eq!(find("0503333333"), BTreeSet::from(["a1".to_string()]));
+    assert_eq!(find("5501111111"), BTreeSet::new());
+    assert_eq!(find("5503333333"), BTreeSet::from(["a1".to_string()]));
 
     // A closed value moved to another row is refused, the fingerprint with it.
     let mut other = repo.get("a2").unwrap();
     other.phone = repo.get("a1").unwrap().phone;
     let err = repo.set("a2", &other).unwrap_err().to_string();
     assert!(err.contains("can only be written back"), "{err}");
-    assert_eq!(find("0502222222"), BTreeSet::from(["a2".to_string()]));
+    assert_eq!(find("5502222222"), BTreeSet::from(["a2".to_string()]));
     s.close();
 }
 
@@ -355,12 +355,12 @@ fn a_condition_built_by_hand_on_a_fingerprint_path_is_refused_and_its_value_is_s
         .build()
         .unwrap();
     let domain = s.domain::<Account>();
-    domain.repo().set("a1", &account("a1", "g", "0509876543", "Secret-Token-Zeta")).unwrap();
+    domain.repo().set("a1", &account("a1", "g", "5509876543", "Secret-Token-Zeta")).unwrap();
 
     let phone_path = Field::<Account, String>::new("phone", ValueKind::Auto).then(Field::<String, String>::new("f", ValueKind::Auto));
     let phone_text = Field::<Account, String>::new("phone", ValueKind::Auto);
     let token_path = Field::<Account, String>::new("token", ValueKind::Auto);
-    let raw = "0509876543";
+    let raw = "5509876543";
     let token_raw = "Secret-Token-Zeta";
     let attempts = vec![
         ("fingerprint path, raw value", domain.query().filter(phone_path.clone().eq(raw.to_string()))),
@@ -389,7 +389,7 @@ fn a_condition_built_by_hand_on_a_fingerprint_path_is_refused_and_its_value_is_s
         assert!(!p.contains(raw) && !p.contains("Zeta") && !p.contains("zeta"), "{p}");
     }
     let bytes = predicate.fingerprint().unwrap();
-    assert!(!contains(&bytes, raw.as_bytes()) && !contains(&bytes, b"0509876543"));
+    assert!(!contains(&bytes, raw.as_bytes()) && !contains(&bytes, b"5509876543"));
     let bytes = token_predicate.fingerprint().unwrap();
     assert!(!contains(&bytes, token_raw.as_bytes()) && !contains(&bytes, b"zeta"));
     // Nor an event.
@@ -408,7 +408,7 @@ fn a_fingerprint_lifted_out_of_a_predicate_is_not_a_way_around_the_check() {
     let dir = temp_dir();
     let s = open(&dir, keys(Some(1), Some(2))).unwrap();
     let domain = s.domain::<Account>();
-    domain.repo().set("a1", &account("a1", "g", "0501111111", "t")).unwrap();
+    domain.repo().set("a1", &account("a1", "g", "5501111111", "t")).unwrap();
     let grant = domain.search_grant().unwrap();
     // The fingerprint text is in the row; copying it into a hand-made condition is still refused,
     // since the query only accepts the ones its predicates carry.
@@ -421,7 +421,7 @@ fn a_fingerprint_lifted_out_of_a_predicate_is_not_a_way_around_the_check() {
     let phone_path = Field::<Account, String>::new("phone", ValueKind::Auto).then(Field::<String, String>::new("f", ValueKind::Auto));
     let by_hand = domain.query().filter(phone_path.eq(stored));
     assert!(by_hand.count().is_err());
-    assert_eq!(domain.query().filter(Account::phone.print_eq("0501111111", &grant)).count().unwrap(), 1);
+    assert_eq!(domain.query().filter(Account::phone.print_eq("5501111111", &grant)).count().unwrap(), 1);
     s.close();
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -446,27 +446,27 @@ fn a_unique_constraint_on_a_fingerprint_stops_a_repeated_value_whatever_its_spel
     let s = open_unique(&dir);
     let domain = s.domain::<Account>();
     let repo = domain.repo();
-    repo.set("a1", &account("a1", "g", "0501111111", "token-one")).unwrap();
+    repo.set("a1", &account("a1", "g", "5501111111", "token-one")).unwrap();
     // The same number written with other digits, with spaces: the same value after normalisation.
-    for spelling in ["٠٥٠١١١١١١١", "  0501111111 "] {
+    for spelling in ["٥٥٠١١١١١١١", "  5501111111 "] {
         let err = repo.set("a2", &account("a2", "g", spelling, "token-two")).unwrap_err();
         assert!(matches!(err, ClError::UniqueViolation), "{spelling:?}: {err:?}");
     }
-    let err = repo.set("a2", &account("a2", "g", "0502222222", " TOKEN-ONE ")).unwrap_err();
+    let err = repo.set("a2", &account("a2", "g", "5502222222", " TOKEN-ONE ")).unwrap_err();
     assert!(matches!(err, ClError::UniqueViolation), "{err:?}");
     assert!(repo.get("a2").is_err(), "the refused row was not saved");
     // Different values are fine, and a row may be written again with its own value.
-    repo.set("a2", &account("a2", "g", "0502222222", "token-two")).unwrap();
+    repo.set("a2", &account("a2", "g", "5502222222", "token-two")).unwrap();
     let mut again = repo.get("a1").unwrap();
     again.group = "g2".into();
     repo.set("a1", &again).unwrap();
     // Two repeated values in one batch: the batch fails and none of it is saved.
-    let (b1, b2) = (account("b1", "g", "0503333333", "token-b1"), account("b2", "g", "0503333333", "token-b2"));
+    let (b1, b2) = (account("b1", "g", "5503333333", "token-b1"), account("b2", "g", "5503333333", "token-b2"));
     assert!(repo.commit_entities(&[("b1", &b1), ("b2", &b2)], &[]).is_err());
     assert!(repo.get("b1").is_err() && repo.get("b2").is_err());
     // Deleting frees the value.
     domain.delete("a1").unwrap();
-    repo.set("a3", &account("a3", "g", "0501111111", "token-one")).unwrap();
+    repo.set("a3", &account("a3", "g", "5501111111", "token-one")).unwrap();
     s.close();
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -501,7 +501,7 @@ fn a_program_with_the_search_key_alone_finds_rows_and_opens_nothing() {
         let s = open_plain(&dir, keys(Some(1), Some(2))).unwrap();
         let domain = s.domain::<Account>();
         for i in 0..20 {
-            domain.repo().set(&format!("a{i:02}"), &account(&format!("a{i:02}"), "g", &format!("05000000{i:02}"), &format!("tok{i}"))).unwrap();
+            domain.repo().set(&format!("a{i:02}"), &account(&format!("a{i:02}"), "g", &format!("55000000{i:02}"), &format!("tok{i}"))).unwrap();
         }
         s.close();
     }
@@ -509,7 +509,7 @@ fn a_program_with_the_search_key_alone_finds_rows_and_opens_nothing() {
         let s = open_plain(&dir, keys(None, Some(2))).unwrap();
         let domain = s.domain::<Account>();
         let grant = domain.search_grant().expect("the search key is enough to search");
-        let found = domain.query().filter(Account::phone.print_eq("0500000007", &grant)).collect().unwrap();
+        let found = domain.query().filter(Account::phone.print_eq("5500000007", &grant)).collect().unwrap();
         assert_eq!(ids_of(found.clone()), BTreeSet::from(["a07".to_string()]));
         assert_eq!(domain.query().filter(Account::token.print_eq("tok13", &grant)).count().unwrap(), 1);
         // The row comes back closed, and this program cannot open it.
@@ -517,7 +517,7 @@ fn a_program_with_the_search_key_alone_finds_rows_and_opens_nothing() {
         let opened = read.and_then(|g| found[0].phone.open(&g));
         assert!(opened.is_err(), "a program without the read key opened a value");
         // And it cannot write a row, which needs the read key to seal.
-        assert!(domain.repo().set("z", &account("z", "g", "0500000099", "tz")).is_err());
+        assert!(domain.repo().set("z", &account("z", "g", "5500000099", "tz")).is_err());
         s.close();
     }
     {
@@ -527,7 +527,7 @@ fn a_program_with_the_search_key_alone_finds_rows_and_opens_nothing() {
         assert!(err.contains("search key"), "{err}");
         // It can still open values.
         let read = domain.read_grant().unwrap();
-        assert_eq!(domain.repo().get("a03").unwrap().phone.open(&read).unwrap(), "0500000003");
+        assert_eq!(domain.repo().get("a03").unwrap().phone.open(&read).unwrap(), "5500000003");
         s.close();
     }
     std::fs::remove_dir_all(&dir).ok();
@@ -546,7 +546,7 @@ fn a_changed_normalisation_is_a_migration_and_writes_nothing() {
     let dir = temp_dir();
     {
         let s = open(&dir, keys(Some(1), Some(2))).unwrap();
-        s.domain::<Account>().repo().set("a1", &account("a1", "g", "0501111111", "t")).unwrap();
+        s.domain::<Account>().repo().set("a1", &account("a1", "g", "5501111111", "t")).unwrap();
         s.close();
     }
     let before: Vec<(PathBuf, Vec<u8>)> = walk(&dir).into_iter().filter(|p| p.extension().is_none_or(|e| e != "cldb")).map(|p| (p.clone(), std::fs::read(p).unwrap())).collect();
@@ -564,7 +564,7 @@ fn a_changed_normalisation_is_a_migration_and_writes_nothing() {
     let s = open(&dir, keys(Some(1), Some(2))).unwrap();
     let domain = s.domain::<Account>();
     let grant = domain.search_grant().unwrap();
-    assert_eq!(domain.query().filter(Account::phone.print_eq("0501111111", &grant)).count().unwrap(), 1);
+    assert_eq!(domain.query().filter(Account::phone.print_eq("5501111111", &grant)).count().unwrap(), 1);
     s.close();
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -578,7 +578,7 @@ fn a_table_without_recorded_fingerprint_settings_is_a_migration() {
     let dir = temp_dir();
     {
         let s = open(&dir, keys(Some(1), Some(2))).unwrap();
-        s.domain::<Account>().repo().set("a1", &account("a1", "g", "0501111111", "t")).unwrap();
+        s.domain::<Account>().repo().set("a1", &account("a1", "g", "5501111111", "t")).unwrap();
         s.close();
     }
     let primary = dir.join("records").join("store.cldb");
@@ -662,7 +662,7 @@ fn no_searched_value_appears_in_any_file_or_event() {
     let dir = temp_dir();
     let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = seen.clone();
-    let phones = ["0599911101", "0599911102", "0599911103", "0599911104", "0599911105"];
+    let phones = ["5599911101", "5599911102", "5599911103", "5599911104", "5599911105"];
     let tokens = ["Marker-Token-Alpha", "Marker-Token-Beta", "Marker-Token-Gamma"];
     let history_text;
     {
@@ -715,7 +715,7 @@ fn no_searched_value_appears_in_any_file_or_event() {
         needles.push(token.to_lowercase());
         needles.push(token.to_uppercase());
     }
-    needles.extend(["note of m0", "0577000012"].map(String::from));
+    needles.extend(["note of m0", "5577000012"].map(String::from));
     let mut ordinary_seen = false;
     let mut index_file_seen = false;
     for path in walk(&dir) {

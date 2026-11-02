@@ -262,9 +262,9 @@ fn a_row_is_stored_with_sorted_distinct_hex_fingerprints_of_its_parts() {
         let bytes = s.db_manager("store").get_uncached(TableDefinition::<&str, &[u8]>::new(table), id).unwrap().expect("row");
         serde_json::from_slice(&bytes).unwrap()
     };
-    s.domain::<Balanced>().repo().set("r", &Balanced { id: "r".into(), group: "g".into(), value: Sealed::new("0501234567".into()) }).unwrap();
-    s.domain::<Fast>().repo().set("r", &Fast { id: "r".into(), group: "g".into(), value: Sealed::new("0501234567".into()) }).unwrap();
-    s.domain::<Protected>().repo().set("r", &Protected { id: "r".into(), group: "g".into(), value: Sealed::new("0501234567".into()) }).unwrap();
+    s.domain::<Balanced>().repo().set("r", &Balanced { id: "r".into(), group: "g".into(), value: Sealed::new("5501234567".into()) }).unwrap();
+    s.domain::<Fast>().repo().set("r", &Fast { id: "r".into(), group: "g".into(), value: Sealed::new("5501234567".into()) }).unwrap();
+    s.domain::<Protected>().repo().set("r", &Protected { id: "r".into(), group: "g".into(), value: Sealed::new("5501234567".into()) }).unwrap();
     for (table, digits) in [("b", 3usize), ("f", 16), ("p", 2)] {
         let json = raw(table, "r");
         let value = json["value"].as_object().expect("an object");
@@ -276,7 +276,7 @@ fn a_row_is_stored_with_sorted_distinct_hex_fingerprints_of_its_parts() {
         sorted.sort();
         sorted.dedup();
         assert_eq!(tags, sorted, "{table}: sorted and distinct");
-        assert!(!json.to_string().contains("0501234567"));
+        assert!(!json.to_string().contains("5501234567"));
     }
     // Eight windows of a ten-digit value, all different, with 64 bits.
     assert_eq!(raw("f", "r")["value"]["p"].as_str().unwrap().split(' ').count(), 8);
@@ -327,7 +327,7 @@ fn another_digit_spelling_finds_the_same_candidates_and_a_closed_value_keeps_its
         .unwrap();
     let domain = s.domain::<Balanced>();
     let repo = domain.repo();
-    for (i, v) in ["0501234567", "٠٥٠١٢٣٤٥٦٧", "  0509999999 ", "0507654321"].iter().enumerate() {
+    for (i, v) in ["5501234567", "٥٥٠١٢٣٤٥٦٧", "  5509999999 ", "5507654321"].iter().enumerate() {
         repo.set(&format!("r{i}"), &Balanced { id: format!("r{i}"), group: "g".into(), value: Sealed::new((*v).into()) }).unwrap();
     }
     let grant = domain.search_grant().unwrap();
@@ -348,7 +348,7 @@ fn another_digit_spelling_finds_the_same_candidates_and_a_closed_value_keeps_its
     repo.set("r0", &row).unwrap();
     assert_eq!(raw("r0")["value"], before["value"]);
     let mut row = repo.get("r0").unwrap();
-    row.value = Sealed::new("0551112223".into());
+    row.value = Sealed::new("5551112223".into());
     repo.set("r0", &row).unwrap();
     assert_ne!(raw("r0")["value"]["p"], before["value"]["p"]);
     assert!(!ids("12345").contains("r0"), "the old value's parts are gone");
@@ -365,7 +365,7 @@ fn another_part_length_or_bits_is_a_migration_and_writes_nothing() {
             .add_database(with_keys(base(&dir), keys(Some(1), Some(2))).register_sealed::<Balanced>("t"))
             .build()
             .unwrap();
-        s.domain::<Balanced>().repo().set("r", &Balanced { id: "r".into(), group: "g".into(), value: Sealed::new("0501234567".into()) }).unwrap();
+        s.domain::<Balanced>().repo().set("r", &Balanced { id: "r".into(), group: "g".into(), value: Sealed::new("5501234567".into()) }).unwrap();
         s.close();
     }
     let before: Vec<(PathBuf, Vec<u8>)> = walk(&dir).into_iter().filter(|p| p.extension().is_none_or(|e| e != "cldb")).map(|p| (p.clone(), std::fs::read(p).unwrap())).collect();
@@ -444,10 +444,10 @@ fn a_text_condition_built_by_hand_on_the_parts_path_is_refused() {
         .build()
         .unwrap();
     let domain = s.domain::<Balanced>();
-    domain.repo().set("r", &Balanced { id: "r".into(), group: "g".into(), value: Sealed::new("0501234567".into()) }).unwrap();
+    domain.repo().set("r", &Balanced { id: "r".into(), group: "g".into(), value: Sealed::new("5501234567".into()) }).unwrap();
     let parts_path = Field::<Balanced, String>::new("value", ValueKind::Auto).then(Field::<String, String>::new("p", ValueKind::Auto));
     for query in [
-        domain.query().filter(parts_path.clone().text("0501234567".to_string())),
+        domain.query().filter(parts_path.clone().text("5501234567".to_string())),
         domain.query().filter(parts_path.clone().contains("501".to_string())),
         domain.query().filter(parts_path.clone().eq("abc".to_string())),
         domain.query().filter(parts_path.clone().prefix("abc".to_string())),
@@ -468,7 +468,7 @@ fn no_part_search_text_appears_in_any_file_or_event() {
     let dir = temp_dir();
     let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = seen.clone();
-    let needles = ["0599911", "9991123", "٠٥٩٩٩١١", "marker-piece-zz", "Marker-Piece-ZZ"];
+    let needles = ["5599911", "9991123", "٥٥٩٩٩١١", "marker-piece-zz", "Marker-Piece-ZZ"];
     {
         let config = StorageConfig::default().event_sink(move |e: &LibraryEvent| sink.lock().unwrap().push(format!("{e:?}")));
         let s = Storage::builder(config)
@@ -476,7 +476,7 @@ fn no_part_search_text_appears_in_any_file_or_event() {
             .build()
             .unwrap();
         let domain = s.domain::<Balanced>();
-        domain.repo().set("m1", &Balanced { id: "m1".into(), group: "visible".into(), value: Sealed::new("0599911123".into()) }).unwrap();
+        domain.repo().set("m1", &Balanced { id: "m1".into(), group: "visible".into(), value: Sealed::new("5599911123".into()) }).unwrap();
         domain.repo().set("m2", &Balanced { id: "m2".into(), group: "visible".into(), value: Sealed::new("xx marker-piece-zz xx".into()) }).unwrap();
         let bulk: Vec<Balanced> = (0..300).map(|i| Balanced { id: format!("b{i:03}"), group: "visible".into(), value: Sealed::new(format!("0577{i:06}")) }).collect();
         let writes: Vec<(&str, &Balanced)> = bulk.iter().map(|a| (a.id.as_str(), a)).collect();
@@ -484,7 +484,7 @@ fn no_part_search_text_appears_in_any_file_or_event() {
         let grant = domain.search_grant().unwrap();
         let started = Instant::now();
         loop {
-            let q = domain.query().filter(Balanced::value.part_candidates("0599911", &grant));
+            let q = domain.query().filter(Balanced::value.part_candidates("5599911", &grant));
             assert!(q.collect().unwrap().iter().any(|r| r.id == "m1"));
             if q.explain().unwrap().selected == Plan::IndexContains {
                 break;

@@ -6,6 +6,7 @@ use crate::backup::BackupRecord;
 use crate::metadata::store::read_meta;
 use crate::metadata::types::{BACKUP_PRE_UPGRADE_SUFFIX, FRAMEWORK_ID, FileEra, META_TABLE};
 use crate::migration::types::migration_dir_name;
+#[cfg(feature = "encryption")]
 use crate::encrypted_store::{EncryptionHandle, OpenOptionsExt, StoreError};
 use crate::handle::DbOrRo;
 use crate::units::{ClError, Result};
@@ -53,7 +54,7 @@ pub struct InspectReport {
 
 /// Open a file of the database to look at it, as a plain database or through the encryption. **Read only**: nothing is written to the file, not even the
 /// recovery mark redb leaves on a writable open. A file that needs repair is not repaired here: it is an error that says to open the database normally first.
-fn open_for_inspection(path: &Path, encryption: Option<&EncryptionHandle>) -> Result<DbOrRo> {
+fn open_for_inspection(path: &Path, #[cfg(feature = "encryption")] encryption: Option<&EncryptionHandle>) -> Result<DbOrRo> {
     crate::handle::guard_open(path, false)?;
     let needs_repair = || {
         ClError::Validation(format!(
@@ -61,32 +62,41 @@ fn open_for_inspection(path: &Path, encryption: Option<&EncryptionHandle>) -> Re
             path.display()
         ))
     };
-    match encryption {
-        Some(enc) => enc
+    #[cfg(feature = "encryption")]
+    if let Some(enc) = encryption {
+        return enc
             .open_file(path, "main", false, &OpenOptionsExt { read_only: true, ..OpenOptionsExt::default() }, &mut |_| {})
             .map(|db| DbOrRo::Enc(db.into_database()))
             .map_err(|e| match e {
                 StoreError::InUse => ClError::DatabaseInUse { path: path.display().to_string() },
                 StoreError::NeedsRepair => needs_repair(),
                 e => ClError::from(e),
-            }),
-        None => Database::builder()
-            .open_read_only(path)
-            .map(DbOrRo::Plain)
-            .map_err(|e| match e {
-                redb::DatabaseError::RepairAborted => needs_repair(),
-                e => crate::handle::open_error(e, path),
-            }),
+            });
     }
+    Database::builder()
+        .open_read_only(path)
+        .map(DbOrRo::Plain)
+        .map_err(|e| match e {
+            redb::DatabaseError::RepairAborted => needs_repair(),
+            e => crate::handle::open_error(e, path),
+        })
 }
 
 pub fn inspect_cldb(primary_path: &Path) -> Result<InspectReport> {
-    inspect_cldb_with(primary_path, None)
+    inspect_cldb_inner(primary_path, #[cfg(feature = "encryption")] None)
 }
 
 /// [`inspect_cldb`] for a database that may be encrypted: pass the same encryption the database
 /// was built with. A file that does not open with it is [`ClError::EncryptedOpenFailed`].
+#[cfg(feature = "encryption")]
 pub fn inspect_cldb_with(primary_path: &Path, encryption: Option<&EncryptionHandle>) -> Result<InspectReport> {
+    inspect_cldb_inner(primary_path, encryption)
+}
+
+fn inspect_cldb_inner(
+    primary_path: &Path,
+    #[cfg(feature = "encryption")] encryption: Option<&EncryptionHandle>,
+) -> Result<InspectReport> {
     let parent = primary_path
         .parent()
         .map(|p| p.to_path_buf())
@@ -106,11 +116,17 @@ pub fn inspect_cldb_with(primary_path: &Path, encryption: Option<&EncryptionHand
     };
 
     let migration_dir = parent.join(migration_dir_name(&db_name));
-    let inspection = inspect_database_with(primary_path, backup_path.as_deref(), &migration_dir, encryption)?;
+    let inspection = inspect_database_inner(
+        primary_path,
+        backup_path.as_deref(),
+        &migration_dir,
+        #[cfg(feature = "encryption")]
+        encryption,
+    )?;
 
     let (framework_version, table_schemas, blob_enabled, table_storage) =
         if inspection.kind == FileKind::Authenticated {
-        let db = open_for_inspection(primary_path, encryption)?;
+        let db = open_for_inspection(primary_path, #[cfg(feature = "encryption")] encryption)?;
         if let Some(meta) = read_meta(&db)? {
             let schemas = meta
                 .tables
@@ -158,15 +174,25 @@ pub fn inspect_database(
     backup_path: Option<&Path>,
     migration_dir: &Path,
 ) -> Result<DatabaseInspection> {
-    inspect_database_with(primary_path, backup_path, migration_dir, None)
+    inspect_database_inner(primary_path, backup_path, migration_dir, #[cfg(feature = "encryption")] None)
 }
 
 /// [`inspect_database`] for a database that may be encrypted.
+#[cfg(feature = "encryption")]
 pub fn inspect_database_with(
     primary_path: &Path,
     backup_path: Option<&Path>,
     migration_dir: &Path,
     encryption: Option<&EncryptionHandle>,
+) -> Result<DatabaseInspection> {
+    inspect_database_inner(primary_path, backup_path, migration_dir, encryption)
+}
+
+pub(crate) fn inspect_database_inner(
+    primary_path: &Path,
+    backup_path: Option<&Path>,
+    migration_dir: &Path,
+    #[cfg(feature = "encryption")] encryption: Option<&EncryptionHandle>,
 ) -> Result<DatabaseInspection> {
     let primary_exists = primary_path.exists();
     let backup_exists = backup_path.map(|p| p.exists()).unwrap_or(false);
@@ -202,7 +228,7 @@ pub fn inspect_database_with(
         });
     }
 
-    let db = open_for_inspection(primary_path, encryption)?;
+    let db = open_for_inspection(primary_path, #[cfg(feature = "encryption")] encryption)?;
     inspect_open(&db, primary_path, backup_path, migration_dir)
 }
 

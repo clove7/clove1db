@@ -68,6 +68,7 @@ mod tests {
             redb: crate::handle::RedbOptions::default(),
             event_sink: Default::default(),
             field_encryption: None, field_keys_file: None,
+            create_missing_tables: false,
         })
         .unwrap();
 

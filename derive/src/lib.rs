@@ -519,8 +519,15 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             }
         })
     };
+    // A protected field needs the `encryption` feature of clove1db, which this macro cannot see:
+    // clove1db's own macro stops the build with a clear message when the feature is off.
+    let require_encryption = if sealed.is_empty() {
+        quote!()
+    } else {
+        quote!(::clove1db::__require_encryption!();)
+    };
     Ok(
-        quote!(impl #ig ::clove1db::fields::CloveFields for #name #tg #wc {
+        quote!(#require_encryption impl #ig ::clove1db::fields::CloveFields for #name #tg #wc {
         const CHECK_FIELDS: () = { fn check<T: ::clove1db::fields::CloveFields>() {} #(let _=check::<#shapes>;)* };
     } impl #ig #name #tg #wc {#(#constants)*} #protected_impl),
     )

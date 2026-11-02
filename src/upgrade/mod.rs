@@ -4,7 +4,7 @@ pub mod legacy_record;
 pub mod migration_refs;
 pub mod pipeline;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "encryption"))]
 mod pipeline_tests;
 
 pub use backup_normalize::{eager_normalize, BackupNormalizeResult};

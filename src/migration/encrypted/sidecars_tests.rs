@@ -96,8 +96,11 @@ fn the_attachments_are_the_ones_the_main_file_refers_to_and_go_both_ways() {
     assert!(names.iter().all(|n| !n.contains("files") && !blobs.iter().any(|b| n.contains(&b.id))), "{names:?}");
     let marker = data(64, 2);
     let marker = &marker[..];
+    // the bytes to look for are made once, not again for every window of every file
+    let clear = data(200_000, 2);
+    let clear = &clear[..marker.len()];
     assert!(
-        contents.iter().all(|c| !c.windows(marker.len()).any(|w| w == &data(200_000, 2)[..marker.len()])),
+        contents.iter().all(|c| !c.windows(marker.len()).any(|w| w == clear)),
         "a sealed file holds the bytes in the clear"
     );
     // and back

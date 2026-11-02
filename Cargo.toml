@@ -5,15 +5,23 @@ edition = "2024"
 rust-version.workspace = true
 license = "MIT"
 authors = ["clove7"]
-description = "Embedded database framework for Rust, built on redb: domain-driven CRUD over typed entities, a byte-budgeted cache, per-entity versioned backup and restore, per-table migrations, and strict durability. Work in progress — feedback welcome."
+description = "Embedded database for Rust on redb: typed entities and queries, automatic indexes, history and restore, a durable change log, attachments, migrations, and optional encryption of the whole database or of single fields."
 repository = "https://github.com/clove7/clove1db"
-keywords = ["database", "embedded", "migration", "backup", "redb"]
+keywords = ["database", "embedded", "redb", "encryption", "index"]
 categories = ["database", "database-implementations", "caching"]
 readme = "README.md"
 exclude = ["examples/**"]
 
+# docs.rs builds the documentation with these features, so the derive macro and the encryption API are documented too.
+[package.metadata.docs.rs]
+features = ["derive", "encryption"]
+
 [features]
 default = []
+# The derive macro: #[derive(CloveFields)]. Without it, write the field constants by hand.
+derive = ["dep:clove1db-derive"]
+# All encryption: of a whole database and of protected fields. It needs the derive macro.
+encryption = ["derive", "dep:aes-gcm", "dep:aes-gcm-siv", "dep:chacha20poly1305", "dep:argon2", "dep:scrypt", "dep:hkdf", "dep:hmac", "dep:sha2", "dep:sha3", "dep:zeroize", "dep:subtle", "dep:getrandom"]
 # Process-exit crash points for durability tests (CLOVE_CRASH_POINT=...).
 crash-inject = []
 
@@ -25,7 +33,7 @@ unexpected_cfgs = { level = "warn", check-cfg = [
 [dependencies]
 fst = { version = "0.4.7", features = ["levenshtein"] }
 strsim = "0.11.1"
-clove1db-derive = { path = "derive", version = "0.1.0" }
+clove1db-derive = { path = "derive", version = "0.1.0", optional = true }
 chrono = "0.4.45"
 itertools = "0.15.0"
 moka = { version = "0.12.16", features = ["sync"] }
@@ -34,24 +42,269 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["raw_value"] }
 thiserror = "2.0.21"
 uuid = { version = "1.29.0", features = ["v4"] }
-aes-gcm = { version = "0.11.1", features = ["zeroize"] }
-aes-gcm-siv = { version = "0.12.1", features = ["zeroize"] }
-chacha20poly1305 = { version = "0.11.0", features = ["zeroize"] }
-argon2 = { version = "0.6.0", features = ["zeroize"] }
-scrypt = "0.12.0"
-hkdf = "0.13.0"
-hmac = { version = "0.13.0", features = ["zeroize"] }
-sha2 = { version = "0.11.1", features = ["zeroize"] }
-sha3 = { version = "0.12.0", features = ["zeroize"] }
+aes-gcm = { version = "0.11.1", features = ["zeroize"], optional = true }
+aes-gcm-siv = { version = "0.12.1", features = ["zeroize"], optional = true }
+chacha20poly1305 = { version = "0.11.0", features = ["zeroize"], optional = true }
+argon2 = { version = "0.6.0", features = ["zeroize"], optional = true }
+scrypt = { version = "0.12.0", optional = true }
+hkdf = { version = "0.13.0", optional = true }
+hmac = { version = "0.13.0", features = ["zeroize"], optional = true }
+sha2 = { version = "0.11.1", features = ["zeroize"], optional = true }
+sha3 = { version = "0.12.0", features = ["zeroize"], optional = true }
 blake3 = { version = "1.8.7", features = ["zeroize"] }
-zeroize = "1.9.1"
-subtle = "2.6.1"
-getrandom = "0.4.3"
+zeroize = { version = "1.9.1", optional = true }
+subtle = { version = "2.6.1", optional = true }
+getrandom = { version = "0.4.3", optional = true }
 
 [dev-dependencies]
 # Tests only: without `cache_metrics`, redb reports its cache as empty, and the
 # redb cache cap could not be checked against what redb actually holds.
 redb = { version = "4.3.0", features = ["cache_metrics"] }
+
+# The integration tests that need a feature are built only with it (cargo test --all-features runs them all).
+[[test]]
+name = "backup_open"
+required-features = ["derive"]
+
+[[test]]
+name = "fields_ast"
+required-features = ["derive"]
+
+[[test]]
+name = "fields_codec"
+required-features = ["derive"]
+
+[[test]]
+name = "fields_extract"
+required-features = ["derive"]
+
+[[test]]
+name = "fields_macro"
+required-features = ["derive"]
+
+[[test]]
+name = "fields_transforms"
+required-features = ["derive"]
+
+[[test]]
+name = "id_contract"
+required-features = ["derive"]
+
+[[test]]
+name = "index_build_reads"
+required-features = ["derive"]
+
+[[test]]
+name = "index_file_deleted"
+required-features = ["derive"]
+
+[[test]]
+name = "index_queries"
+required-features = ["derive"]
+
+[[test]]
+name = "index_swap_queries"
+required-features = ["derive", "crash-inject"]
+
+[[test]]
+name = "locked_files"
+required-features = ["derive"]
+
+[[test]]
+name = "out_of_memory"
+required-features = ["derive"]
+
+[[test]]
+name = "prefetch"
+required-features = ["derive"]
+
+[[test]]
+name = "query"
+required-features = ["derive"]
+
+[[test]]
+name = "query_edges"
+required-features = ["derive"]
+
+[[test]]
+name = "query_invariants"
+required-features = ["derive"]
+
+[[test]]
+name = "replay_budget_kill"
+required-features = ["derive"]
+
+[[test]]
+name = "trigram_index"
+required-features = ["derive"]
+
+[[test]]
+name = "commit_atomic"
+required-features = ["encryption"]
+
+[[test]]
+name = "compact"
+required-features = ["encryption"]
+
+[[test]]
+name = "crypto_ciphers"
+required-features = ["encryption"]
+
+[[test]]
+name = "crypto_keys"
+required-features = ["encryption"]
+
+[[test]]
+name = "crypto_macs"
+required-features = ["encryption"]
+
+[[test]]
+name = "encrypted_blobs"
+required-features = ["encryption"]
+
+[[test]]
+name = "encrypted_crash"
+required-features = ["encryption"]
+
+[[test]]
+name = "encrypted_crash_points"
+required-features = ["encryption"]
+
+[[test]]
+name = "encrypted_database"
+required-features = ["encryption"]
+
+[[test]]
+name = "encrypted_files"
+required-features = ["encryption"]
+
+[[test]]
+name = "encrypted_handle"
+required-features = ["encryption"]
+
+[[test]]
+name = "encrypted_kills"
+required-features = ["encryption"]
+
+[[test]]
+name = "encrypted_sealed"
+required-features = ["encryption"]
+
+[[test]]
+name = "encrypted_sidecar"
+required-features = ["encryption"]
+
+[[test]]
+name = "encrypted_sidecars"
+required-features = ["encryption"]
+
+[[test]]
+name = "encrypted_store"
+required-features = ["encryption"]
+
+[[test]]
+name = "field_crypto_attachments"
+required-features = ["encryption"]
+
+[[test]]
+name = "field_crypto_combined"
+required-features = ["encryption"]
+
+[[test]]
+name = "field_crypto_cost"
+required-features = ["encryption"]
+
+[[test]]
+name = "field_crypto_declaration"
+required-features = ["encryption"]
+
+[[test]]
+name = "field_crypto_exclusion"
+required-features = ["encryption"]
+
+[[test]]
+name = "field_crypto_fields"
+required-features = ["encryption"]
+
+[[test]]
+name = "field_crypto_hash"
+required-features = ["encryption"]
+
+[[test]]
+name = "field_crypto_kills"
+required-features = ["encryption"]
+
+[[test]]
+name = "field_crypto_print"
+required-features = ["encryption"]
+
+[[test]]
+name = "field_crypto_storage"
+required-features = ["encryption"]
+
+[[test]]
+name = "field_crypto_tables"
+required-features = ["encryption"]
+
+[[test]]
+name = "growing_database"
+required-features = ["encryption"]
+
+[[test]]
+name = "migration_cost"
+required-features = ["encryption"]
+
+[[test]]
+name = "migration_fields_kills"
+required-features = ["encryption"]
+
+[[test]]
+name = "migration_fields_whole_kills"
+required-features = ["encryption"]
+
+[[test]]
+name = "migration_leftover"
+required-features = ["encryption"]
+
+[[test]]
+name = "migration_processes"
+required-features = ["encryption"]
+
+[[test]]
+name = "migration_processes_fields"
+required-features = ["encryption"]
+
+[[test]]
+name = "open_writes_nothing"
+required-features = ["encryption"]
+
+[[test]]
+name = "redb_stream"
+required-features = ["encryption"]
+
+[[test]]
+name = "sealed_scan"
+required-features = ["encryption"]
+
+[[test]]
+name = "sealed_search_confirm"
+required-features = ["encryption"]
+
+[[test]]
+name = "sealed_search_full"
+required-features = ["encryption"]
+
+[[test]]
+name = "sealed_search_kills"
+required-features = ["encryption"]
+
+[[test]]
+name = "sealed_search_parts"
+required-features = ["encryption"]
+
+[[test]]
+name = "sealed_search_slow"
+required-features = ["encryption"]
 
 [workspace]
 members = [".", "derive"]
@@ -69,3 +322,7 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 rust-version = "1.89"
+
+# Tests only: the dependencies (Argon2, the ciphers, redb) are built optimised; the library itself stays unoptimised.
+[profile.dev.package."*"]
+opt-level = 3

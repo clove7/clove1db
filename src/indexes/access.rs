@@ -21,8 +21,8 @@ impl Shared {
   if forced.is_some_and(|hint|hint.is_scan()){return Ok(None)}
   let planning=Instant::now();
   let Some(pair)=self.pair()else{return Ok(None)};if pair.ready==0||(!stale&&pair.primary.head!=view.head)||pair.primary.database_uuid!=view.database_uuid{return Ok(None)}
-  if super::worker::identity(view)?!=metadata(&pair.index)?.identity{return Ok(None)}
-  let defs=definitions(&pair.index)?;
+  let memo=pair.memo()?;if super::worker::identity(view)?!=memo.0{return Ok(None)}
+  let defs=&memo.1;
   use redb::ReadableTableMetadata;
   let rows=view.tx.open_table(TableDefinition::<&str,&[u8]>::new(table))?.len()? as f64;
   let recipes=super::planner::candidates(&pair,&defs,table,expr,order,limit,rows,explain.estimated_rows)?;

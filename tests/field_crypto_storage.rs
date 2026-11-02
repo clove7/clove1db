@@ -91,7 +91,7 @@ fn a_row_is_stored_sealed() {
     s.domain::<Person>().repo().set("p1", &person("p1", PHONE)).unwrap();
     let bytes = raw(&s, "p1").unwrap();
     let text = String::from_utf8(bytes).unwrap();
-    for secret in ["966500000001", "vip", "late"] {
+    for secret in ["155500000001", "vip", "late"] {
         assert!(!text.contains(secret), "{text}");
     }
     let json = raw_json(&s, "p1");
@@ -196,7 +196,7 @@ fn a_batch_by_entity_seals_every_row() {
     assert!(raw(&s, "gone").is_none());
     for id in ["a", "b"] {
         let text = String::from_utf8(raw(&s, id).unwrap()).unwrap();
-        assert!(!text.contains("96650000000"), "{text}");
+        assert!(!text.contains("15550000000"), "{text}");
         assert!(repo.get(id).unwrap().phone.is_bound());
     }
     // A closed value from row `a` cannot go into row `b` through a batch either.

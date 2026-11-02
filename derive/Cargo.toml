@@ -2,7 +2,14 @@
 name = "clove1db-derive"
 version.workspace = true
 edition = "2024"
+rust-version.workspace = true
 license = "MIT"
+authors = ["clove7"]
+description = "Derive macro for clove1db: #[derive(CloveFields)] generates the typed field constants used by queries and indexes, and the sealing code for fields marked #[clove(encrypt)]."
+repository = "https://github.com/clove7/clove1db"
+readme = "README.md"
+keywords = ["database", "embedded", "derive", "macro", "redb"]
+categories = ["database", "development-tools::procedural-macro-helpers"]
 [lib]
 proc-macro = true
 [dependencies]

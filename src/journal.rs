@@ -171,6 +171,23 @@ pub(crate) fn put_number(tx: &WriteTransaction, key: &str, value: u64) -> Result
         .insert(key, value.to_be_bytes().as_slice())?;
     Ok(())
 }
+/// Key of `__seq` that says attachment files written by a version without references may be in the
+/// folders of this database. It is written with the log itself (see [`mark_adoption_due`]) and never removed.
+pub(crate) const ADOPTION_DUE: &str = "blob_adopt_due";
+/// Prefix of the keys of `__seq` that record, one per attachment table, that the old files of the table
+/// were adopted: `blob_adopted:{table}`.
+pub(crate) const ADOPTED_PREFIX: &str = "blob_adopted:";
+/// Called just before [`initialize`] when a database is opened. A database that has no log yet was made by
+/// a version that kept no references (or is new), so the files it left in attachment folders are
+/// attachments, not leftovers. This is written in the transaction that creates the log, so no interruption
+/// can separate the two; a database whose log already exists never gets it.
+pub(crate) fn mark_adoption_due(tx: &WriteTransaction) -> Result<()> {
+    let mut t = tx.open_table(SEQ)?;
+    if t.get("head")?.is_none() {
+        t.insert(ADOPTION_DUE, [1u8].as_slice())?;
+    }
+    Ok(())
+}
 pub(crate) fn initialize(tx: &WriteTransaction) -> Result<()> {
     let mut t = tx.open_table(SEQ)?;
     if t.get("head")?.is_none() {

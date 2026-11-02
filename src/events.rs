@@ -32,6 +32,10 @@ pub enum LibraryEvent {
         name: String,
         last_acked_seq: u64,
     },
+    /// Tables the database file did not have were created empty at open, because
+    /// `DatabaseConfig::create_missing_tables` was set. The names are here so that a misspelled table
+    /// shows in the log. Never carries a value.
+    TablesCreated { database: String, tables: Vec<String> },
     /// Something about an encrypted file happened. `event` is one of a fixed list
     /// (`encryption/open_failed/<reason>`, `encryption/index_rebuilt`,
     /// `encryption/sidecar_set_aside`, `encryption/cleanup_failed`); `file` is `main`, `bak`,

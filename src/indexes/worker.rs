@@ -4,16 +4,46 @@ use super::{format::*,Pair,Shared};
 use crate::{journal::{ChangeKind,ConsumerToken,ReadView},repository::DatabaseManager,units::{Result,ClError}};
 use redb::{Database, ReadableDatabase,ReadableTable,TableDefinition};
 use std::{sync::{Arc,Mutex,atomic::{AtomicBool,Ordering}},thread::{self,JoinHandle},time::{Duration,Instant}};
-#[cfg(test)] use redb::ReadableTableMetadata;
+#[cfg(all(test, feature = "derive"))] use redb::ReadableTableMetadata;
 const CATALOG_META:TableDefinition<&str,&[u8]>=TableDefinition::new("__inx_catalog_meta");
 const CATALOG:TableDefinition<u64,&[u8]>=TableDefinition::new("__inx_catalog");
 /// Fair turn budgets. A single indivisible row/commit can exceed the time limit.
 pub const BATCH_BYTES:usize=256*1024;
 pub const BATCH_TIME:Duration=Duration::from_millis(4);
+/// A turn of building an index reads rows for up to this long (or `BUILD_BATCH_BYTES`): a turn ends in a durable commit, and 4 ms turns spent most of a build in fsync.
+const BUILD_BATCH_TIME:Duration=Duration::from_millis(100);
+const BUILD_BATCH_BYTES:usize=2*1024*1024;
+/// The most entries (keys and row ids) a build holds in memory before writing them, sorted. An index smaller than this is written once, in key order.
+const HELD_BYTES:usize=32*1024*1024;
 /// How long one turn may spend applying the changes it collected (see `Driver::tick`).
 pub const APPLY_TIME:Duration=Duration::from_millis(50);
-pub(crate) struct Worker {stop:Arc<AtomicBool>,thread:Mutex<Option<JoinHandle<()>>>}
-impl Worker {pub fn stop(&self) {self.stop.store(true,Ordering::Release);let t=self.thread.lock().unwrap_or_else(|e|e.into_inner()).take();if let Some(t)=t {let _=t.join();}}}
+/// Lets a caller ask the worker to let go of a database's files for a while (compaction needs the file with no read open on it).
+#[derive(Default)]
+pub(crate) struct Gate {wanted:Mutex<std::collections::HashMap<String,usize>>,parked:Mutex<std::collections::HashSet<String>>}
+impl Gate {
+ fn held(&self,db:&str)->bool {self.wanted.lock().unwrap_or_else(|e|e.into_inner()).get(db).is_some_and(|n|*n>0)}
+ fn park(&self,db:&str,on:bool) {let mut p=self.parked.lock().unwrap_or_else(|e|e.into_inner());if on {p.insert(db.to_string());}else{p.remove(db);}}
+ fn is_parked(&self,db:&str)->bool {self.parked.lock().unwrap_or_else(|e|e.into_inner()).contains(db)}
+}
+/// While it lives the worker keeps no read open on the database; dropping it lets the worker go on.
+pub(crate) struct Pause {gate:Arc<Gate>,db:String}
+impl Drop for Pause {fn drop(&mut self){let mut w=self.gate.wanted.lock().unwrap_or_else(|e|e.into_inner());if let Some(n)=w.get_mut(&self.db){*n=n.saturating_sub(1);}}}
+pub(crate) struct Worker {stop:Arc<AtomicBool>,thread:Mutex<Option<JoinHandle<()>>>,gate:Arc<Gate>}
+impl Worker {
+ /// Waits until the worker has let go of `db` (it finishes a running build first). Gives up with an error after `wait`.
+ pub fn pause(&self,db:&str,wait:Duration)->Result<Pause> {
+  *self.gate.wanted.lock().unwrap_or_else(|e|e.into_inner()).entry(db.to_string()).or_insert(0)+=1;
+  let pause=Pause{gate:self.gate.clone(),db:db.to_string()};
+  let start=Instant::now();
+  loop {
+   // a stopped worker holds nothing
+   if self.thread.lock().unwrap_or_else(|e|e.into_inner()).is_none()||self.gate.is_parked(db) {return Ok(pause)}
+   if start.elapsed()>wait {return Err(ClError::Validation("the index worker is busy with this database and did not let go of it in time; try again".into()))}
+   thread::sleep(Duration::from_millis(2));
+  }
+ }
+ pub fn stop(&self) {self.stop.store(true,Ordering::Release);let t=self.thread.lock().unwrap_or_else(|e|e.into_inner()).take();if let Some(t)=t {let _=t.join();}}
+}
 impl Drop for Worker {fn drop(&mut self){self.stop();}}
 struct Driver {db:DatabaseManager,file:Arc<Database>,state:Arc<Shared>,token:Option<ConsumerToken>,meta:Metadata,defs:Vec<Manifest>,target:Option<Arc<ReadView>>,pending:Vec<Definition>,build:Option<Build>,samplers:BTreeMap<u64,Reservoir>,last_flush:Instant,repair_errors:u64,retired:Vec<Manifest>,reset_job:Option<ResetJob>,compact_job:Option<CompactJob>,last_compact_check:Instant,compact_checked_seq:Option<u64>,last_compact_bytes:u64,prepared:BTreeMap<u64,(u64,u64,Arc<crate::query::stats::FieldStats>)>,dictionary_job:Option<DictionaryJob>,budget_override:Option<Duration>,replay_since:Option<Instant>,budget_rebuilds:Vec<Instant>,hold:Option<(u64,Instant)>,
  /// The journal sequence acknowledged so far. Only a durable `.inx` checkpoint moves it (see `maintain`).
@@ -27,7 +57,9 @@ struct ResetJob {seq:u64,source:String,view:Arc<ReadView>,defs:Vec<Manifest>,sam
  builders:BTreeMap<u64,super::trigram::Builder>}
 struct Build {view:Arc<ReadView>,manifest:Manifest,last:Option<String>,started:Instant,sampler:Reservoir,
  /// A trigram index is built in memory and written in key order (`trigram::Builder`): `flushing` while it is being written, `read_done` once every row has been read.
- tri:Option<super::trigram::Builder>,flushing:bool,read_done:bool}
+ tri:Option<super::trigram::Builder>,flushing:bool,read_done:bool,
+ /// Entries of a value or token index built so far and not yet written: they are written sorted, in one pass, when the table is read or `HELD_BYTES` is reached (see `build_turn`).
+ held:Vec<(Vec<u8>,String)>,held_bytes:usize,fresh:bool}
 pub(super) fn identity(view:&ReadView)->Result<Identity> {
  let schema=match view.tx.open_table(TableDefinition::<&str,&[u8]>::new(crate::metadata::types::META_TABLE)) {
   Ok(t)=>match t.get(crate::metadata::types::META_KEY)? {Some(v)=>{let m:crate::metadata::types::CloveMeta=serde_json::from_slice(v.value())?;serde_json::to_vec(&m.tables)?},None=>vec![]},Err(_)=>vec![]};
@@ -52,7 +84,7 @@ impl Driver {
    let f=existing.unwrap();let tx=f.begin_read()?;let m=metadata(&tx)?;let d=definitions(&tx);drop(tx);
    if let Ok(d)=d {(f,m,d)} else {drop(f);let old=path.with_extension(format!("inx.invalid-{}",uuid::Uuid::new_v4()));std::fs::rename(&path,old)?;let f=db.redb.open_index_file(&path,true,&db.event_sink)?;initialize(&f,expected.clone(),generation,view.head)?;let m=metadata(&f.begin_read()?)?;(f,m,vec![])}
   } else {
-   drop(existing);if path.exists(){if db.redb.encryption.is_some(){db.event_sink.emit(&crate::LibraryEvent::Encryption{event:"encryption/index_rebuilt",file:"index"})}std::fs::rename(&path,path.with_extension(format!("inx.invalid-{}",uuid::Uuid::new_v4())))?;}
+   drop(existing);if path.exists(){#[cfg(feature = "encryption")]{if db.redb.encryption.is_some(){db.event_sink.emit(&crate::LibraryEvent::Encryption{event:"encryption/index_rebuilt",file:"index"})}}std::fs::rename(&path,path.with_extension(format!("inx.invalid-{}",uuid::Uuid::new_v4())))?;}
    let f=db.redb.open_index_file(&path,true,&db.event_sink)?;initialize(&f,expected,generation,view.head)?;let m=metadata(&f.begin_read()?)?;(f,m,vec![])
   };
   let file=Arc::new(file);
@@ -108,7 +140,7 @@ impl Driver {
   for d in self.defs.iter().filter(|d|d.ready&&d.state==IndexState::Active&&d.definition.kind==Kind::Value&&d.definition.paths.len()==1){if let Some(stats)=self.samplers.get(&d.id){let cached=self.prepared.entry(d.id).or_insert_with(||(d.generation,stats.revision,Arc::new(stats.field_stats(stats.revision))));if cached.0!=d.generation||cached.1!=stats.revision{*cached=(d.generation,stats.revision,Arc::new(stats.field_stats(stats.revision)));}statistics.push((d.definition.table.clone(),d.definition.paths[0].clone(),cached.2.clone()));}}
 
   self.update_report()?;
-  self.state.publish(Arc::new(Pair{primary:view,index,published:Instant::now(),ready:self.defs.iter().filter(|d|d.ready&&d.state==IndexState::Active).count(),statistics,keep:self.file.clone()}));Ok(())
+  self.state.publish(Arc::new(Pair{primary:view,index,published:Instant::now(),ready:self.defs.iter().filter(|d|d.ready&&d.state==IndexState::Active).count(),statistics,keep:self.file.clone(),memo:Default::default()}));Ok(())
  }
  fn start_build(&mut self,definition:Definition)->Result<()> {
   let view=if self.token.is_none() {let(t,_)=self.db.resume_index_consumer()?;self.token=Some(t);let view=Arc::new(self.db.read_view_at_head()?);self.meta.applied=view.head;self.meta.reset=reset(&view)?;view} else {self.state.pair().ok_or_else(||ClError::Validation("missing paired snapshot".into()))?.primary.clone()};
@@ -118,9 +150,9 @@ impl Driver {
   if let Some(old)=previous{d.interval_ms=old.interval_ms;d.reads=old.reads;d.matched=old.matched;d.estimated_ms=old.estimated_ms;d.actual_ms=old.actual_ms;}
   // The durable definition catalog lets a deleted/corrupt derived file recover.
   self.db.journal_write(|tx,_| {tx.open_table(CATALOG)?.insert(id,serde_json::to_vec(&d)?.as_slice())?;Ok(())})?;
-  let tx=self.file.begin_write()?;put_definition(&tx,&d)?;create_tables(&tx,&d)?;put_metadata(&tx,&self.meta)?;tx.commit()?;
+  let tx=self.file.begin_write()?;put_definition(&tx,&d)?;create_tables(&tx,&d)?;put_metadata(&tx,&self.meta)?;let fresh={let reverse=tx.open_table(TableDefinition::<&str,&[u8]>::new(&d.reverse()))?;redb::ReadableTableMetadata::len(&reverse)?==0};tx.commit()?;
   let tri=(d.definition.kind.postings()).then(super::trigram::Builder::default);
-  self.build=Some(Build{view,manifest:d,last:None,started:Instant::now(),sampler:Reservoir::default(),tri,flushing:false,read_done:false});Ok(())
+  self.build=Some(Build{view,manifest:d,last:None,started:Instant::now(),sampler:Reservoir::default(),tri,flushing:false,read_done:false,held:Vec::new(),held_bytes:0,fresh});Ok(())
  }
  /// One turn of a trigram build: read rows into the in-memory builder (no commit), or write part of it out in key order.
  fn trigram_build_turn(&mut self)->Result<bool> {
@@ -152,15 +184,21 @@ impl Driver {
  fn build_turn(&mut self)->Result<bool> {
   if self.build.as_ref().is_some_and(|b|b.tri.is_some()) {return self.trigram_build_turn()}
   let b=self.build.as_mut().unwrap();let rows=b.view.tx.open_table(TableDefinition::<&str,&[u8]>::new(&b.manifest.definition.table))?;
-  let tx=self.file.begin_write()?;let(mut bytes,mut done)=(0usize,true);let mut pending=vec![];let start=Instant::now();
+  let tx=self.file.begin_write()?;let(mut bytes,mut done)=(0usize,true);let start=Instant::now();
   let lower=b.last.as_deref().map(std::ops::Bound::Excluded).unwrap_or(std::ops::Bound::Unbounded);
-  for row in rows.range::<&str>((lower,std::ops::Bound::Unbounded))? {let(k,v)=row?;let seq=crate::lastwrite::get(&b.view.tx,&b.manifest.definition.table,k.value())?;let delta=write_row_buffered(&tx,&b.manifest,k.value(),v.value(),seq,Some(&mut pending))?;b.sampler.apply(delta.old.as_ref(),Some(delta.new));b.last=Some(k.value().into());bytes+=k.value().len()+v.value().len();if bytes>=BATCH_BYTES||start.elapsed()>=BATCH_TIME{done=false;break}}
-  insert_run(&tx,&b.manifest,&mut pending)?;
+  for row in rows.range::<&str>((lower,std::ops::Bound::Unbounded))? {let(k,v)=row?;let seq=crate::lastwrite::get(&b.view.tx,&b.manifest.definition.table,k.value())?;crate::memory::reserve("index.build_held",&mut b.held,8)?;let before=b.held.len();let delta=write_row_core(&tx,&b.manifest,k.value(),v.value(),seq,Some(&mut b.held),b.fresh)?;for e in &b.held[before..] {b.held_bytes+=e.0.len()+e.1.len()}b.sampler.apply(delta.old.as_ref(),Some(delta.new));b.last=Some(k.value().into());bytes+=k.value().len()+v.value().len();if bytes>=BUILD_BATCH_BYTES||start.elapsed()>=BUILD_BATCH_TIME{done=false;break}}
+  if done||b.held_bytes>=HELD_BYTES{insert_run(&tx,&b.manifest,&mut b.held)?;b.held_bytes=0;}
   b.manifest.bytes+=bytes as u64;crate::fsutil::maybe_crash("index_during_build");tx.commit()?;self.refresh_pair()?;
   if done {
    let b=self.build.take().unwrap();let tx=self.file.begin_write()?;tx.open_table(STATS)?.insert(b.manifest.id,b.sampler.encode()?.as_slice())?;put_definition(&tx,&b.manifest)?;tx.commit()?;
    if b.manifest.definition.kind==Kind::Token{self.start_dictionary(vec![b.manifest.clone()],DictionaryFinish::Build(b))?;}else{self.finish_build(b)?;}
   } Ok(true)
+ }
+
+ /// Lets go of every read this driver keeps on the primary, unless a job is using one (then it goes on with the job and asks again next turn).
+ fn try_park(&mut self)->bool {
+  if self.build.is_some()||self.dictionary_job.is_some()||self.compact_job.is_some()||self.reset_job.is_some() {return false}
+  self.target=None;self.state.clear();true
  }
 
  fn tick(&mut self)->Result<bool> {
@@ -209,7 +247,8 @@ impl Driver {
   // so after any crash `.inx` falls back to its last checkpoint and the worker continues from the journal. The text path (dictionaries) keeps its own durable commits.
   if dictionaries.is_empty(){tx.set_durability(redb::Durability::None)?;}
   put_metadata(&tx,&self.meta)?;crate::fsutil::maybe_crash("index_before_commit");tx.commit()?;crate::fsutil::maybe_crash("index_after_commit");
-  if dictionaries.is_empty(){if last==target{self.publish()?;}}
+  // Caught up with the target: there is no backlog any more, so the time a backlog has been replayed starts again with the next write (`replay_since` is the age of a backlog, not of the first write).
+  if dictionaries.is_empty(){if last==target{self.replay_since=None;self.publish()?;}}
   else{self.start_dictionary(dictionaries,DictionaryFinish::Batch(last))?;}
   Ok(true)
  }
@@ -259,12 +298,14 @@ fn remove_row(tx:&redb::WriteTransaction,d:&Manifest,row:&str)->Result<Option<Ro
  Ok(old.stats)
 }
 fn write_row(tx:&redb::WriteTransaction,d:&Manifest,row:&str,bytes:&[u8],seq:u64)->Result<RowDelta> {write_row_buffered(tx,d,row,bytes,seq,None)}
-fn write_row_buffered(tx:&redb::WriteTransaction,d:&Manifest,row:&str,bytes:&[u8],seq:u64,pending:Option<&mut Vec<(Vec<u8>,String)>>)->Result<RowDelta> {
+fn write_row_buffered(tx:&redb::WriteTransaction,d:&Manifest,row:&str,bytes:&[u8],seq:u64,pending:Option<&mut Vec<(Vec<u8>,String)>>)->Result<RowDelta> {write_row_core(tx,d,row,bytes,seq,pending,false)}
+/// `fresh`: the row cannot have an entry already (the first build of an index whose tables were empty when it began), so there is none to remove.
+fn write_row_core(tx:&redb::WriteTransaction,d:&Manifest,row:&str,bytes:&[u8],seq:u64,pending:Option<&mut Vec<(Vec<u8>,String)>>,fresh:bool)->Result<RowDelta> {
  if d.definition.kind.postings() {let(grams,stats)=trigram_inputs(d,row,bytes)?;let old=super::trigram::write(tx,d,row,&grams,&stats)?;return Ok(RowDelta{old,new:stats})}
- let old=remove_row(tx,d,row)?;
+ let old=if fresh {None} else {remove_row(tx,d,row)?};
  let sampled=if d.definition.kind==Kind::LastWrite {vec![crate::fields::Value::Number(seq.to_string())]}else if let Some(path)=d.definition.paths.first(){path_values(bytes,path)?}else{vec![]};
  let mut stats=RowStats::new(row,bytes.len(),&sampled)?;
- let values=if d.definition.kind==Kind::LastWrite {vec![crate::fields::Value::Number(seq.to_string())]}else if d.definition.paths.len()==1 {let values=path_values(bytes,&d.definition.paths[0])?;match d.definition.kind {Kind::Token|Kind::Trigram=>{let mut out=vec![];for value in values {if let crate::fields::Value::String(s)=value {crate::memory::probe("index.row_terms",s.len().saturating_mul(48))?;let terms=if d.definition.kind==Kind::Token {crate::query::eval::tokens(&s)}else{super::access::trigrams(&s)};out.extend(terms.into_iter().map(crate::fields::Value::String));}}out},_=>values}}else{let mut tuple=vec![];for path in &d.definition.paths {if path.steps.iter().any(|s|matches!(s,crate::fields::Step::Any|crate::fields::Step::All)){return Err(ClError::Validation("compound multikey requires a single expansion path".into()))}tuple.push(crate::query::path_value(bytes,path)?);}vec![crate::fields::Value::Array(tuple)]};
+ let values=if d.definition.kind==Kind::LastWrite {vec![crate::fields::Value::Number(seq.to_string())]}else if d.definition.paths.len()==1 {let values=sampled.clone();match d.definition.kind {Kind::Token|Kind::Trigram=>{let mut out=vec![];for value in values {if let crate::fields::Value::String(s)=value {crate::memory::probe("index.row_terms",s.len().saturating_mul(48))?;let terms=if d.definition.kind==Kind::Token {crate::query::eval::tokens(&s)}else{super::access::trigrams(&s)};out.extend(terms.into_iter().map(crate::fields::Value::String));}}out},_=>values}}else{let mut tuple=vec![];for path in &d.definition.paths {if path.steps.iter().any(|s|matches!(s,crate::fields::Step::Any|crate::fields::Step::All)){return Err(ClError::Validation("compound multikey requires a single expansion path".into()))}tuple.push(crate::query::path_value(bytes,path)?);}vec![crate::fields::Value::Array(tuple)]};
  if d.definition.paths.len()>1{stats.unorderable=u64::from(values.iter().any(|v|crate::fields::codec::encode(v).is_err()));}
  let terms=if d.definition.kind==Kind::Token {values.iter().filter_map(|v|if let crate::fields::Value::String(s)=v {Some(s.clone())}else{None}).collect::<std::collections::BTreeSet<_>>().into_iter().collect::<Vec<_>>()}else{vec![]};
  if d.definition.kind==Kind::Token {let name=terms_name(d);let mut table=tx.open_table(TableDefinition::<&str,u64>::new(&name))?;for term in &terms {let count=table.get(term.as_str())?.map(|v|v.value()).unwrap_or(0);table.insert(term.as_str(),count+1)?;}}
@@ -273,27 +314,36 @@ fn write_row_buffered(tx:&redb::WriteTransaction,d:&Manifest,row:&str,bytes:&[u8
  let mut counters=stats.clone();counters.values.clear();
  let reverse=encode_reverse(row,&Reverse{keys:keys.into_iter().collect(),terms,stats:Some(counters)})?;tx.open_table(TableDefinition::<&str,&[u8]>::new(&d.reverse()))?.insert(row,reverse.as_slice())?;Ok(RowDelta{old,new:stats})
 }
+/// How long the worker waits when it found nothing to do: 1 ms while changes were arriving a moment ago (`busy_until`), else 10 ms.
+fn idle_pause(now:Instant,busy_until:Instant)->Duration {if now<busy_until {Duration::from_millis(1)} else {Duration::from_millis(10)}}
 pub(super) fn boot(databases:&mut std::collections::HashMap<String,DatabaseManager>)->Result<Worker> {
  let mut drivers=vec![];for db in databases.values() {drivers.push(Driver::open(db.clone())?);}
- let stop=Arc::new(AtomicBool::new(false));let signal=stop.clone();
+ let stop=Arc::new(AtomicBool::new(false));let signal=stop.clone();let gate=Arc::new(Gate::default());let hold=gate.clone();
  let t=thread::Builder::new().name("clove-indexer".into()).spawn(move|| {
+  // While changes keep arriving the worker looks again after 1 ms, so that the index is at most a moment behind the last write (a query is answered by the index only when it is at the head); once quiet for 250 ms it looks every 10 ms.
+  let mut busy_until=Instant::now();
   while !signal.load(Ordering::Acquire) {
    let mut work=false;
-   for d in &mut drivers {if signal.load(Ordering::Acquire){break}match d.tick() {Ok(w)=>work|=w,Err(e)=>{
+   for d in &mut drivers {if signal.load(Ordering::Acquire){break}
+    // Asked to let go of this database (compaction): once no job holds a read, drop the views and wait.
+    let name=d.db.db_name.clone();
+    if hold.held(&name) {if d.try_park() {hold.park(&name,true);continue}hold.park(&name,false);} else {hold.park(&name,false);}
+    match d.tick() {Ok(w)=>work|=w,Err(e)=>{
     // A retained journal gap requests a fresh snapshot, never stale query output.
     d.repair_errors+=1;d.state.clear();
     // The system refused memory: the same work would be refused again at once, so repair, tell the programmer, and wait before the next attempt.
     if let ClError::OutOfMemory{bytes,..}=e {d.db.event_sink.emit(&crate::LibraryEvent::Index{event:"index/out_of_memory",generation:d.meta.generation,fingerprint:0,rows:0,bytes,elapsed:Duration::ZERO});let _=d.repair();thread::sleep(Duration::from_millis(250));continue}
     if d.repair().is_ok(){work=true;}
    }}}
-   if !work {thread::sleep(Duration::from_millis(10));}
+   if work {busy_until=Instant::now()+Duration::from_millis(250);}
+   if !work {thread::sleep(idle_pause(Instant::now(),busy_until));}
   }
   for d in &mut drivers {let _=d.maintain(true);d.state.clear();}
  }).map_err(|e|ClError::IoError(e.to_string()))?;
- Ok(Worker{stop,thread:Mutex::new(Some(t))})
+ Ok(Worker{stop,thread:Mutex::new(Some(t)),gate})
 }
 
-#[cfg(test)] mod tests {
+#[cfg(all(test, feature = "derive"))] mod tests {
  use super::*;use crate::{CloveFields,entity::Entity,storage::{Storage,StorageConfig,DatabaseConfig}};
  #[derive(Clone,Default,serde::Serialize,serde::Deserialize,CloveFields)] struct Note{id:String,n:i64}
  impl Entity for Note {fn entity_id(&self)->&str {&self.id}}
@@ -445,6 +495,48 @@ pub(super) fn boot(databases:&mut std::collections::HashMap<String,DatabaseManag
   let (i,scan)=until_indexed(&s,"variant 1 ");assert_eq!((i,scan),(3000,3000));assert_eq!(answers(&s,"variant 0 ").1,0);
   assert!(count_of(&seen,"index/rebuild")>=1,"the existing rebuild path ran too");
   s.close();let _=std::fs::remove_dir_all(&root);
+ }
+ /// Writes that the worker keeps up with, for longer than the replay budget: the backlog is never more than a moment old, so nothing is rebuilt and the index keeps answering.
+ /// (The budget is the time a backlog may be replayed, not the time since the first write.)
+ #[test] fn writes_the_worker_keeps_up_with_never_rebuild_the_index_however_long_they_last() {
+  let root=std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());let seen=Arc::new(Mutex::new(vec![]));
+  TEST_REPLAY_BUDGET.with(|b|b.set(Some(Duration::from_millis(400))));let s=events_storage(&root,&seen);TEST_REPLAY_BUDGET.with(|b|b.set(None));
+  let db=s.db_manager("store");db.commit_batch_atomic(&doc_rows(0,2000),&[]).unwrap();
+  let def=||Definition{table:"docs".into(),paths:vec![Doc::text.path()],kind:Kind::Trigram,directions:vec![]};
+  db.indexes.request(def());drop(wait(db,db.journal_head().unwrap()));
+  until_indexed(&s,"variant 0 ");
+  // one small write every 20 ms for five budgets: the worker applies each at once
+  let start=Instant::now();let mut written=0u64;
+  while start.elapsed()<Duration::from_secs(2) {written+=1;db.commit_batch_atomic(&doc_rows(written,1),&[]).unwrap();thread::sleep(Duration::from_millis(20));}
+  assert_eq!(count_of(&seen,"index/rebuild/replay_budget"),0,"a rebuild although the worker kept up with {written} writes: {:?}",seen.lock().unwrap());
+  assert_eq!(count_of(&seen,"index/state"),0,"the index was set aside: {:?}",seen.lock().unwrap());
+  let (indexed,scan)=until_indexed(&s,"variant 0 ");assert_eq!(indexed,scan,"the index answers like a scan");
+ }
+ /// What a published pair says about its index file (identity, definitions) is read once for the pair: an index built after queries were answered is in the next pair, and the next query uses it.
+ #[test] fn an_index_built_after_queries_were_answered_is_used_by_the_next_query() {
+  use crate::query::optimizer::Plan;
+  let root=std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());let seen=Arc::new(Mutex::new(vec![]));let s=events_storage(&root,&seen);
+  let db=s.db_manager("store");db.commit_batch_atomic(&doc_rows(0,2000),&[]).unwrap();
+  db.indexes.request(Definition{table:"docs".into(),paths:vec![Doc::text.path()],kind:Kind::Trigram,directions:vec![]});drop(wait(db,db.journal_head().unwrap()));
+  until_indexed(&s,"variant 0 ");
+  for _ in 0..50 {assert_eq!(answers(&s,"variant 0 ").0.is_some(),true);}
+  // a second index, of another kind, after the first was answering
+  db.indexes.request(Definition{table:"docs".into(),paths:vec![Doc::id.path()],kind:Kind::Value,directions:vec![]});
+  let start=Instant::now();
+  loop {
+   let plan=s.domain::<Doc>().query().filter(Doc::id.eq("00007".to_string())).explain().map(|e|e.selected).ok();
+   if plan==Some(Plan::IndexEquality) {break}
+   assert!(start.elapsed()<Duration::from_secs(30),"the index built later was never used: {plan:?} {:?}",s.index_report());thread::sleep(Duration::from_millis(10));
+  }
+  assert_eq!(s.domain::<Doc>().query().filter(Doc::id.eq("00007".to_string())).count().unwrap(),1);
+  assert!(answers(&s,"variant 0 ").0.is_some(),"the first index still answers");
+ }
+ /// While changes keep arriving the worker looks again after 1 ms (so the index is at most a moment behind the last write, and a query is answered by the index and not by a scan); once quiet it looks every 10 ms.
+ #[test] fn the_worker_looks_again_at_once_while_changes_arrive_and_slowly_when_quiet() {
+  let now=Instant::now();
+  assert_eq!(idle_pause(now,now+Duration::from_millis(250)),Duration::from_millis(1));
+  assert_eq!(idle_pause(now,now),Duration::from_millis(10));
+  assert_eq!(idle_pause(now+Duration::from_secs(1),now+Duration::from_millis(250)),Duration::from_millis(10));
  }
  /// Writes that keep outpacing the replay: three rebuilds, then the index is set aside (`Idle`, queries scan), nothing is rebuilt while the journal keeps growing, and once the
  /// writes stop the index comes back and answers like a scan. Decided by events, with the replay budget fixed at zero so that every backlog is over it.
@@ -730,7 +822,7 @@ impl Driver {
   if done {let bytes=job.builder.take().unwrap().into_inner().map_err(|_|ClError::Validation("token dictionary encoding failed".into()))?;let tx=self.file.begin_write()?;tx.open_table(FST)?.insert(d.id,bytes.as_slice())?;tx.commit()?;job.target+=1;job.last=None;
    if job.target<job.targets.len(){job.builder=Some(fst::SetBuilder::memory());}
    else{let job=self.dictionary_job.take().unwrap();match job.finish {
-    DictionaryFinish::Batch(seq)=>{self.meta.applied=seq;if self.target.as_ref().is_some_and(|v|v.head==seq){self.meta.reset=reset(self.target.as_ref().unwrap())?;}let tx=self.file.begin_write()?;put_metadata(&tx,&self.meta)?;tx.commit()?;self.db.ack(self.token.as_ref().unwrap(),seq)?;if self.target.as_ref().is_some_and(|v|v.head==seq){self.publish()?;}},
+    DictionaryFinish::Batch(seq)=>{self.meta.applied=seq;if self.target.as_ref().is_some_and(|v|v.head==seq){self.meta.reset=reset(self.target.as_ref().unwrap())?;}let tx=self.file.begin_write()?;put_metadata(&tx,&self.meta)?;tx.commit()?;self.db.ack(self.token.as_ref().unwrap(),seq)?;if self.target.as_ref().is_some_and(|v|v.head==seq){self.replay_since=None;self.publish()?;}},
     DictionaryFinish::Build(build)=>self.finish_build(build)?,DictionaryFinish::Reset(reset)=>self.finish_reset(reset)?,
    }}
   }Ok(true)
@@ -781,7 +873,7 @@ impl Driver {
  /// Publish the pair again with a fresh `.inx` read snapshot. A read transaction taken before a long run of commits (a build, a reset) keeps every
  /// page freed since from being reused, so the file grows with the number of commits; this lets the old one go after each commit.
  fn refresh_pair(&mut self)->Result<()> {
-  if let Some(old)=self.state.pair(){let index=self.file.begin_read()?;self.state.publish(Arc::new(Pair{primary:old.primary.clone(),index,published:old.published,ready:old.ready,statistics:old.statistics.clone(),keep:self.file.clone()}));}
+  if let Some(old)=self.state.pair(){let index=self.file.begin_read()?;self.state.publish(Arc::new(Pair{primary:old.primary.clone(),index,published:old.published,ready:old.ready,statistics:old.statistics.clone(),keep:self.file.clone(),memo:Default::default()}));}
   Ok(())
  }
 }
@@ -798,16 +890,16 @@ impl Driver {
   assert_eq!((&x.key,x.missing,x.nulls,x.fanout,x.json_bytes,x.key_bytes,x.unorderable),(&y.key,y.missing,y.nulls,y.fanout,y.json_bytes,y.key_bytes,y.unorderable));
  }
  #[test] fn binary_row_round_trips_and_is_smaller_than_json() {
-  let row="game-0042";let r=sample(row);let binary=encode_reverse(row,&r).unwrap();
+  let row="row-0042";let r=sample(row);let binary=encode_reverse(row,&r).unwrap();
   same(&decode_reverse(row,&binary).unwrap(),&r);
   assert!(binary.len()*3<serde_json::to_vec(&r).unwrap().len(),"binary {} json {}",binary.len(),serde_json::to_vec(&r).unwrap().len());
  }
  #[test] fn format_2_json_rows_still_decode() {
-  let row="game-0042";let r=sample(row);
+  let row="row-0042";let r=sample(row);
   same(&decode_reverse(row,&serde_json::to_vec(&r).unwrap()).unwrap(),&r);
  }
  #[test] fn truncated_binary_row_is_an_error_not_a_panic() {
-  let row="game-0042";let binary=encode_reverse(row,&sample(row)).unwrap();
+  let row="row-0042";let binary=encode_reverse(row,&sample(row)).unwrap();
   for cut in 1..binary.len()-1 {let _=decode_reverse(row,&binary[..cut]);}
   assert!(decode_reverse(row,&binary[..3]).is_err());
  }

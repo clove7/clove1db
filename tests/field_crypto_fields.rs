@@ -97,7 +97,7 @@ fn open_fields_watched(dir: &Path, config: EncryptionConfig, seen: &Seen) -> clo
     let storage = StorageConfig::default().event_sink(move |e| {
         if let LibraryEvent::FieldRead { table, field, field_id, row, .. } = e {
             // The event is printed too: it must not hold a value.
-            assert!(!format!("{e:?}").contains("966500000001"));
+            assert!(!format!("{e:?}").contains("155500000001"));
             seen.lock().unwrap().push((table.clone(), field.clone(), *field_id, row.clone()));
         }
     });
@@ -146,11 +146,11 @@ fn a_plain_database_with_field_keys_holds_no_protected_text_in_any_file() {
     let mut visible = false;
     for path in &files {
         let bytes = std::fs::read(path).unwrap();
-        for secret in ["966500000001", "966500000009", "vip", "late"] {
+        for secret in ["155500000001", "155500000009", "vip", "late"] {
             assert!(!contains(&bytes, secret.as_bytes()), "{secret} found in {}", path.display());
         }
         visible |= contains(&bytes, b"visible");
-        assert!(!path.to_string_lossy().contains("966500000001"));
+        assert!(!path.to_string_lossy().contains("155500000001"));
     }
     assert!(visible, "the scan itself is blind: an ordinary field was not found");
 }

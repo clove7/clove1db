@@ -21,7 +21,6 @@ use serde_json::Value;
 
 /// Where an entity's rows live, as the storage layer knows it.
 pub(crate) struct TableSeal<'a> {
-    pub table: &'a str,
     pub table_id: &'a str,
     pub specs: &'static [SealedSpec],
     pub keys: &'a FieldKeys,
@@ -155,6 +154,7 @@ pub(crate) fn seal_row<E: Serialize + SealedFields>(
 }
 
 /// Ties the protected fields of an entity just read to the row they came from.
+#[cfg(test)]
 pub(crate) fn bind_row<E: SealedFields>(table_id: &str, key: &str, entity: &mut E) {
     entity.bind_sealed(&RowBinding::new(table_id, key));
 }
@@ -231,7 +231,7 @@ mod tests {
     }
 
     fn table<'a>(keys: &'a FieldKeys) -> TableSeal<'a> {
-        TableSeal { table: "people", table_id: "00112233445566778899aabbccddeeff", specs: Person::SEALED, keys }
+        TableSeal { table_id: "00112233445566778899aabbccddeeff", specs: Person::SEALED, keys }
     }
 
     const BOTH: [CipherKind; 2] = [CipherKind::Aes256GcmSiv, CipherKind::XChaCha20Poly1305];
@@ -243,7 +243,7 @@ mod tests {
             let t = table(&k);
             let bytes = seal_row(&t, "p1", &person()).unwrap();
             let text = String::from_utf8(bytes.clone()).unwrap();
-            for secret in ["966500000001", "vip", "late"] {
+            for secret in ["15550100001", "vip", "late"] {
                 assert!(!text.contains(secret), "{text}");
             }
             let json: Value = serde_json::from_slice(&bytes).unwrap();
@@ -337,7 +337,7 @@ mod tests {
     #[test]
     fn a_hashed_field_is_stored_as_a_salted_hash_tied_to_its_row() {
         let k = keys(CipherKind::Aes256GcmSiv, true);
-        let t = TableSeal { table: "people", table_id: "00112233445566778899aabbccddeeff", specs: WithHash::SEALED, keys: &k };
+        let t = TableSeal { table_id: "00112233445566778899aabbccddeeff", specs: WithHash::SEALED, keys: &k };
         let entity = WithHash { id: "h".into(), password: Hashed::new("hunter2") };
         let bytes = seal_row(&t, "h", &entity).unwrap();
         let text = String::from_utf8(bytes.clone()).unwrap();
@@ -365,7 +365,7 @@ mod tests {
     #[test]
     fn a_fingerprint_field_is_stored_as_a_keyed_fingerprint_equal_across_rows() {
         let k = keys(CipherKind::Aes256GcmSiv, true);
-        let t = TableSeal { table: "people", table_id: "00112233445566778899aabbccddeeff", specs: WithPrint::SEALED, keys: &k };
+        let t = TableSeal { table_id: "00112233445566778899aabbccddeeff", specs: WithPrint::SEALED, keys: &k };
         let entity = WithPrint { id: "t".into(), token: crate::field_crypto::SearchPrint::new("abc") };
         let one = seal_row(&t, "row-1", &entity).unwrap();
         let two = seal_row(&t, "row-2", &entity).unwrap();
@@ -386,7 +386,7 @@ mod tests {
     }
 
     fn printed_table<'a>(keys: &'a FieldKeys) -> TableSeal<'a> {
-        TableSeal { table: "people", table_id: "00112233445566778899aabbccddeeff", specs: Printed::SEALED, keys }
+        TableSeal { table_id: "00112233445566778899aabbccddeeff", specs: Printed::SEALED, keys }
     }
 
     #[test]
@@ -394,15 +394,15 @@ mod tests {
         for cipher in BOTH {
             let k = keys(cipher, true);
             let t = printed_table(&k);
-            let entity = Printed { id: "p1".into(), phone: Sealed::new(" 0501234567 ".into()) };
+            let entity = Printed { id: "p1".into(), phone: Sealed::new(" 5550123456 ".into()) };
             let bytes = seal_row(&t, "p1", &entity).unwrap();
             let json: Value = serde_json::from_slice(&bytes).unwrap();
             let phone = json["phone"].as_object().unwrap();
             assert_eq!(phone.len(), 2);
             assert_eq!(phone["f"].as_str().unwrap().len(), 43);
-            assert!(!String::from_utf8(bytes.clone()).unwrap().contains("0501234567"));
+            assert!(!String::from_utf8(bytes.clone()).unwrap().contains("5550123456"));
             // The fingerprint is that of the value after the declared normalisation.
-            let same = seal_row(&t, "p2", &Printed { id: "p2".into(), phone: Sealed::new("0501234567".into()) }).unwrap();
+            let same = seal_row(&t, "p2", &Printed { id: "p2".into(), phone: Sealed::new("5550123456".into()) }).unwrap();
             let same: Value = serde_json::from_slice(&same).unwrap();
             assert_eq!(same["phone"]["f"], phone["f"]);
             assert_ne!(same["phone"]["s"], phone["s"], "each write has its own nonce");
@@ -431,7 +431,7 @@ mod tests {
     #[test]
     fn a_value_that_is_not_text_cannot_have_a_fingerprint() {
         let k = keys(CipherKind::Aes256GcmSiv, true);
-        let t = TableSeal { table: "t", table_id: "00112233445566778899aabbccddeeff", specs: PrintedNumber::SEALED, keys: &k };
+        let t = TableSeal { table_id: "00112233445566778899aabbccddeeff", specs: PrintedNumber::SEALED, keys: &k };
         let err = seal_row(&t, "n1", &PrintedNumber { id: "n1".into(), code: Sealed::new(42) }).unwrap_err().to_string();
         assert!(err.contains("must hold text"), "{err}");
     }

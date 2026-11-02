@@ -16,6 +16,8 @@ use clove1db::{
     entity::Entity,
     storage::{DatabaseConfig, Storage, StorageConfig},
 };
+#[path = "child_log/mod.rs"]
+mod child_log;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -129,6 +131,20 @@ fn kill_child() {
     }
 }
 
+/// Runs `each` on every case, several at a time (the cases are independent: each has its own folder and its own program).
+fn side_by_side<T: Sync>(cases: &[T], each: impl Fn(&T) + Sync) {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..std::thread::available_parallelism().map_or(4, |n| n.get()).min(8) {
+            scope.spawn(|| {
+                while let Some(case) = cases.get(next.fetch_add(1, std::sync::atomic::Ordering::SeqCst)) {
+                    each(case);
+                }
+            });
+        }
+    });
+}
+
 fn next(state: &mut u64) -> u64 {
     *state ^= *state << 13;
     *state ^= *state >> 7;
@@ -148,8 +164,7 @@ fn spawn(root: &Path, cipher: &str, ack: &Path, mode: &str, first: u64) -> std::
         .env("CLOVE_KILL_ACK", ack)
         .env("CLOVE_KILL_MODE", mode)
         .env("CLOVE_KILL_FIRST", first.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(child_log::out(root)).stderr(child_log::out(root))
         .spawn()
         .unwrap()
 }
@@ -231,51 +246,56 @@ fn check(root: &Path, cipher: &str, ack: &Path, large: bool, first: u64) -> Resu
 fn the_four_new_crash_points_leave_a_database_on_the_last_durable_commit() {
     let base = std::env::temp_dir().join(format!("clove-crashpoints-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&base).unwrap();
-    let mut failures = Vec::new();
-    let mut runs = 0;
+    let mut cases = Vec::new();
     for point in ["enc_drain_before_seal", "enc_drain_after_seal", "enc_drain_mid_write", "enc_drain_before_sync", "enc_drain_after_sync"] {
         for cipher in ["aes", "xchacha"] {
             for (mode, skip) in [("small", 2u64), ("small", 7), ("small", 19), ("large", 0), ("large", 2)] {
-                let large = mode == "large";
-                let name = format!("{point}-{cipher}-{mode}-{skip}");
-                let root = base.join(&name);
-                let ack = base.join(format!("{name}.ack"));
-                let mut child = Command::new(std::env::current_exe().unwrap())
-                    .args(["kill_child", "--exact", "--ignored", "--test-threads=1"])
-                    .env("CLOVE_KILL_ROOT", &root)
-                    .env("CLOVE_KILL_CIPHER", cipher)
-                    .env("CLOVE_KILL_ACK", &ack)
-                    .env("CLOVE_KILL_MODE", mode)
-                    .env("CLOVE_KILL_FIRST", "1")
-                    .env("CLOVE_CRASH_POINT", point)
-                    .env("CLOVE_CRASH_SKIP", skip.to_string())
-                    .env("CLOVE_KILL_STOP_AFTER", "40")
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn()
-                    .unwrap();
-                let status = child.wait().unwrap();
-                runs += 1;
-                if status.code() != Some(99) {
-                    failures.push(format!("{name}: the child ended with {:?}, the crash point was not reached", status.code()));
-                    continue;
-                }
-                match check(&root, cipher, &ack, large, 1) {
-                    Ok(text) => {
-                        println!("{name}: exit 99, reopened: {text}");
-                        let _ = std::fs::remove_dir_all(&root);
-                    }
-                    Err((class, text)) => {
-                        let kept = std::env::temp_dir().join(format!("clove-crashpoint-failed-{}-{}", name, uuid::Uuid::new_v4()));
-                        let _ = std::fs::rename(&root, &kept);
-                        failures.push(format!("{name}: [{class}] {text} (kept: {})", kept.display()));
-                    }
-                }
+                cases.push((point, cipher, mode, skip));
             }
         }
     }
+    let runs = cases.len();
+    // each case has its own folder, so the cases run side by side
+    let failures = Mutex::new(Vec::new());
+    side_by_side(&cases, |&(point, cipher, mode, skip)| {
+        let large = mode == "large";
+        let name = format!("{point}-{cipher}-{mode}-{skip}");
+        let root = base.join(&name);
+        let ack = base.join(format!("{name}.ack"));
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["kill_child", "--exact", "--ignored", "--test-threads=1"])
+            .env("CLOVE_KILL_ROOT", &root)
+            .env("CLOVE_KILL_CIPHER", cipher)
+            .env("CLOVE_KILL_ACK", &ack)
+            .env("CLOVE_KILL_MODE", mode)
+            .env("CLOVE_KILL_FIRST", "1")
+            .env("CLOVE_CRASH_POINT", point)
+            .env("CLOVE_CRASH_SKIP", skip.to_string())
+            .env("CLOVE_KILL_STOP_AFTER", "40")
+            .stdout(child_log::out(&root)).stderr(child_log::out(&root))
+            .spawn()
+            .unwrap();
+        let status = child.wait().unwrap();
+        if status.code() != Some(99) {
+            failures.lock().unwrap().push(format!("{name}: the child ended with {}, the crash point was not reached", child_log::why(&root, status)));
+            return;
+        }
+        match check(&root, cipher, &ack, large, 1) {
+            Ok(text) => {
+                println!("{name}: exit 99, reopened: {text}");
+                child_log::clean(&root);
+            }
+            Err((class, text)) => {
+                let kept = std::env::temp_dir().join(format!("clove-crashpoint-failed-{}-{}", name, uuid::Uuid::new_v4()));
+                let _ = std::fs::rename(&root, &kept);
+                failures.lock().unwrap().push(format!("{name}: [{class}] {text} (kept: {})", kept.display()));
+            }
+        }
+    });
+    let mut failures = failures.into_inner().unwrap();
+    failures.sort();
     println!("crash points: {} of {runs} runs reopened on the last durable commit (the ones that fell in the creation of the database reopen as a new, empty database), {} failed", runs - failures.len(), failures.len());
-    let _ = std::fs::remove_dir_all(&base);
+    child_log::clean(&base);
     assert!(failures.is_empty(), "{} of {runs} failed:
 {}", failures.len(), failures.join("
 "));
@@ -310,8 +330,7 @@ fn a_crash_at_any_point_of_the_creation_leaves_no_database_or_a_whole_one() {
         ("create_after_place", 0, 0, "on"),
         ("create_after_folder_sync", 0, 0, "on"),
     ];
-    let (mut runs, mut no_database, mut whole, mut leftovers) = (0, 0, 0, 0);
-    let mut failures = Vec::new();
+    let mut cases = Vec::new();
     for cipher in ["aes", "xchacha"] {
         for (point, from, to, tuning) in &plan {
             for skip in *from..=*to {
@@ -319,49 +338,63 @@ fn a_crash_at_any_point_of_the_creation_leaves_no_database_or_a_whole_one() {
                 if *point == "enc_write_page" && skip % 3 != 0 {
                     continue;
                 }
-                let name = format!("{point}-{cipher}-{skip}");
-                let root = base.join(&name);
-                let ack = base.join(format!("{name}.ack"));
-                let status = Command::new(std::env::current_exe().unwrap())
-                    .args(["kill_child", "--exact", "--ignored", "--test-threads=1"])
-                    .env("CLOVE_KILL_ROOT", &root)
-                    .env("CLOVE_KILL_CIPHER", cipher)
-                    .env("CLOVE_KILL_ACK", &ack)
-                    .env("CLOVE_KILL_MODE", "small")
-                    .env("CLOVE_KILL_FIRST", "1")
-                    .env("CLOVE_KILL_TUNING", tuning)
-                    .env("CLOVE_CRASH_POINT", point)
-                    .env("CLOVE_CRASH_SKIP", skip.to_string())
-                    .env("CLOVE_KILL_STOP_AFTER", "6")
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                    .unwrap();
-                if status.code() != Some(99) {
-                    // the point is not reached that many times: the child ended normally; nothing to check for this skip
-                    let _ = std::fs::remove_dir_all(&root);
-                    continue;
-                }
-                runs += 1;
-                let before = files_of(&root);
-                let final_exists = before.iter().any(|f| f.ends_with("store.cldb"));
-                let pending = before.iter().any(|f| f.ends_with("store.cldb.new") || f.ends_with("store.cldb.new.creating"));
-                if final_exists { whole += 1 } else { no_database += 1 }
-                if pending { leftovers += 1 }
-                match check(&root, cipher, &ack, false, 1) {
-                    Ok(_) => {}
-                    Err((class, text)) => failures.push(format!("{name}: [{class}] {text} (before the reopen: {before:?})")),
-                }
-                let after = files_of(&root);
-                if after.iter().any(|f| f.ends_with(".new") || f.ends_with(".creating")) {
-                    failures.push(format!("{name}: a pending file is left after the reopen: {after:?}"));
-                }
-                let _ = std::fs::remove_dir_all(&root);
+                cases.push((cipher, *point, skip, *tuning));
             }
         }
     }
+    // (runs, no_database, whole, leftovers) and the failures; each case has its own folder, so the cases run side by side
+    let seen = Mutex::new((0, 0, 0, 0));
+    let failures = Mutex::new(Vec::new());
+    side_by_side(&cases, |&(cipher, point, skip, tuning)| {
+        let name = format!("{point}-{cipher}-{skip}");
+        let root = base.join(&name);
+        let ack = base.join(format!("{name}.ack"));
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["kill_child", "--exact", "--ignored", "--test-threads=1"])
+            .env("CLOVE_KILL_ROOT", &root)
+            .env("CLOVE_KILL_CIPHER", cipher)
+            .env("CLOVE_KILL_ACK", &ack)
+            .env("CLOVE_KILL_MODE", "small")
+            .env("CLOVE_KILL_FIRST", "1")
+            .env("CLOVE_KILL_TUNING", tuning)
+            .env("CLOVE_CRASH_POINT", point)
+            .env("CLOVE_CRASH_SKIP", skip.to_string())
+            .env("CLOVE_KILL_STOP_AFTER", "6")
+            .stdout(child_log::out(&root)).stderr(child_log::out(&root))
+            .status()
+            .unwrap();
+        if status.code() != Some(99) {
+            // the point is not reached that many times: the child ended normally; nothing to check for this skip
+            if !status.success() {
+                failures.lock().unwrap().push(format!("{name}: the child ended neither at the crash point nor normally: {}", child_log::why(&root, status)));
+            }
+            child_log::clean(&root);
+            return;
+        }
+        let before = files_of(&root);
+        let final_exists = before.iter().any(|f| f.ends_with("store.cldb"));
+        let pending = before.iter().any(|f| f.ends_with("store.cldb.new") || f.ends_with("store.cldb.new.creating"));
+        {
+            let mut seen = seen.lock().unwrap();
+            seen.0 += 1;
+            if final_exists { seen.2 += 1 } else { seen.1 += 1 }
+            if pending { seen.3 += 1 }
+        }
+        match check(&root, cipher, &ack, false, 1) {
+            Ok(_) => {}
+            Err((class, text)) => failures.lock().unwrap().push(format!("{name}: [{class}] {text} (before the reopen: {before:?})")),
+        }
+        let after = files_of(&root);
+        if after.iter().any(|f| f.ends_with(".new") || f.ends_with(".creating")) {
+            failures.lock().unwrap().push(format!("{name}: a pending file is left after the reopen: {after:?}"));
+        }
+        child_log::clean(&root);
+    });
+    let (runs, no_database, whole, leftovers) = seen.into_inner().unwrap();
+    let mut failures = failures.into_inner().unwrap();
+    failures.sort();
     println!("creation crashes: {runs} runs (both ciphers); at the crash {no_database} had no database file ({leftovers} runs had a pending file), {whole} had the final file; failures {}", failures.len());
-    let _ = std::fs::remove_dir_all(&base);
+    child_log::clean(&base);
     assert!(runs > 40 && no_database > 0 && whole > 0, "the plan did not cover both states: {runs} {no_database} {whole}");
     assert!(failures.is_empty(), "{} failed:\n{}", failures.len(), failures.join("\n"));
 }
@@ -380,18 +413,17 @@ fn a_pending_file_beside_a_whole_database_is_removed_at_the_next_open() {
         .env("CLOVE_KILL_MODE", "small")
         .env("CLOVE_KILL_FIRST", "1")
         .env("CLOVE_KILL_STOP_AFTER", "4")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(child_log::out(&base)).stderr(child_log::out(&base))
         .status()
         .unwrap();
-    assert!(status.success());
+    assert!(status.success(), "the child ended with {}", child_log::why(&base, status));
     let dir = base.join("records");
     std::fs::write(dir.join("store.cldb.new"), b"half a file").unwrap();
     std::fs::write(dir.join("store.cldb.new.creating"), b"half a file").unwrap();
     check(&base, "aes", &ack, false, 1).unwrap();
     assert!(!dir.join("store.cldb.new").exists() && !dir.join("store.cldb.new.creating").exists());
     assert!(dir.join("store.cldb").exists() && std::fs::metadata(dir.join("store.cldb")).unwrap().len() > 0);
-    let _ = std::fs::remove_dir_all(&base);
+    child_log::clean(&base);
 }
 
 /// The plain database (no encryption), looked at and not changed: is there a window in its creation too? The child dies after the file was
@@ -412,11 +444,10 @@ fn the_plain_database_creation_window_is_reported_not_fixed() {
         .env("CLOVE_KILL_PLAIN", "1")
         .env("CLOVE_CRASH_POINT", "create_plain_before_first_commit")
         .env("CLOVE_KILL_STOP_AFTER", "4")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(child_log::out(&base)).stderr(child_log::out(&base))
         .status()
         .unwrap();
-    assert_eq!(status.code(), Some(99), "the plain crash point was not reached");
+    assert_eq!(status.code(), Some(99), "the plain crash point was not reached: {}", child_log::why(&base, status));
     let files = files_of(&base);
     // the next open, in a child (the setting travels in its environment, not in this process)
     let reopened = Command::new(std::env::current_exe().unwrap())
@@ -438,7 +469,7 @@ fn the_plain_database_creation_window_is_reported_not_fixed() {
         format!("does NOT reopen: {}", text.lines().find(|l| l.contains("panicked") || l.contains("Err")).unwrap_or("(no message)").trim())
     };
     println!("PLAIN database, process killed after the file was created and before its first meta commit: files {files:?}; the next open {state}");
-    let _ = std::fs::remove_dir_all(&base);
+    child_log::clean(&base);
 }
 
 /// A process that dies while the file of an encrypted database is being extended (the new space is only partly filled with sealed blocks)
@@ -447,59 +478,66 @@ fn the_plain_database_creation_window_is_reported_not_fixed() {
 fn a_crash_while_the_file_grows_leaves_every_block_sealed() {
     let base = std::env::temp_dir().join(format!("clove-grow-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&base).unwrap();
-    let mut failures = Vec::new();
-    let mut reached = 0;
+    let mut cases = Vec::new();
     for cipher in ["aes", "xchacha"] {
         for skip in [2u64, 6, 12, 30] {
-            let name = format!("grow-{cipher}-{skip}");
-            let root = base.join(&name);
-            let ack = base.join(format!("{name}.ack"));
-            let status = Command::new(std::env::current_exe().unwrap())
-                .args(["kill_child", "--exact", "--ignored", "--test-threads=1"])
-                .env("CLOVE_KILL_ROOT", &root)
-                .env("CLOVE_KILL_CIPHER", cipher)
-                .env("CLOVE_KILL_ACK", &ack)
-                .env("CLOVE_KILL_MODE", "large")
-                .env("CLOVE_KILL_FIRST", "1")
-                .env("CLOVE_CRASH_POINT", "enc_fill_mid")
-                .env("CLOVE_CRASH_SKIP", skip.to_string())
-                .env("CLOVE_KILL_STOP_AFTER", "40")
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .unwrap();
-            if status.code() != Some(99) {
-                failures.push(format!("{name}: the child ended with {:?}, the crash point was not reached", status.code()));
-                continue;
-            }
-            reached += 1;
-            // the file exactly as the crash left it, before any open could trim it
-            if let Err(e) = verify_encrypted_files(&root, "records", "store", &EncryptionHandle::new(config(cipher))) {
-                failures.push(format!("{name}: [verify before the reopen] {e:?}"));
-                continue;
-            }
-            match check(&root, cipher, &ack, true, 1) {
-                Ok(_) => {}
-                Err((class, text)) => {
-                    failures.push(format!("{name}: [{class}] {text}"));
-                    continue;
-                }
-            }
-            // writing afterwards into the free space is sound, and the full check still passes
-            let events: Events = Default::default();
-            let storage = open(&root, cipher, &events).unwrap();
-            let db = storage.db_manager("store");
-            let first = last_ack(&ack) + 1;
-            for b in first..first + 6 {
-                db.commit_batch_atomic(&batch(b, true), &[]).unwrap();
-            }
-            storage.close();
-            drop(storage);
-            if let Err(e) = verify_encrypted_files(&root, "records", "store", &EncryptionHandle::new(config(cipher))) {
-                failures.push(format!("{name}: [verify after writing] {e:?}"));
-            }
+            cases.push((cipher, skip));
         }
     }
-    let _ = std::fs::remove_dir_all(&base);
+    // each case has its own folder, so the cases run side by side
+    let failures = Mutex::new(Vec::new());
+    let reached = std::sync::atomic::AtomicUsize::new(0);
+    side_by_side(&cases, |&(cipher, skip)| {
+        let name = format!("grow-{cipher}-{skip}");
+        let root = base.join(&name);
+        let ack = base.join(format!("{name}.ack"));
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["kill_child", "--exact", "--ignored", "--test-threads=1"])
+            .env("CLOVE_KILL_ROOT", &root)
+            .env("CLOVE_KILL_CIPHER", cipher)
+            .env("CLOVE_KILL_ACK", &ack)
+            .env("CLOVE_KILL_MODE", "large")
+            .env("CLOVE_KILL_FIRST", "1")
+            .env("CLOVE_CRASH_POINT", "enc_fill_mid")
+            .env("CLOVE_CRASH_SKIP", skip.to_string())
+            .env("CLOVE_KILL_STOP_AFTER", "40")
+            .stdout(child_log::out(&root)).stderr(child_log::out(&root))
+            .status()
+            .unwrap();
+        if status.code() != Some(99) {
+            failures.lock().unwrap().push(format!("{name}: the child ended with {}, the crash point was not reached", child_log::why(&root, status)));
+            return;
+        }
+        reached.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // the file exactly as the crash left it, before any open could trim it
+        if let Err(e) = verify_encrypted_files(&root, "records", "store", &EncryptionHandle::new(config(cipher))) {
+            failures.lock().unwrap().push(format!("{name}: [verify before the reopen] {e:?}"));
+            return;
+        }
+        match check(&root, cipher, &ack, true, 1) {
+            Ok(_) => {}
+            Err((class, text)) => {
+                failures.lock().unwrap().push(format!("{name}: [{class}] {text}"));
+                return;
+            }
+        }
+        // writing afterwards into the free space is sound, and the full check still passes
+        let events: Events = Default::default();
+        let storage = open(&root, cipher, &events).unwrap();
+        let db = storage.db_manager("store");
+        let first = last_ack(&ack) + 1;
+        for b in first..first + 6 {
+            db.commit_batch_atomic(&batch(b, true), &[]).unwrap();
+        }
+        storage.close();
+        drop(storage);
+        if let Err(e) = verify_encrypted_files(&root, "records", "store", &EncryptionHandle::new(config(cipher))) {
+            failures.lock().unwrap().push(format!("{name}: [verify after writing] {e:?}"));
+        }
+    });
+    let mut failures = failures.into_inner().unwrap();
+    failures.sort();
+    let reached = reached.into_inner();
+    child_log::clean(&base);
     assert!(reached > 0 && failures.is_empty(), "{} failed ({reached} reached the point):\n{}", failures.len(), failures.join("\n"));
 }

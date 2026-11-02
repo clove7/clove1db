@@ -29,6 +29,7 @@ pub use handle::test_prefetched_bytes;
 pub mod upgrade;
 
 pub use durability::{DurabilityMode, DEFAULT_MAX_COMMIT_BATCH_ENTRIES};
+pub use repository::PreparedRow;
 pub use handle::RedbOptions;
 pub use metadata::{FileEra, FileKind, InspectReport, TableStorageMode, inspect_cldb};
 
@@ -44,13 +45,19 @@ pub use unique::Unique;
 pub mod query;
 pub mod events;
 pub use events::LibraryEvent;
+mod feature_check;
 pub mod fields;
 pub use fields::CloveFields;
+#[cfg(feature = "derive")]
 pub use clove1db_derive::CloveFields;
 extern crate self as clove1db;
 
 pub mod indexes;
+#[cfg(feature = "encryption")]
 pub mod crypto;
+#[cfg(feature = "encryption")]
 pub mod field_crypto;
+#[cfg(feature = "encryption")]
 pub mod encrypted_store;
+#[cfg(feature = "encryption")]
 pub use encrypted_store::{EncryptionConfig, EncryptionTuning, KeySource, StoreDiagnostic};

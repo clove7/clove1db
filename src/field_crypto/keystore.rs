@@ -11,7 +11,7 @@ use crate::{
     encrypted_store::{EncryptionConfig, KeySource},
     units::{ClError, Result},
 };
-use redb::{ReadableDatabase, ReadableTable, TableDefinition, WriteTransaction};
+use redb::{ReadableDatabase, TableDefinition, WriteTransaction};
 use std::sync::Arc;
 
 pub(crate) const TABLE: TableDefinition<'static, &str, &[u8]> = TableDefinition::new("__field_keys");

@@ -49,7 +49,12 @@ pub(crate) fn plan_blobs(main: &impl ReadableDatabase) -> Result<Vec<Blob>> {
         size: u64,
     }
     let read = main.begin_read().map_err(io)?;
-    let refs = read.open_table(crate::journal_blob::REFS).map_err(io)?;
+    // a database written by a version that kept no references has no such table: every file is then a legacy one
+    let refs = match read.open_table(crate::journal_blob::REFS) {
+        Ok(refs) => refs,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(e) => return Err(io(e)),
+    };
     let mut out = Vec::new();
     for row in refs.iter().map_err(io)? {
         let (k, v) = row.map_err(io)?;
@@ -61,6 +66,72 @@ pub(crate) fn plan_blobs(main: &impl ReadableDatabase) -> Result<Vec<Blob>> {
         out.push(Blob { table, id: reference.id, size: reference.size });
     }
     Ok(out)
+}
+
+/// The attachment files an older version wrote with no reference (see `journal::mark_adoption_due`), in the
+/// plain folder `root`: for each table of the old file that has a folder there and is not recorded as
+/// adopted, every file that is not already in `known`, not named like this version's own files and not a
+/// temporary one. Returns them with the names of the tables that were looked at. Nothing is returned for a
+/// database whose log exists and that is not marked as due. Reads only.
+pub(crate) fn legacy_blobs(main: &impl ReadableDatabase, root: &Path, user_tables: &[String], known: &[Blob]) -> Result<(Vec<Blob>, Vec<String>)> {
+    let read = main.begin_read().map_err(io)?;
+    let (due, adopted) = match read.open_table(crate::journal::SEQ) {
+        Ok(seq) => {
+            let due = seq.get(crate::journal::ADOPTION_DUE).map_err(io)?.is_some() || seq.get("head").map_err(io)?.is_none();
+            let mut adopted = Vec::new();
+            for table in user_tables {
+                if seq.get(format!("{}{table}", crate::journal::ADOPTED_PREFIX).as_str()).map_err(io)?.is_some() {
+                    adopted.push(table.clone());
+                }
+            }
+            (due, adopted)
+        }
+        Err(redb::TableError::TableDoesNotExist(_)) => (true, Vec::new()),
+        Err(e) => return Err(io(e)),
+    };
+    let (mut found, mut tables) = (Vec::new(), Vec::new());
+    if !due {
+        return Ok((found, tables));
+    }
+    for table in user_tables.iter().filter(|t| !adopted.contains(t) && safe(t)) {
+        let Ok(entries) = fs::read_dir(root.join(table)) else { continue };
+        tables.push(table.clone());
+        for entry in entries {
+            let entry = entry.map_err(ioerr)?;
+            if !entry.file_type().map_err(ioerr)?.is_file() {
+                continue;
+            }
+            let Some(id) = entry.file_name().to_str().map(str::to_owned) else { continue };
+            if id.starts_with("__v_") || crate::journal_blob::is_temporary_name(&id) || known.iter().any(|b| b.table == *table && b.id == id) {
+                continue;
+            }
+            if !safe(&id) {
+                return Err(bad("an attachment has a name that cannot be a file name; nothing was changed"));
+            }
+            found.push(Blob { table: table.clone(), id, size: entry.metadata().map_err(ioerr)?.len() });
+        }
+    }
+    Ok((found, tables))
+}
+
+/// Write, in the new main file, what adopting does in a database that is opened: a reference for each
+/// legacy file, the "due" mark and one "adopted" mark for each table that was looked at.
+pub(crate) fn record_adoption(to: &redb::Database, legacy: &[Blob], tables: &[String]) -> Result<()> {
+    let write = to.begin_write().map_err(io)?;
+    {
+        let mut refs = write.open_table(crate::journal_blob::REFS).map_err(io)?;
+        for blob in legacy {
+            let reference = serde_json::to_vec(&crate::journal_blob::BlobRef { id: blob.id.clone(), size: blob.size })?;
+            refs.insert(crate::journal_blob::key(&blob.table, &blob.id).as_str(), reference.as_slice()).map_err(io)?;
+        }
+        let mut seq = write.open_table(crate::journal::SEQ).map_err(io)?;
+        seq.insert(crate::journal::ADOPTION_DUE, [1u8].as_slice()).map_err(io)?;
+        for table in tables {
+            seq.insert(format!("{}{table}", crate::journal::ADOPTED_PREFIX).as_str(), [1u8].as_slice()).map_err(io)?;
+        }
+    }
+    write.commit().map_err(io)?;
+    Ok(())
 }
 
 fn plain_path(root: &Path, blob: &Blob) -> PathBuf {

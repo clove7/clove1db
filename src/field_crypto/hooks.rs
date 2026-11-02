@@ -51,7 +51,7 @@ impl<T> SealedHooks<T> {
 
     /// The stored bytes of `value` as row `key`.
     pub(crate) fn encode(&self, key: &str, value: &T) -> Result<Vec<u8>> {
-        let table = TableSeal { table: &self.table, table_id: &self.table_id, specs: self.specs, keys: &self.keys };
+        let table = TableSeal { table_id: &self.table_id, specs: self.specs, keys: &self.keys };
         (self.kit.seal)(&table, key, value)
     }
 

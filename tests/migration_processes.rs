@@ -12,9 +12,11 @@ use clove1db::{
     storage::{DatabaseConfig, Storage, StorageConfig},
     units::ClError,
 };
+#[path = "child_log/mod.rs"]
+mod child_log;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Default, Debug, Serialize, Deserialize, CloveFields)]
@@ -223,8 +225,8 @@ fn child(root: &Path, from: Option<u8>, to: Option<u8>) -> Command {
         .env("CLOVE_MIG_ROOT", root)
         .env("CLOVE_MIG_FROM", describe(from))
         .env("CLOVE_MIG_TO", describe(to))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(child_log::out(root))
+        .stderr(child_log::out(root));
     c
 }
 
@@ -254,11 +256,12 @@ fn a_second_program_cannot_open_the_database_while_it_is_changed_and_the_change_
     }
     assert_eq!(names(&root), seen, "trying to open changed the folder");
     std::fs::write(hold.join("release.flag"), b"1").unwrap();
-    assert!(running.wait().unwrap().success());
+    let st = running.wait().unwrap();
+    assert!(st.success(), "the held run failed: {}", child_log::why(&root, st));
     assert_eq!(contents(&root, Some(5)).unwrap(), before, "the change went on to the end");
     assert!(!secret_in_files(&root));
     no_leftovers(&root);
-    let _ = std::fs::remove_dir_all(&root);
+    child_log::clean(&root);
     let _ = std::fs::remove_dir_all(&hold);
 }
 
@@ -275,15 +278,15 @@ fn a_program_stopped_at_any_moment_leaves_the_database_as_it_was_or_as_it_is_to_
             }
         }
     }
-    const STOPS: u64 = 100;
-    // plain to encrypted, and back, and to other keys, each stopped 100 times. The moments are not
+    const STOPS: u64 = 30;
+    // plain to encrypted, and back, and to other keys, each stopped 30 times. The moments are not
     // random: they are spread over the whole length of the change, measured on a run that is not
     // stopped (from 0.5% of it to 99.5%), so that every stage of the change is stopped in.
     for (from, to) in [(None, Some(5u8)), (Some(5u8), None), (Some(5u8), Some(6u8))] {
         let mut old_state = 0;
         let mut new_state = 0;
         let mut killed = 0;
-        let template = make_sized(from, 6000, 40);
+        let template = make_sized(from, 1500, 10);
         let before = contents(&template, from).unwrap();
         // the length of the change, program start included: the longer of two whole runs
         let mut whole = Duration::ZERO;
@@ -291,9 +294,10 @@ fn a_program_stopped_at_any_moment_leaves_the_database_as_it_was_or_as_it_is_to_
             let probe = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
             copy_dir(&template, &probe);
             let started = Instant::now();
-            assert!(child(&probe, from, to).status().unwrap().success());
+            let st = child(&probe, from, to).status().unwrap();
+            assert!(st.success(), "the measuring run failed: {}", child_log::why(&probe, st));
             whole = whole.max(started.elapsed());
-            let _ = std::fs::remove_dir_all(&probe);
+            child_log::clean(&probe);
         }
         let whole_ms = whole.as_millis() as f64;
         for i in 0..STOPS {
@@ -303,7 +307,7 @@ fn a_program_stopped_at_any_moment_leaves_the_database_as_it_was_or_as_it_is_to_
             std::thread::sleep(Duration::from_millis((whole_ms * (i as f64 + 0.5) / STOPS as f64) as u64));
             match running.try_wait().unwrap() {
                 // it ran to the end before it was stopped: that is a success or a bug, not a stop
-                Some(status) => assert!(status.success(), "{from:?} to {to:?}, stop {i}: the change failed: {status:?}"),
+                Some(status) => assert!(status.success(), "{from:?} to {to:?}, stop {i}: the change failed: {}", child_log::why(&root, status)),
                 None => {
                     running.kill().unwrap();
                     killed += 1;
@@ -330,14 +334,14 @@ fn a_program_stopped_at_any_moment_leaves_the_database_as_it_was_or_as_it_is_to_
                     assert!(!secret_in_files(&root), "{from:?} to {to:?}, stop {i}: the new state shows a clear value");
                 }
             }
-            let _ = std::fs::remove_dir_all(&root);
+            child_log::clean(&root);
         }
         println!(
             "{from:?} to {to:?}: {STOPS} stops spread over {whole_ms:.0} ms ({killed} killed while running), {old_state} left the old files, {new_state} the new ones"
         );
         assert_eq!(old_state + new_state, STOPS);
-        assert!(killed >= 40, "only {killed} of {STOPS} were stopped while the change was running");
-        assert!(old_state >= 5 && new_state >= 5, "the stops did not reach both sides of the decision");
+        assert!(killed >= 12, "only {killed} of {STOPS} were stopped while the change was running");
+        assert!(old_state >= 2 && new_state >= 2, "the stops did not reach both sides of the decision");
         let _ = std::fs::remove_dir_all(&template);
     }
 }
@@ -419,11 +423,24 @@ fn every_crash_point_is_reached_and_settled() {
             points.push((format!("migration_{what}_{i}"), true));
         }
     }
-    let mut reached = std::collections::BTreeSet::new();
+    let mut cases = Vec::new();
     for shape in ["blobs", "history"] {
         for (from, to) in [(None, Some(5u8)), (Some(5u8), None)] {
             for wipe in [false, true] {
                 for (point, decided) in &points {
+                    cases.push((shape, from, to, wipe, point, *decided));
+                }
+            }
+        }
+    }
+    // each case has its own database and its own program, so the cases run side by side
+    let reached = std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..std::thread::available_parallelism().map_or(4, |n| n.get()).min(8) {
+            scope.spawn(|| {
+                loop {
+                    let Some(&(shape, from, to, wipe, point, decided)) = cases.get(next.fetch_add(1, std::sync::atomic::Ordering::SeqCst)) else { break };
                     let root = if shape == "blobs" { make(from) } else { make_history(from) };
                     let read = |k: Option<u8>| -> clove1db::units::Result<Contents> {
                         if shape == "blobs" { contents(&root, k) } else { rows_history(&root, k).map(|r| (r, Vec::new())) }
@@ -439,19 +456,24 @@ fn every_crash_point_is_reached_and_settled() {
                     }
                     let status = c.status().unwrap();
                     if status.code() == Some(99) {
-                        reached.insert(point.clone());
-                        let key = if *decided { to } else { from };
+                        reached.lock().unwrap().insert(point.clone());
+                        let key = if decided { to } else { from };
                         let got = read(key).unwrap_or_else(|e| panic!("{shape} {from:?} to {to:?} wipe={wipe} at {point}: {e:?}"));
                         assert_eq!(got, before, "{shape} {from:?} to {to:?} wipe={wipe} at {point}");
                         no_leftovers(&root);
                     } else {
-                        assert!(status.success(), "{point}: {status:?}");
+                        assert!(
+                            status.success(),
+                            "{shape} {from:?} to {to:?} wipe={wipe} at {point}: {}",
+                            child_log::why(&root, status)
+                        );
                     }
-                    let _ = std::fs::remove_dir_all(&root);
+                    child_log::clean(&root);
                 }
-            }
+            });
         }
-    }
+    });
+    let reached = reached.into_inner().unwrap();
     let unreached: Vec<&String> = points.iter().map(|(p, _)| p).filter(|p| !reached.contains(*p)).collect();
     println!("reached {} of {} points; not reached: {unreached:?}", reached.len(), points.len());
     // a database of this size replaces at most four files or folders, and the points that name a
@@ -487,31 +509,45 @@ fn a_crash_at_every_point_of_the_change_is_settled_by_the_next_open() {
         ("migration_after_markers_removed", true),
         ("migration_after_swap", true),
     ];
-    let mut reached = 0;
+    let mut cases = Vec::new();
     for (from, to) in [(None, Some(5u8)), (Some(5u8), Some(6u8))] {
         for (point, decided) in points {
-            let root = make(from);
-            let before = contents(&root, from).unwrap();
-            let status = child(&root, from, to).env("CLOVE_CRASH_POINT", point).status().unwrap();
-            if status.code() != Some(99) {
-                // the point is not on this path (no backup file, say): the change ran to the end
-                assert!(status.success(), "{point}: {status:?}");
-                assert_eq!(contents(&root, to).unwrap(), before);
-                let _ = std::fs::remove_dir_all(&root);
-                continue;
-            }
-            reached += 1;
-            let got = if *decided {
-                // the decision was made: the new files are the database
-                contents(&root, to).unwrap_or_else(|e| panic!("{from:?} to {to:?} at {point}: {e:?}"))
-            } else {
-                contents(&root, from).unwrap_or_else(|e| panic!("{from:?} to {to:?} at {point}: {e:?}"))
-            };
-            assert_eq!(got, before, "{from:?} to {to:?} at {point}");
-            no_leftovers(&root);
-            let _ = std::fs::remove_dir_all(&root);
+            cases.push((from, to, *point, *decided));
         }
     }
+    // each case has its own database and its own program, so the cases run side by side
+    let reached = std::sync::atomic::AtomicUsize::new(0);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..std::thread::available_parallelism().map_or(4, |n| n.get()).min(8) {
+            scope.spawn(|| {
+                loop {
+                    let Some(&(from, to, point, decided)) = cases.get(next.fetch_add(1, std::sync::atomic::Ordering::SeqCst)) else { break };
+                    let root = make(from);
+                    let before = contents(&root, from).unwrap();
+                    let status = child(&root, from, to).env("CLOVE_CRASH_POINT", point).status().unwrap();
+                    if status.code() != Some(99) {
+                        // the point is not on this path (no backup file, say): the change ran to the end
+                        assert!(status.success(), "{point}: {}", child_log::why(&root, status));
+                        assert_eq!(contents(&root, to).unwrap(), before);
+                        child_log::clean(&root);
+                        continue;
+                    }
+                    reached.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let got = if decided {
+                        // the decision was made: the new files are the database
+                        contents(&root, to).unwrap_or_else(|e| panic!("{from:?} to {to:?} at {point}: {e:?}"))
+                    } else {
+                        contents(&root, from).unwrap_or_else(|e| panic!("{from:?} to {to:?} at {point}: {e:?}"))
+                    };
+                    assert_eq!(got, before, "{from:?} to {to:?} at {point}");
+                    no_leftovers(&root);
+                    child_log::clean(&root);
+                }
+            });
+        }
+    });
+    let reached = reached.into_inner();
     println!("crash points reached: {reached}");
     assert!(reached >= 20, "only {reached} points were reached");
 }

@@ -17,9 +17,10 @@ pub(crate) mod private {
     pub trait Sealed {}
 }
 impl<E, V> private::Sealed for Field<E, V> {}
+#[cfg(feature = "encryption")]
 impl<E> private::Sealed for crate::field_crypto::PrintField<E> {}
 /// What a unique constraint can be put on: an ordinary field, or the stored fingerprint of a field
-/// that has one ([`PrintHandle::print_field`](crate::field_crypto::PrintHandle::print_field)). It
+/// that has one (`PrintHandle::print_field`, with the `encryption` feature). It
 /// cannot be implemented for other types:
 ///
 /// ```compile_fail,E0277
@@ -40,6 +41,7 @@ impl<E, V> UniqueField<E> for Field<E, V> {
         self.path()
     }
 }
+#[cfg(feature = "encryption")]
 impl<E> UniqueField<E> for crate::field_crypto::PrintField<E> {
     fn unique_path(self) -> Path {
         self.into_path()

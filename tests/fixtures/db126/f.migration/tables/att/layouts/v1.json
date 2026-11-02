@@ -1,0 +1,15 @@
+{
+  "fields": [
+    {
+      "name": "id",
+      "json_type": "string",
+      "required": true
+    },
+    {
+      "name": "name",
+      "json_type": "string",
+      "required": true
+    }
+  ],
+  "layout_hash": "7e3b5c54e3ccd209"
+}

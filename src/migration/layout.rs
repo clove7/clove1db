@@ -61,6 +61,7 @@ impl FieldLayout {
     }
 
     /// Records that the field is stored with this JSON type, whatever a default value shows.
+    #[cfg(feature = "encryption")]
     pub(crate) fn set_json_type(&mut self, name: &str, json_type: &str) {
         if let Some(field) = self.fields.iter_mut().find(|f| f.name == name) {
             field.json_type = json_type.to_string();

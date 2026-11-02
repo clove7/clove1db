@@ -13,10 +13,12 @@ use clove1db::{
     migration::ChangeProtection,
     storage::{DatabaseConfig, Storage, StorageConfig},
 };
+#[path = "child_log/mod.rs"]
+mod child_log;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 const PHONE: &str = "+155-KILL-PHONE-";
@@ -316,8 +318,8 @@ fn child(root: &Path, shape: Shape, from: Prot, to: Prot) -> Command {
         .env("CLOVE_MIG_SHAPE", shape.text())
         .env("CLOVE_MIG_FROM", from.text())
         .env("CLOVE_MIG_TO", to.text())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(child_log::out(root))
+        .stderr(child_log::out(root));
     c
 }
 
@@ -357,9 +359,10 @@ fn stopped_in(shape: Shape, from: Prot, to: Prot) {
             let probe = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
             copy_dir(&template, &probe);
             let started = Instant::now();
-            assert!(child(&probe, shape, from, to).status().unwrap().success());
+            let st = child(&probe, shape, from, to).status().unwrap();
+            assert!(st.success(), "the measuring run failed: {}", child_log::why(&probe, st));
             let took = started.elapsed();
-            let _ = std::fs::remove_dir_all(&probe);
+            child_log::clean(&probe);
             took
         };
         let middle = |lengths: &[Duration]| {
@@ -397,7 +400,7 @@ fn stopped_in(shape: Shape, from: Prot, to: Prot) {
                 std::thread::sleep(Duration::from_millis((whole_ms * ((i / 2) as f64 + 0.5) / spread) as u64));
             }
             match running.try_wait().unwrap() {
-                Some(status) => assert!(status.success(), "{shape:?} {from:?} to {to:?}, stop {i}: the change failed: {status:?}"),
+                Some(status) => assert!(status.success(), "{shape:?} {from:?} to {to:?}, stop {i}: the change failed: {}", child_log::why(&root, status)),
                 None => {
                     running.kill().unwrap();
                     killed += 1;
@@ -426,7 +429,7 @@ fn stopped_in(shape: Shape, from: Prot, to: Prot) {
                     assert!(!clear_value_in_files(&root), "{shape:?} {from:?} to {to:?}, stop {i}: the new state shows a clear value");
                 }
             }
-            let _ = std::fs::remove_dir_all(&root);
+            child_log::clean(&root);
         }
         record(&format!(
             "{shape:?} {from:?} to {to:?}: {stops} stops spread over {whole_ms:.0} ms at the end ({killed} killed while running), {old_state} left the old files, {new_state} the new ones"
@@ -485,26 +488,44 @@ fn a_crash_at_every_point_of_the_protected_change_is_settled_by_the_next_open() 
             points.push((format!("migration_{what}_{i}"), true));
         }
     }
-    let mut reached = std::collections::BTreeSet::new();
+    let mut cases = Vec::new();
     for shape in [Shape::Accounts, Shape::Files] {
         for (from, to) in [(Prot::Whole(5), Prot::Whole(6)), (Prot::Fields(5), Prot::Whole(4)), (Prot::Whole(5), Prot::Fields(4))] {
             for (point, decided) in &points {
-                let (rows, scale) = (6, 1);
-                let root = make(shape, from, rows, scale);
-                let status = child(&root, shape, from, to).env("CLOVE_CRASH_POINT", point).status().unwrap();
-                if status.code() == Some(99) {
-                    reached.insert(point.clone());
-                    let key = if *decided { to } else { from };
-                    read(&root, shape, key, rows, scale).unwrap_or_else(|e| panic!("{shape:?} {from:?} to {to:?} at {point}: {e}"));
-                    no_leftovers(&root);
-                } else {
-                    assert!(status.success(), "{point}: {status:?}");
-                    read(&root, shape, to, rows, scale).unwrap();
-                }
-                let _ = std::fs::remove_dir_all(&root);
+                cases.push((shape, from, to, point, *decided));
             }
         }
     }
+    // each case has its own database and its own program, so the cases run side by side
+    let reached = std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..std::thread::available_parallelism().map_or(4, |n| n.get()).min(8) {
+            scope.spawn(|| {
+                loop {
+                    let Some(&(shape, from, to, point, decided)) = cases.get(next.fetch_add(1, std::sync::atomic::Ordering::SeqCst)) else { break };
+                    let (rows, scale) = (6, 1);
+                    let root = make(shape, from, rows, scale);
+                    let status = child(&root, shape, from, to).env("CLOVE_CRASH_POINT", point).status().unwrap();
+                    if status.code() == Some(99) {
+                        reached.lock().unwrap().insert(point.clone());
+                        let key = if decided { to } else { from };
+                        read(&root, shape, key, rows, scale).unwrap_or_else(|e| panic!("{shape:?} {from:?} to {to:?} at {point}: {e}"));
+                        no_leftovers(&root);
+                    } else {
+                        assert!(
+                            status.success(),
+                            "{shape:?} {from:?} to {to:?} at {point}: {}",
+                            child_log::why(&root, status)
+                        );
+                        read(&root, shape, to, rows, scale).unwrap();
+                    }
+                    child_log::clean(&root);
+                }
+            });
+        }
+    });
+    let reached = reached.into_inner().unwrap();
     let unreached: Vec<&String> = points.iter().map(|(p, _)| p).filter(|p| !reached.contains(*p)).collect();
     println!("reached {} of {} points; not reached: {unreached:?}", reached.len(), points.len());
     // a database of this size replaces at most four files or folders; the points that name a

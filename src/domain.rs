@@ -15,7 +15,10 @@ pub struct Domain<E: Entity> {
 
 impl<E: Entity> Domain<E> {
     pub fn query(&self) -> crate::query::Query<E> {
-        crate::query::Query::new(self.repository.database_manager.clone(),self.repository.table.into()).with_sealed(self.repository.sealed.clone())
+        let query = crate::query::Query::new(self.repository.database_manager.clone(),self.repository.table.into());
+        #[cfg(feature = "encryption")]
+        let query = query.with_sealed(self.repository.sealed.clone());
+        query
     }
     pub fn new(repository: Repository<E>) -> Self {
         Self {
@@ -182,7 +185,11 @@ impl<E: Entity> Domain<E> {
         for r in records {
             if r.restorable {
                 if let Some(json) = r.data.as_json() {
+                    #[cfg(feature = "encryption")]
                     let mut entity: E = serde_json::from_value(json.clone())?;
+                    #[cfg(not(feature = "encryption"))]
+                    let entity: E = serde_json::from_value(json.clone())?;
+                    #[cfg(feature = "encryption")]
                     self.repository.bind_entity(id, &mut entity);
                     out.push(O::from_entity(entity));
                 }
@@ -197,12 +204,14 @@ impl<E: Entity> Domain<E> {
 
     /// A permission to open protected values of this entity's database, for the request in hand.
     /// See [`DatabaseManager::read_grant`](crate::repository::DatabaseManager::read_grant).
+    #[cfg(feature = "encryption")]
     pub fn read_grant(&self) -> Result<crate::field_crypto::ReadGrant> {
         self.repository.database_manager.read_grant()
     }
 
     /// A permission to search the fingerprinted fields of this entity, for the request in hand. It
     /// needs the search key, not the read key. See [`PrintHandle`](crate::field_crypto::PrintHandle).
+    #[cfg(feature = "encryption")]
     pub fn search_grant(&self) -> Result<crate::field_crypto::SearchGrant<E>> {
         match &self.repository.sealed {
             Some(hooks) => hooks.search_grant(self.repository.database_manager.event_sink.clone()),
@@ -213,6 +222,7 @@ impl<E: Entity> Domain<E> {
     }
 
     /// A checker of secrets against the verification hashes of this entity's database.
+    #[cfg(feature = "encryption")]
     pub fn verifier(&self) -> Result<crate::field_crypto::Verifier> {
         self.repository.database_manager.verifier()
     }

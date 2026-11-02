@@ -426,6 +426,10 @@ pub(crate) fn verify_main_with(from: &impl ReadableDatabase, to: &Database, plan
     let tables = plan.user_tables.len() as u64;
     expected.push(CHANGES.name().to_string());
     expected.push(LAST_WRITE.to_string());
+    // the tables the log makes in any new file: a file written before the log existed has none of them
+    for name in [SEQ.name(), CONSUMERS.name(), "__blob_refs", "__unique_definitions", UNIQUE_KEYS, UNIQUE_ROWS, "__id_contracts"] {
+        expected.push(name.to_string());
+    }
     for (i, table) in plan.user_tables.iter().enumerate() {
         let snapshot = format!("{RESET_PREFIX}{}", generation - tables + 1 + i as u64);
         let rows = entries(&read_to, table, Kind::User)?;

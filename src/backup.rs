@@ -88,6 +88,11 @@ impl BackupManager {
         self.db.get()
     }
 
+    /// Compact the backup file. See [`DbHandle::compact`].
+    pub(crate) fn compact(&self) -> Result<(u64, u64)> {
+        self.db.compact()
+    }
+
     /// Close the backup file. See [`DbHandle::close`].
     pub fn close(&self) -> bool {
         self.db.close()

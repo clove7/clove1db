@@ -17,8 +17,8 @@
 //! #[derive(Serialize, Deserialize, CloveFields)]
 //! struct A { id: String, #[clove(encrypt, id = 1, print = "full")] phone: Sealed<String> }
 //! fn search(grant: &SearchGrant<A>) {
-//!     let _ = A::phone.print_eq("0501234567", grant);
-//!     let _ = A::phone.print_in(["0501234567", "0507654321"], grant);
+//!     let _ = A::phone.print_eq("5501234567", grant);
+//!     let _ = A::phone.print_in(["5501234567", "5507654321"], grant);
 //!     let _: Unique<A> = Unique::on(A::phone.print_field());
 //! }
 //! ```
@@ -30,7 +30,7 @@
 //! use serde::{Deserialize, Serialize};
 //! #[derive(Serialize, Deserialize, CloveFields)]
 //! struct A { id: String, #[clove(encrypt, id = 1, print = "full")] phone: Sealed<String> }
-//! let _ = A::phone.eq("0501234567");
+//! let _ = A::phone.eq("5501234567");
 //! ```
 //!
 //! ```compile_fail
@@ -54,7 +54,6 @@
 //! themselves stay protected.
 use super::{
     grant::ReadGrant,
-    envelope::{Place, open_envelope},
     keys::FieldKeys,
     method::Method,
     parts, prints,
@@ -62,9 +61,7 @@ use super::{
     spec::SealedSpec,
 };
 use crate::{
-    domain::Domain,
-    entity::Entity,
-    events::{EventSink, LibraryEvent},
+    events::EventSink,
     fields::{Compare, Expr, Path, Predicate, Step, TransformKind, Value, ValueKind},
     units::{ClError, Result},
 };

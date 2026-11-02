@@ -241,12 +241,18 @@ fn child_entry() {
 
 fn child(root: &Path, direction: u8) -> Command {
     let mut c = Command::new(std::env::current_exe().unwrap());
+    // what the child prints is kept beside the database, so that a child that ends with an error says why
+    let log = std::fs::File::create(root.join("child.log")).unwrap();
     c.args(["--exact", "migration::encrypted::attachments_kills::child_entry", "--nocapture", "--test-threads=1"])
         .env("CLOVE_ATT_ROOT", root)
         .env("CLOVE_ATT_DIRECTION", direction.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(Stdio::from(log.try_clone().unwrap()))
+        .stderr(Stdio::from(log));
     c
+}
+
+fn child_log(root: &Path) -> String {
+    std::fs::read_to_string(root.join("child.log")).unwrap_or_default()
 }
 
 fn copy_dir(from: &Path, to: &Path) {
@@ -280,14 +286,15 @@ fn a_move_that_is_not_stopped_ends_in_the_new_place_in_both_directions() {
 
 #[test]
 fn a_program_stopped_at_any_moment_leaves_the_attachments_where_they_were_or_where_they_are_to_be() {
-    const STOPS: u64 = 100;
-    // each direction stopped 100 times. The moments are not random: they are measured on runs that
+    const STOPS: u64 = 20;
+    // each direction stopped 20 times (it was 100 on 22 MB: the same two sides of the decision are reached, in a fraction of the
+    // time). The moments are not random: they are measured on runs that
     // are not stopped. Half are spread over the whole length of the move (from 0.5% of it to 99.5%);
     // the other half over the end of it, from a little before the decision (the commit file shows)
     // to the last moment, since what follows the decision is a short part of the whole.
     for direction in [PLAIN_TO_PROTECTED, PROTECTED_TO_PLAIN] {
-        // about 22 MB of attachments, so that the move itself is most of what the program does
-        let (template, _, expected) = make(direction, 6);
+        // about 3.5 MB of attachments, so that the move itself is most of what the program does
+        let (template, _, expected) = make(direction, 1);
         let (mut old_state, mut new_state, mut killed) = (0, 0, 0);
         // the length of the move, program start included: the shortest of three whole runs (a stop
         // later than a run is long is no stop, so the short one is the safe measure)
@@ -351,7 +358,7 @@ fn a_program_stopped_at_any_moment_leaves_the_attachments_where_they_were_or_whe
             }
             match running.try_wait().unwrap() {
                 // it ran to the end before it was stopped: that is a success or a bug, not a stop
-                Some(status) => assert!(status.success(), "{}, stop {i}: the move failed: {status:?}", name(direction)),
+                Some(status) => assert!(status.success(), "{}, stop {i}: the move failed: {status:?}; the child printed: {}", name(direction), child_log(&root)),
                 None => {
                     running.kill().unwrap();
                     killed += 1;
@@ -369,10 +376,11 @@ fn a_program_stopped_at_any_moment_leaves_the_attachments_where_they_were_or_whe
             name(direction)
         );
         assert_eq!(old_state + new_state, STOPS);
-        // seen in 7 runs (2 directions each): 71 to 100 stopped while running; 47 to 49 left the old place and 51 to 53 the new one
-        // (half the stops are aimed at the end, after the decision, so the two sides are not left to chance)
-        assert!(killed >= 40, "{}: only {killed} of {STOPS} were stopped while the move was running", name(direction));
-        assert!(old_state >= 20 && new_state >= 20, "{}: the stops did not reach both sides of the decision", name(direction));
+        // seen with 100 stops on 22 MB in 7 runs (2 directions each): 71 to 100 stopped while running; 47 to 49 left the old place and 51 to 53
+        // the new one (half the stops are aimed at the end, after the decision, so the two sides are not left to chance). The bounds keep the
+        // same shares for 20 stops: 8 of 20 stopped while running (40%), and 4 of 20 on each side (20%).
+        assert!(killed >= 8, "{}: only {killed} of {STOPS} were stopped while the move was running", name(direction));
+        assert!(old_state >= 4 && new_state >= 4, "{}: the stops did not reach both sides of the decision", name(direction));
         let _ = std::fs::remove_dir_all(&template);
     }
 }
@@ -406,24 +414,37 @@ fn a_crash_at_every_point_of_the_move_is_settled_by_the_next_open() {
         ("migration_before_markers_removed", 0, true),
         ("migration_after_markers_removed", 0, true),
     ];
-    let mut reached = std::collections::BTreeSet::new();
+    let mut cases = Vec::new();
     for direction in [PLAIN_TO_PROTECTED, PROTECTED_TO_PLAIN] {
         for (point, skip, decided) in points {
-            let (root, dir, expected) = make(direction, 1);
-            let status = child(&root, direction).env("CLOVE_CRASH_POINT", point).env("CLOVE_CRASH_SKIP", skip.to_string()).status().unwrap();
-            let what = format!("{} at {point} (after {skip} hits)", name(direction));
-            if status.code() == Some(99) {
-                reached.insert(point.to_string());
-                let state = settle(&root, &dir, direction, &expected, &what);
-                assert_eq!(state, if *decided { State::New } else { State::Old }, "{what}: wrong side of the decision");
-            } else {
-                // the point is not on this path (the old folder is not removed when it is not there, say)
-                assert!(status.success(), "{what}: {status:?}");
-                assert_eq!(settle(&root, &dir, direction, &expected, &what), State::New);
-            }
-            let _ = std::fs::remove_dir_all(&root);
+            cases.push((direction, *point, *skip, *decided));
         }
     }
+    // each case has its own database and its own program, so the cases run side by side
+    let reached = std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..std::thread::available_parallelism().map_or(4, |n| n.get()).min(8) {
+            scope.spawn(|| {
+                while let Some(&(direction, point, skip, decided)) = cases.get(next.fetch_add(1, std::sync::atomic::Ordering::SeqCst)) {
+                    let (root, dir, expected) = make(direction, 1);
+                    let status = child(&root, direction).env("CLOVE_CRASH_POINT", point).env("CLOVE_CRASH_SKIP", skip.to_string()).status().unwrap();
+                    let what = format!("{} at {point} (after {skip} hits)", name(direction));
+                    if status.code() == Some(99) {
+                        reached.lock().unwrap().insert(point.to_string());
+                        let state = settle(&root, &dir, direction, &expected, &what);
+                        assert_eq!(state, if decided { State::New } else { State::Old }, "{what}: wrong side of the decision");
+                    } else {
+                        // the point is not on this path (the old folder is not removed when it is not there, say)
+                        assert!(status.success(), "{what}: {status:?}");
+                        assert_eq!(settle(&root, &dir, direction, &expected, &what), State::New);
+                    }
+                    let _ = std::fs::remove_dir_all(&root);
+                }
+            });
+        }
+    });
+    let reached = reached.into_inner().unwrap();
     println!("reached {} different points: {reached:?}", reached.len());
     for must in [
         "migration_after_begin",

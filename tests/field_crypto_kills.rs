@@ -15,10 +15,12 @@ use clove1db::{
     field_crypto::{Sealed, SearchPrint},
     storage::{DatabaseConfig, Storage, StorageConfig},
 };
+#[path = "child_log/mod.rs"]
+mod child_log;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Default, Debug, Serialize, Deserialize, CloveFields)]
@@ -184,8 +186,8 @@ fn spawn(root: &Path, cipher: &str, ack: &Path, mode: &str, first: u64, count: O
         .env("CLOVE_KILL_ACK", ack)
         .env("CLOVE_KILL_MODE", mode)
         .env("CLOVE_KILL_FIRST", first.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(child_log::out(root))
+        .stderr(child_log::out(root));
     if let Some(count) = count {
         command.env("CLOVE_KILL_COUNT", count.to_string());
     }
@@ -325,7 +327,7 @@ fn fifty_forced_kills_leave_rows_that_open_exact_and_hold_no_marker_text() {
         let mut child = spawn(&root, cipher, &ack, mode, 1, None, None);
         let started = Instant::now();
         while last_ack(&ack) == 0 {
-            assert!(started.elapsed() < Duration::from_secs(60), "kill {k}: the child never acknowledged a row");
+            assert!(started.elapsed() < Duration::from_secs(60), "kill {k}: the child never acknowledged a row; it printed: {}", child_log::said(&root));
             std::thread::sleep(Duration::from_millis(10));
         }
         std::thread::sleep(Duration::from_millis(wait_ms));
@@ -382,17 +384,19 @@ fn a_crash_at_any_point_of_a_protected_write_leaves_rows_that_open_exact() {
             let ack = base.join(format!("p{n}{m}.ack"));
             // Three rows written normally, then one write that stops at the point.
             let mut setup = spawn(&root, cipher, &ack, mode, 1, Some(3), None);
-            assert!(setup.wait().unwrap().success(), "{point}: setup child failed");
+            let setup_status = setup.wait().unwrap();
+            assert!(setup_status.success(), "{point}: setup child failed: {}", child_log::why(&root, setup_status));
             assert_eq!(last_ack(&ack), 3);
             let mut crashing = spawn(&root, cipher, &ack, mode, 4, Some(1), Some(point));
             let status = crashing.wait().unwrap();
+            let unexpected = if status.code() == Some(99) { String::new() } else { format!(" (the child ended with {})", child_log::why(&root, status)) };
             if status.code() == Some(99) {
                 reached += 1;
             }
             let with_file = *mode == "files";
             match check(&root, cipher, &ack, with_file, 1) {
                 Ok(text) => println!("{point:32} {mode:5} exit={:?} ok {text}", status.code()),
-                Err((class, text)) => failures.push(format!("{point} {mode} exit={:?} [{class}] {text}", status.code())),
+                Err((class, text)) => failures.push(format!("{point} {mode} exit={:?} [{class}] {text}{unexpected}", status.code())),
             }
             // And it opens again, the same.
             if let Err((class, text)) = check(&root, cipher, &ack, with_file, 1) {

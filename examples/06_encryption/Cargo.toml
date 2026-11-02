@@ -5,7 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
-clove1db = { path = "../.." }
+clove1db = { path = "../..", features = ["encryption"] }
 serde = { version = "1.0.229", features = ["derive"] }
 
 [workspace]

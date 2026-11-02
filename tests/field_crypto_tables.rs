@@ -198,8 +198,14 @@ fn removing_the_protection_of_a_table_is_refused() {
 }
 
 #[test]
-fn protecting_a_table_that_already_exists_is_refused() {
+fn protecting_an_existing_table_that_holds_rows_is_refused() {
     let dir = temp_dir();
+    {
+        let storage = open_plain_encrypted::<CustomerPlain>(&dir).unwrap();
+        let row = CustomerPlain { id: "c1".into(), name: "n".into(), phone: "p".into(), password: "w".into(), token: "t".into() };
+        storage.domain::<CustomerPlain>().repo().set("c1", &row).unwrap();
+        storage.close();
+    }
     let described = description(&open_plain_encrypted::<CustomerPlain>(&dir).unwrap());
     let before = snapshot(&dir);
     let err = open_sealed::<Customer>(&dir).err().expect("must be refused");
@@ -207,6 +213,54 @@ fn protecting_a_table_that_already_exists_is_refused() {
     assert_untouched(&before, &snapshot(&dir));
     // Still a table without protected fields, with no identity recorded.
     let after = description(&open_plain_encrypted::<CustomerPlain>(&dir).unwrap());
+    assert_eq!(described, after);
+    assert!(after.0.is_none() && after.1.is_empty());
+}
+
+#[test]
+fn protecting_an_existing_table_that_is_empty_is_accepted_and_a_protected_value_survives_a_reopen() {
+    let dir = temp_dir();
+    // The table exists in the file, without rows and without protected fields.
+    let plain = open_plain_encrypted::<CustomerPlain>(&dir).unwrap();
+    assert!(description(&plain).1.is_empty());
+    plain.close();
+    {
+        let storage = open_sealed::<Customer>(&dir).unwrap();
+        let meta = table_meta(&storage);
+        assert_eq!(meta.sealed.len(), 3);
+        assert!(meta.table_id.is_some());
+        let row = Customer { id: "c1".into(), name: "n".into(), phone: Sealed::new("+155500000001".into()), password: Hashed::new("pw"), ..Default::default() };
+        storage.domain::<Customer>().repo().set("c1", &row).unwrap();
+        storage.close();
+    }
+    let storage = open_sealed::<Customer>(&dir).unwrap();
+    let domain = storage.domain::<Customer>();
+    let row = domain.repo().get("c1").unwrap();
+    assert_eq!(row.phone.open(&domain.read_grant().unwrap()).unwrap(), "+155500000001");
+}
+
+#[test]
+fn protecting_an_emptied_table_whose_backup_still_holds_old_versions_is_refused() {
+    let dir = temp_dir();
+    let with_backup = || config(&dir).backup_enabled(true).encryption(enc());
+    {
+        let storage = Storage::builder(StorageConfig::default()).add_database(with_backup().register::<CustomerPlain>("customers")).build().unwrap();
+        let row = CustomerPlain { id: "r1".into(), name: "n".into(), phone: "+155-PLAIN-PHONE".into(), password: "pw".into(), token: "t".into() };
+        storage.domain::<CustomerPlain>().repo().set("r1", &row).unwrap();
+        // The table is empty now, but its backup file still holds the plain versions.
+        storage.domain::<CustomerPlain>().repo().delete("r1").unwrap();
+        storage.close();
+    }
+    let reopen = |plain: bool| {
+        let config = if plain { with_backup().register::<CustomerPlain>("customers") } else { with_backup().register_sealed::<Customer>("customers") };
+        Storage::builder(StorageConfig::default()).add_database(config).build()
+    };
+    let described = description(&reopen(true).unwrap());
+    let before = snapshot(&dir);
+    let err = reopen(false).err().expect("must be refused");
+    assert!(matches!(err, ClError::Validation(ref t) if t.contains("migration")), "{err:?}");
+    assert_untouched(&before, &snapshot(&dir));
+    let after = description(&reopen(true).unwrap());
     assert_eq!(described, after);
     assert!(after.0.is_none() && after.1.is_empty());
 }
@@ -249,6 +303,6 @@ fn a_new_protected_value_is_never_written_by_a_plain_registration() {
     drop(storage);
     for (path, bytes) in snapshot(&dir) {
         let hay = String::from_utf8_lossy(&bytes);
-        assert!(!hay.contains("966500000001"), "{}", path.display());
+        assert!(!hay.contains("155500000001"), "{}", path.display());
     }
 }

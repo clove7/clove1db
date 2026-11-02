@@ -110,6 +110,10 @@ struct Source {
     main_plan: convert::Plan,
     history_plan: Option<history::Plan>,
     blobs: Vec<sidecars::Blob>,
+    /// The attachment files an older version wrote with no reference, already in `blobs`, and the tables whose
+    /// legacy files were looked for: the new main file gets references and marks for them.
+    legacy: Vec<sidecars::Blob>,
+    adopted: Vec<String>,
     records: Vec<sidecars::Parts>,
     from_form: Form,
     unused_blobs: usize,
@@ -325,6 +329,14 @@ impl ChangeProtection {
         // their table, row and file; they are moved by `attachments`
         let mut blobs = sidecars::plan_blobs(&main)?;
         blobs.retain(|b| !protected_tables.iter().any(|(name, _)| *name == b.table));
+        // files an older version wrote with `write_blob` have no reference: they are attachments all the same
+        let (mut legacy, mut adopted) = (Vec::new(), Vec::new());
+        if matches!(from_form, Form::Plain) {
+            (legacy, adopted) = sidecars::legacy_blobs(&main, &paths.blobs, &main_plan.user_tables, &blobs)?;
+            legacy.retain(|b| !protected_tables.iter().any(|(name, _)| *name == b.table));
+            adopted.retain(|t| !protected_tables.iter().any(|(name, _)| name == t));
+            blobs.extend(legacy.iter().cloned());
+        }
         let unused_blobs = match &from_form {
             Form::Plain => sidecars::unused_plain_blobs(&paths.blobs, &blobs)?,
             Form::Sealed(_) => 0,
@@ -334,7 +346,7 @@ impl ChangeProtection {
         } else {
             Vec::new()
         };
-        Ok(Source { main, backup, main_plan, history_plan, blobs, records, from_form, unused_blobs, protected, protected_tables, old_keys })
+        Ok(Source { main, backup, main_plan, history_plan, blobs, legacy, adopted, records, from_form, unused_blobs, protected, protected_tables, old_keys })
     }
 
     /// The files and folders that are replaced: (folder, name, a new file takes its place).
@@ -390,7 +402,7 @@ impl ChangeProtection {
     }
 
     /// The keys of the protected fields of the old file, opened with the keys given for it.
-    fn old_keys(&self, main: &impl redb::ReadableDatabase, paths: &Paths) -> Result<Arc<FieldKeys>> {
+    fn old_keys(&self, main: &impl redb::ReadableDatabase, _paths: &Paths) -> Result<Arc<FieldKeys>> {
         if let Some(handle) = &self.from {
             let context = handle.context().cloned().ok_or(ClError::EncryptedOpenFailed)?;
             return Ok(Arc::new(FieldKeys::with_context(context)?));
@@ -561,6 +573,9 @@ impl ChangeProtection {
             None => convert::verify_main(&source.main, &to_main, &source.main_plan)?,
         }
         done.rows += moved.copied.iter().map(|(_, n)| n).sum::<u64>();
+        if !source.adopted.is_empty() {
+            sidecars::record_adoption(&to_main, &source.legacy, &source.adopted)?;
+        }
         drop(to_main);
         if let Some(r) = rekey.as_ref() {
             self.write_key_file(paths, &source, r)?;

@@ -4,9 +4,14 @@ All notable changes to clove1db. The format follows [Keep a Changelog](https://k
 
 ## [0.1.0] — unreleased
 
-The first minor release. It adds encryption of whole databases and of single fields, searching protected fields, changing the protection of an existing database, automatic indexes, typed queries, a durable change log and streaming imports from redb. Plain databases made by 0.0.126 open unchanged.
+The first release of the 0.1 series. It adds encryption of whole databases and of single fields, searching protected fields, changing the protection of an existing database, automatic indexes, typed queries, a durable change log and streaming imports from redb. Plain databases made by 0.0.126 open unchanged.
 
 ### Added
+
+**Features**
+- `derive` (`#[derive(CloveFields)]`) and `encryption` (whole-database encryption and protected fields; turns on `derive`). Neither is on by default. Indexing and typed queries are part of the core.
+- Without `encryption`, `#[clove(encrypt)]`, `hash` and `search_print` fail to compile with a message naming the feature, and a database with a protected table is refused at open before anything is written.
+- `impl CloveFields` and the field constants (`Field::new`) can be written by hand, without the derive macro.
 
 **Typed fields and queries**
 - `#[derive(CloveFields)]` makes a typed handle for every field (`Note::score`), following serde renames, flattening, `Option`, lists, maps, nested structs and `chrono` types. `#[clove(as = Type)]` and `#[clove(skip)]` for fields serde cannot describe; `#[clove(epoch = "s" | "ms")]` for integer times.
@@ -21,7 +26,8 @@ The first minor release. It adds encryption of whole databases and of single fie
 - One rebuildable `.inx` file per database. The cost-based optimizer builds equality, range, prefix, text, `contains`, fuzzy, order and fingerprint indexes when a query would pay for them; there is no manual index API.
 - Results never depend on an index: missing, late or rebuilding indexes make queries slower, never different. `allow_stale()` opts into an index that is behind.
 - `Storage::index_report()` describes every index without changing any. Unused indexes go idle; replaced ones stay readable until their successor is ready; fragmented files are compacted in the background.
-- A long change backlog is rebuilt instead of replayed when that is cheaper (`index/rebuild/replay_budget` event), and an index under sustained overload is set aside until writes slow down.
+- Under steady writes the indexer applies each change within about a millisecond, so queries keep using the index. Indexes are built in large sorted passes.
+- A change backlog the indexer cannot catch up with is rebuilt instead of replayed when that is cheaper (`index/rebuild/replay_budget` event), and an index under sustained overload is set aside until writes slow down.
 
 **Durable change log**
 - Every committed write gets the next number of a durable sequence (`journal_head`, `journal_stats`).
@@ -47,6 +53,7 @@ The first minor release. It adds encryption of whole databases and of single fie
 - The keys file `{db}.keys` holding the sealed data key; `DatabaseConfig::field_keys_file(path)` to keep it only there.
 - `register_sealed_blob::<E>(table)`: attachments of protected tables sealed in 64 KiB chunks, under `{db}.pblobs` with fingerprinted names.
 - A program holding only the search key can read rows and match fingerprints, and is refused every write.
+- A table with protected fields can be added to a database that already exists. "New" is judged per table: missing from the file, or present with no rows, no stored description and no saved versions in its history. The keys are created when the file holds no protected table yet.
 
 **Changing the protection**
 - `migration::ChangeProtection`: plain ⇄ whole-database encryption, one key or cipher to another, and whole-database encryption ⇄ keys for protected fields only. `migration::ChangeFields`: seal, open, add or remove fingerprints, turn a field into a hash (`confirm_one_way()`).
@@ -54,14 +61,17 @@ The first minor release. It adds encryption of whole databases and of single fie
 - New files are written beside the old ones, compared row by row and file by file, and put in place by one crash-safe decision. Keys of hashes and fingerprint-only fields are carried over when the data key changes.
 
 **Imports**
-- `migration::stream_external`: `scan`, `stream` and `verify` copy a large redb table of JSON rows or of files into a database in batches, with memory checked before the run (`free_memory`, `reserve_memory`), fingerprint verification of every row, and `FilePrefix` for values that carry a fixed prefix before each file. The source is opened read only; repair (`Options::repair`) is for a copy.
+- `migration::stream_external`: `inventory`, `scan`, `stream`, `verify` and explicit `repair_copy`. `Options::json()` is the default; `Options::attachments(prefix)` selects files. `Target` names the destination; optional progress reports committed batches. `ScanReport`, `StreamReport` and `VerifyReport` separate measurements, `Duration` timings and full content verification. `StreamExternalError` identifies actionable errors. Protected-field destinations are refused before opening the source; committed rows refresh the cache. Whole-database encrypted targets are supported. The source stays read only except when explicitly repairing a supplied copy.
 
 **Memory, files and recovery**
 - `DatabaseConfig::prefetch(..)`: read a file in order before redb opens it; automatic for files of 64 MiB or more.
 - `DatabaseConfig::redb_cache_bytes(n)` caps redb's page cache per file; `quick_repair(true)` saves allocator state at each commit.
 - `Storage::close()`, `Storage::open_report()` (size, open time, repair, format checks per file).
 - `ClError::DatabaseInUse` for a file another program holds open; large allocations the library controls return an out-of-memory error instead of aborting.
-- `Repository::list_map`, `Repository::get_uncached_as`, `Repository::commit_entities`.
+- `Repository::list_map`, `Repository::get_uncached_as`, `Repository::commit_entities` (split into several transactions above `max_commit_batch_entries`, as documented).
+- `Repository::prepare` returns a `PreparedRow` (protected fields sealed, nothing written); `DatabaseManager::commit_atomic(prepared, writes, deletes)` writes prepared rows, raw rows of other tables and deletes in one transaction, never split.
+- `DatabaseConfig::create_missing_tables(true)` creates registered tables missing from an existing database, plain or encrypted, and reports them in `LibraryEvent::TablesCreated`.
+- `Storage::compact_database(name)` compacts the main and history files of one database, plain or encrypted, and returns a `CompactReport { before, after, took }`.
 
 **Events**
 - `StorageConfig::event_sink` receives `LibraryEvent`s: slow queries (`slow_query_threshold`, 50 ms by default), non-unique `one()`, consumer expiry, index rebuilds and states, encryption and migration stages, and field openings, checks, confirmations and scans. Events carry names, counts and row keys, never values, keys or searched text.
@@ -73,7 +83,7 @@ The first minor release. It adds encryption of whole databases and of single fie
 
 Compared with 0.0.126:
 
-- **`ClError` has new variants:** `EncryptedOpenFailed`, `DataTampered`, `DatabaseInUse`, `BackupOpenFailed`, `OutOfMemory`, `ConsumerExpired`, `ConsumerNeedsRebuild`, `NonUnique`, `UniqueViolation`, `DuplicateGroups`, `IdFieldMismatch`, `InvalidCursor`, `SumOverflow`, `UnsupportedSum`, `DecimalSumLimit`. A `match` without a wildcard arm must handle them.
+- **`ClError` has new variants:** `StreamExternal`, `EncryptedOpenFailed`, `DataTampered`, `DatabaseInUse`, `BackupOpenFailed`, `OutOfMemory`, `ConsumerExpired`, `ConsumerNeedsRebuild`, `NonUnique`, `UniqueViolation`, `DuplicateGroups`, `IdFieldMismatch`, `InvalidCursor`, `SumOverflow`, `UnsupportedSum`, `DecimalSumLimit`. A `match` without a wildcard arm must handle them.
 - **Attachments are read through `BlobReader`** (`Read + Seek`, `len()`) instead of `std::fs::File`.
 - **`RedbOptions`** is no longer `Copy`, `PartialEq` or `Eq`, and has new fields (`encryption`, `verify_on_open`): build it with `..Default::default()`.
 - **`BackupManager::new`** takes `&RedbOptions`; pass `&RedbOptions::default()` for a plain database.
@@ -88,6 +98,7 @@ Notes on the new APIs (not breaking for code written against 0.0.126): `LibraryE
 
 ### Changed
 
+- A database written by 0.0.126 keeps every attachment when it is first opened: files written with `write_blob` (with no row) are adopted once per attachment table and open with `open_blob` with the same bytes. The clean-up of unreferenced files only looks in the folders of the attachment tables the database registers. Such a database can also be changed straight into an encrypted one, attachments included.
 - Inspecting a database no longer writes to it.
 - A failed open writes no migration file; the migration `index.json` is written only after the stored layouts are checked, and only when its content changed.
 - Only the newest set-aside `.inx.invalid-<id>` file is kept.

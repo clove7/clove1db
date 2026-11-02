@@ -206,7 +206,11 @@ fn write_batch(
     if durability.is_strict() {
         tx.set_durability(redb::Durability::Immediate)?;
     }
-    if redb.quick_repair || redb.encryption.is_some() {
+    #[cfg(feature = "encryption")]
+    let quick_repair = redb.quick_repair || redb.encryption.is_some();
+    #[cfg(not(feature = "encryption"))]
+    let quick_repair = redb.quick_repair;
+    if quick_repair {
         tx.set_quick_repair(true);
     }
     {

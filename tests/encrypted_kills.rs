@@ -14,10 +14,12 @@ use clove1db::{
     entity::Entity,
     storage::{DatabaseConfig, Storage, StorageConfig},
 };
+#[path = "child_log/mod.rs"]
+mod child_log;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -138,8 +140,8 @@ fn spawn(root: &Path, cipher: &str, ack: &Path, mode: &str, first: u64) -> std::
         .env("CLOVE_KILL_ACK", ack)
         .env("CLOVE_KILL_MODE", mode)
         .env("CLOVE_KILL_FIRST", first.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(child_log::out(root))
+        .stderr(child_log::out(root))
         .spawn()
         .unwrap()
 }
@@ -236,7 +238,7 @@ fn fifty_forced_kills_leave_a_database_that_opens_exact_and_sealed() {
         let mut child = spawn(&root, cipher, &ack, if large { "large" } else { "small" }, 1);
         let started = Instant::now();
         while last_ack(&ack) == 0 {
-            assert!(started.elapsed() < Duration::from_secs(60), "kill {k}: the child never acknowledged a batch");
+            assert!(started.elapsed() < Duration::from_secs(60), "kill {k}: the child never acknowledged a batch; it printed: {}", child_log::said(&root));
             std::thread::sleep(Duration::from_millis(10));
         }
         std::thread::sleep(Duration::from_millis(wait_ms));

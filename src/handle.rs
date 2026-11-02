@@ -22,8 +22,11 @@ use std::time::{Duration, Instant};
 
 use redb::{Builder, Database, Durability, StorageError, WriteTransaction, ReadableDatabase};
 
+#[cfg(feature = "encryption")]
 use crate::encrypted_store::{EncryptionHandle, OpenOptionsExt, StoreError};
-use crate::events::{EventSink, LibraryEvent};
+use crate::events::EventSink;
+#[cfg(feature = "encryption")]
+use crate::events::LibraryEvent;
 
 use crate::durability::DurabilityMode;
 use crate::units::{ClError, Result};
@@ -53,11 +56,13 @@ pub struct RedbOptions {
     /// Encrypt every file of the database. When set, each file goes through the encrypted file
     /// layer, whose commits always save the allocator state (two-phase), whatever
     /// [`RedbOptions::quick_repair`] says.
+    #[cfg(feature = "encryption")]
     pub encryption: Option<EncryptionHandle>,
 
     /// With [`RedbOptions::encryption`]: read and check every block of each file right after it
     /// is opened, so a block put back from an older copy is found before any data is used. Costs
     /// a full read of the file at every open.
+    #[cfg(feature = "encryption")]
     pub verify_on_open: bool,
 }
 
@@ -121,11 +126,33 @@ pub fn test_prefetched_bytes(path: &Path) -> u64 {
     PREFETCHED.lock().unwrap_or_else(PoisonError::into_inner).iter().filter(|(p, _)| p == path).map(|(_, n)| *n).sum()
 }
 
+/// False for a file that is not empty and does not start with redb's own file signature (public in
+/// its documentation). An encrypted database has no such mark by design, so without the `encryption`
+/// feature this is how it is told from a damaged ordinary one.
+#[cfg(not(feature = "encryption"))]
+fn has_redb_signature(path: &Path) -> bool {
+    use std::io::Read;
+    const SIGNATURE: [u8; 9] = [b'r', b'e', b'd', b'b', 0x1A, 0x0A, 0xA9, 0x0D, 0x0A];
+    let Ok(mut file) = std::fs::File::open(path) else { return true };
+    let mut head = [0u8; 9];
+    match file.read(&mut head) {
+        Ok(0) | Err(_) => true,
+        Ok(n) => n >= SIGNATURE.len() && head == SIGNATURE,
+    }
+}
+
 /// A redb open error, with the "already open" case as [`ClError::DatabaseInUse`].
 pub(crate) fn open_error(e: redb::DatabaseError, path: &Path) -> ClError {
+    #[cfg(not(feature = "encryption"))]
+    if !matches!(e, redb::DatabaseError::DatabaseAlreadyOpen) && !has_redb_signature(path) {
+        return ClError::Validation(format!(
+            "{} is not an ordinary redb database file. If it is an encrypted clove1db database, enable the `encryption` feature of clove1db to open it",
+            path.display()
+        ));
+    }
     match e {
         redb::DatabaseError::DatabaseAlreadyOpen => ClError::DatabaseInUse { path: path.display().to_string() },
-        redb::DatabaseError::Storage(StorageError::Io(io)) if crate::encrypted_store::is_tamper(&io) => ClError::DataTampered,
+        redb::DatabaseError::Storage(StorageError::Io(io)) if crate::units::is_tamper(&io) => ClError::DataTampered,
         e => ClError::Database(redb::Error::from(e)),
     }
 }
@@ -152,9 +179,12 @@ impl RedbOptions {
     /// The index file (`.inx`): its own small page cache, and the role `"index"` when encrypted.
     pub(crate) fn open_index_file(&self, path: &Path, create: bool, events: &EventSink) -> Result<Database> {
         const INDEX_CACHE_BYTES: usize = 2 * 1024 * 1024;
+        #[cfg(feature = "encryption")]
         if let Some(enc) = &self.encryption {
             return self.open_encrypted(enc, path, "index", create, false, Some(INDEX_CACHE_BYTES), events).map(|(db, _)| db);
         }
+        #[cfg(not(feature = "encryption"))]
+        let _ = events;
         let mut builder = Database::builder();
         builder.set_cache_size(INDEX_CACHE_BYTES);
         if create {
@@ -166,6 +196,7 @@ impl RedbOptions {
 
     /// Open (or create) one file of an encrypted database; `read_only` leaves the file untouched.
     /// Returns the database and whether redb had to repair the file.
+    #[cfg(feature = "encryption")]
     fn open_encrypted(
         &self,
         enc: &EncryptionHandle,
@@ -215,13 +246,19 @@ impl RedbOptions {
         #[cfg(test)]
         opens::record(path);
         let start = Instant::now();
-        let db = guard_open(path, false).and_then(|()| match &self.encryption {
-            Some(enc) => self.open_encrypted(enc, path, label, false, true, self.cache_bytes, &EventSink::default()).map(|(db, _)| DbOrRo::Enc(db)),
-            None => self
-                .builder()
+        let db = guard_open(path, false).and_then(|()| {
+            #[cfg(feature = "encryption")]
+            if let Some(enc) = &self.encryption {
+                return self
+                    .open_encrypted(enc, path, label, false, true, self.cache_bytes, &EventSink::default())
+                    .map(|(db, _)| DbOrRo::Enc(db));
+            }
+            #[cfg(not(feature = "encryption"))]
+            let _ = label;
+            self.builder()
                 .open_read_only(path)
                 .map(DbOrRo::Plain)
-                .map_err(|e| open_error(e, path)),
+                .map_err(|e| open_error(e, path))
         });
         let open_time = start.elapsed();
         let opened = FileOpen {
@@ -263,6 +300,9 @@ impl RedbOptions {
 
         guard_open(path, true)?;
         let start = Instant::now();
+        #[cfg(not(feature = "encryption"))]
+        let _ = (label, events);
+        #[cfg(feature = "encryption")]
         if let Some(enc) = &self.encryption {
             let (db, repaired) = self.open_encrypted(enc, path, label, create, false, self.cache_bytes, events)?;
             let open_time = start.elapsed();
@@ -304,6 +344,7 @@ impl RedbOptions {
 /// encrypted kind is an ordinary database over a file layer that refuses every write.
 pub(crate) enum DbOrRo {
     Plain(redb::ReadOnlyDatabase),
+    #[cfg(feature = "encryption")]
     Enc(Database),
 }
 
@@ -311,6 +352,7 @@ impl ReadableDatabase for DbOrRo {
     fn begin_read(&self) -> std::result::Result<redb::ReadTransaction, redb::TransactionError> {
         match self {
             DbOrRo::Plain(db) => db.begin_read(),
+            #[cfg(feature = "encryption")]
             DbOrRo::Enc(db) => db.begin_read(),
         }
     }
@@ -318,6 +360,7 @@ impl ReadableDatabase for DbOrRo {
     fn cache_stats(&self) -> redb::CacheStats {
         match self {
             DbOrRo::Plain(db) => db.cache_stats(),
+            #[cfg(feature = "encryption")]
             DbOrRo::Enc(db) => db.cache_stats(),
         }
     }
@@ -404,9 +447,19 @@ impl DbHandle {
             path: opened.path.clone(),
             durability,
             // an encrypted file always commits in two phases and saves the allocator state
-            quick_repair: options.quick_repair || options.encryption.is_some(),
+            quick_repair: Self::quick_repair_of(&options),
             opened,
         }
+    }
+
+    #[cfg(feature = "encryption")]
+    fn quick_repair_of(options: &RedbOptions) -> bool {
+        options.quick_repair || options.encryption.is_some()
+    }
+
+    #[cfg(not(feature = "encryption"))]
+    fn quick_repair_of(options: &RedbOptions) -> bool {
+        options.quick_repair
     }
 
     /// How this file's open went.
@@ -442,6 +495,23 @@ impl DbHandle {
     pub fn close(&self) -> bool {
         let mut slot = self.slot.write().unwrap_or_else(PoisonError::into_inner);
         slot.take().is_some()
+    }
+
+    /// Compact the file: redb moves live pages toward the start and the file is cut to what is used.
+    /// Takes the write side of the slot, so it waits for the operations already running, and every
+    /// later read or write waits until it is over (no other database is affected). Returns the size
+    /// of the file before and after. A read or write transaction still open on the file is
+    /// [`ClError::Database`] (`TransactionInProgress`); nothing is changed then.
+    pub(crate) fn compact(&self) -> Result<(u64, u64)> {
+        let mut slot = self.slot.write().unwrap_or_else(PoisonError::into_inner);
+        let Some(db) = slot.as_mut() else {
+            return Err(ClError::Closed { path: self.path.display().to_string() });
+        };
+        let size = || std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
+        let before = size();
+        // one pass may leave pages that a second pass can still move
+        while db.compact().map_err(redb::Error::from)? {}
+        Ok((before, size()))
     }
 
     pub fn is_closed(&self) -> bool {

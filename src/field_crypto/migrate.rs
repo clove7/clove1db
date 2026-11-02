@@ -362,7 +362,7 @@ pub(crate) fn settings_checks(keys: &FieldKeys, table_id: &str, specs: &[SealedS
 
 /// Put the checks of [`settings_checks`] into the description of a table's fields (by field number).
 /// A field with no entry is left as it is.
-pub(crate) fn apply_checks(fields: &mut [super::compat::SealedField], checks: &[(u32, Option<String>)]) {
+pub(crate) fn apply_checks(fields: &mut [super::SealedField], checks: &[(u32, Option<String>)]) {
     for field in fields {
         if let Some((_, check)) = checks.iter().find(|(id, _)| *id == field.id) {
             field.check = check.clone();
@@ -455,7 +455,7 @@ mod tests {
     fn every_method_makes_what_the_row_codec_makes() {
         for cipher in BOTH {
             let k = keys(cipher);
-            let table = TableSeal { table: "t", table_id: TABLE_ID, specs: Mixed::SEALED, keys: &k };
+            let table = TableSeal { table_id: TABLE_ID, specs: Mixed::SEALED, keys: &k };
             let entity = Mixed {
                 id: "x".into(),
                 a: Sealed::new("alpha".into()),
@@ -697,7 +697,7 @@ mod tests {
         let (a, b) = (under(CipherKind::Aes256GcmSiv), under(CipherKind::XChaCha20Poly1305));
         assert_eq!(settings_checks(&a, TABLE_ID, Mixed::SEALED).unwrap(), settings_checks(&b, TABLE_ID, Mixed::SEALED).unwrap());
         // and they are written into the description by field number
-        let mut fields: Vec<_> = Mixed::SEALED.iter().map(super::super::compat::SealedField::from_spec).collect();
+        let mut fields: Vec<_> = Mixed::SEALED.iter().map(super::super::SealedField::from_spec).collect();
         apply_checks(&mut fields, &after);
         for f in &fields {
             assert_eq!(f.check, check(&after, f.id), "{}", f.id);
