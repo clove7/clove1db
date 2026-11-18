@@ -27,10 +27,19 @@ impl Pair {
  }
 }
 #[derive(Default)]
-pub(crate) struct Shared {pub pair:Mutex<Option<Arc<Pair>>>,wanted:Mutex<Vec<format::Definition>>,observations:Mutex<std::collections::BTreeMap<Vec<u8>,Observation>>,clock:report::Clock,usages:Mutex<std::collections::BTreeMap<u64,report::Usage>>,reports:Mutex<Vec<IndexReport>>,compact_requested:std::sync::atomic::AtomicBool}
+pub(crate) struct Shared {pub pair:Mutex<Option<Arc<Pair>>>,wanted:Mutex<Vec<format::Definition>>,observations:Mutex<std::collections::BTreeMap<Vec<u8>,Observation>>,clock:report::Clock,usages:Mutex<std::collections::BTreeMap<u64,report::Usage>>,reports:Mutex<Vec<IndexReport>>,compact_requested:std::sync::atomic::AtomicBool,
+ /// The worker's wake signal, once a worker serves this database.
+ signal:Mutex<Option<Arc<worker::Signal>>>}
+/// Wakes the index worker when it is dropped: a write holds one, so the worker hears of the commit when the write returns.
+pub(crate) struct Nudge(pub Arc<Shared>);
+impl Drop for Nudge {fn drop(&mut self) {self.0.nudge();}}
 impl std::fmt::Debug for Shared {fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {f.write_str("IndexRuntime")}}
 impl Shared {
- pub(super) fn request(&self,def:format::Definition) {let mut wanted=self.wanted.lock().unwrap_or_else(|e|e.into_inner());if wanted.len()<128&&!wanted.contains(&def){wanted.push(def);}}
+ pub(super) fn request(&self,def:format::Definition) {{let mut wanted=self.wanted.lock().unwrap_or_else(|e|e.into_inner());if wanted.len()<128&&!wanted.contains(&def){wanted.push(def);}}self.nudge();}
+ /// The worker that serves this database listens on `signal` from now on.
+ pub(super) fn listen(&self,signal:Arc<worker::Signal>) {*self.signal.lock().unwrap_or_else(|e|e.into_inner())=Some(signal);}
+ /// Tells the worker there may be work (a commit, a request). Costs a lock and a notify; nothing when no worker listens.
+ pub(crate) fn nudge(&self) {if let Some(s)=self.signal.lock().unwrap_or_else(|e|e.into_inner()).as_ref() {s.wake();}}
  pub fn view(&self,db:&crate::repository::DatabaseManager,allow_stale:bool)->Result<Arc<ReadView>> {
   let current=Arc::new(db.read_view_at_head()?);
   let Some(pair)=self.pair() else{return Ok(current)};

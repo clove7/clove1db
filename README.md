@@ -17,9 +17,9 @@ Everything lives in files next to your program: `.cldb` for the data, `.cldb.bak
 
 ```toml
 [dependencies]
-clove1db = "0.1.0"                                                # core only
-# clove1db = { version = "0.1.0", features = ["derive"] }        # + #[derive(CloveFields)]
-# clove1db = { version = "0.1.0", features = ["encryption"] }    # + encryption (includes derive)
+clove1db = "0.1.7"                                                # core only
+# clove1db = { version = "0.1.7", features = ["derive"] }        # + #[derive(CloveFields)]
+# clove1db = { version = "0.1.7", features = ["encryption"] }    # + encryption (includes derive)
 ```
 
 - **No features:** the database, queries, indexes, history, the change log and attachments. The field constants of an entity are written by hand ([without the derive macro](#without-the-derive-macro)).
@@ -451,6 +451,8 @@ storage.migrate::<ProductV1, ProductV2>()
 Storage::builder(config).migration_step::<ProductV1, ProductV2>();   // so history reads in the new shape
 ```
 
+A table is compared with its registered type at every `build()`, before and after its migrations: a struct that changed with no migration to it gives `ClError::LayoutMismatch`. A table with no rows is migrated like any other, so that it opens under the new type.
+
 **Older files are upgraded by `build()`.** A `.cldb` made by an earlier clove1db is recognised, given the metadata it lacks, and its history converted to the current format on a checked copy, before it is served. `inspect_cldb(path)` tells what a file is (`Legacy042`, `Clove049`, `Authenticated`, `ExternalRedb`, ...) without opening a `Storage`, and never changes it.
 
 ## Importing from a foreign redb file
@@ -553,7 +555,7 @@ cd clove1db/examples/01_getting_started && cargo run
 | Example | What it shows |
 |---|---|
 | `01_getting_started` | Entities and DTOs, create, read, update, delete, two databases in one `Storage` |
-| `02_queries_and_indexes` | Filters, pages, `one()`, aggregates, text and fuzzy search, a unique constraint, automatic indexes, `explain()`, a deleted `.inx` rebuilt |
+| `02_queries_and_indexes` | Filters, pages, `one()`, aggregates, text and fuzzy search, a unique constraint, automatic indexes, `explain()`, an idle database left unwritten, a deleted `.inx` rebuilt |
 | `03_backup_and_batches` | History, reading and restoring a version, bulk changes, atomic and chunked batches |
 | `04_change_log` | A follower: snapshot, changes, acknowledgement, restart, table reset, expiry |
 | `05_files_and_memory` | Attachments read as streams, the cache budget, reading a large table |
@@ -564,22 +566,13 @@ Run 02, 05, 06 and 07 with `cargo run --release`.
 
 ## Upgrading
 
-### From 0.0.x to 0.1.0
+### From 0.1.0 to 0.1.7
 
-The data format of existing plain databases is unchanged, and they open as before. Code may need these changes:
+The files and the API are the same. One check is stricter:
 
-- **Features:** `#[derive(CloveFields)]` needs `features = ["derive"]`, and encryption needs `features = ["encryption"]`. Without features the core is the same, and field constants are written by hand.
-- **`ClError`** has new variants (`EncryptedOpenFailed`, `DataTampered`, `DatabaseInUse`, `OutOfMemory`, ...). A `match` without a wildcard arm must handle them.
-- **Attachments are read through `BlobReader`** (`Read + Seek`, with `len()`) instead of `std::fs::File`.
-- **`RedbOptions`** is no longer `Copy` or `PartialEq`, and has new fields: build it with `..Default::default()`.
-- **`BackupManager::new`** takes `&RedbOptions`.
-- **`migration::DbMigrationRootIndex::tables`** is a `BTreeMap`.
-- **Inspecting a file never repairs it:** a file that needs repair gives `ClError::Validation` asking to open it normally first.
-- **Quarantined side files keep their whole name:** `index.json.corrupt.{time}`.
-- **A failed `build()` removes the database it was creating**, and only that.
-- **The examples** were rewritten: seven instead of nineteen.
+- **A table changed in place is still checked at open.** In 0.1.0 a table was compared with its registered type only until its first migration. If a struct changed again after that with no migration, `build()` now returns `ClError::LayoutMismatch` where it opened before (and the rows failed to read later): write the migration.
 
-New in 0.1.0: typed queries, automatic indexes, the change log, whole-database encryption, protected fields and searching them, `ChangeProtection` and `ChangeFields`, `stream_external`, events, `DatabaseInUse`, out-of-memory errors instead of aborts on large allocations, `prefetch`, the `derive` and `encryption` features, `create_missing_tables`, `compact_database`, `prepare` with `commit_atomic`. Every change is listed in [CHANGELOG.md](CHANGELOG.md).
+Also in 0.1.7: an open database with no work is no longer written (in 0.1.0 the indexer checkpointed every open database once a second, whether anything had changed or not), and the in-place migration of a table with no rows is recorded, so the table opens under the new type. Every change is listed in [CHANGELOG.md](CHANGELOG.md).
 
 ### From 0.0.119 or earlier
 

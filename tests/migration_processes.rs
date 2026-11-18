@@ -279,9 +279,13 @@ fn a_program_stopped_at_any_moment_leaves_the_database_as_it_was_or_as_it_is_to_
         }
     }
     const STOPS: u64 = 30;
+    const TIED: u64 = 4;
     // plain to encrypted, and back, and to other keys, each stopped 30 times. The moments are not
     // random: they are spread over the whole length of the change, measured on a run that is not
     // stopped (from 0.5% of it to 99.5%), so that every stage of the change is stopped in.
+    // The decision comes close to the end of the change (little is left to do after it), so the
+    // spread stops can all fall before it. Four more stops are tied to it: the program is stopped
+    // as soon as the commit marker is on disk, and the new files must be the database.
     for (from, to) in [(None, Some(5u8)), (Some(5u8), None), (Some(5u8), Some(6u8))] {
         let mut old_state = 0;
         let mut new_state = 0;
@@ -300,11 +304,21 @@ fn a_program_stopped_at_any_moment_leaves_the_database_as_it_was_or_as_it_is_to_
             child_log::clean(&probe);
         }
         let whole_ms = whole.as_millis() as f64;
-        for i in 0..STOPS {
+        for i in 0..STOPS + TIED {
             let root = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
             copy_dir(&template, &root);
             let mut running = child(&root, from, to).spawn().unwrap();
-            std::thread::sleep(Duration::from_millis((whole_ms * (i as f64 + 0.5) / STOPS as f64) as u64));
+            let tied = i >= STOPS;
+            if tied {
+                let commit = root.join("records").join("store.migrating.commit");
+                let until = Instant::now() + Duration::from_secs(300);
+                while !commit.exists() && running.try_wait().unwrap().is_none() {
+                    assert!(Instant::now() < until, "{from:?} to {to:?}, stop {i}: the commit marker never appeared");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis((whole_ms * (i as f64 + 0.5) / STOPS as f64) as u64));
+            }
             match running.try_wait().unwrap() {
                 // it ran to the end before it was stopped: that is a success or a bug, not a stop
                 Some(status) => assert!(status.success(), "{from:?} to {to:?}, stop {i}: the change failed: {}", child_log::why(&root, status)),
@@ -323,6 +337,9 @@ fn a_program_stopped_at_any_moment_leaves_the_database_as_it_was_or_as_it_is_to_
             };
             assert_eq!(got, before, "{from:?} to {to:?}, stop {i}: not the same database");
             no_leftovers(&root);
+            if tied {
+                assert_eq!(state, "new", "{from:?} to {to:?}, stop {i}: stopped after the commit, the old files were the database");
+            }
             if state == "old" {
                 old_state += 1;
                 if from.is_none() {
@@ -337,9 +354,9 @@ fn a_program_stopped_at_any_moment_leaves_the_database_as_it_was_or_as_it_is_to_
             child_log::clean(&root);
         }
         println!(
-            "{from:?} to {to:?}: {STOPS} stops spread over {whole_ms:.0} ms ({killed} killed while running), {old_state} left the old files, {new_state} the new ones"
+            "{from:?} to {to:?}: {STOPS} stops spread over {whole_ms:.0} ms and {TIED} tied to the decision ({killed} killed while running), {old_state} left the old files, {new_state} the new ones"
         );
-        assert_eq!(old_state + new_state, STOPS);
+        assert_eq!(old_state + new_state, STOPS + TIED);
         assert!(killed >= 12, "only {killed} of {STOPS} were stopped while the change was running");
         assert!(old_state >= 2 && new_state >= 2, "the stops did not reach both sides of the decision");
         let _ = std::fs::remove_dir_all(&template);

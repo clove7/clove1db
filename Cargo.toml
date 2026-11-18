@@ -1,6 +1,6 @@
 [package]
 name = "clove1db"
-version = "0.1.0"
+version = "0.1.7"
 edition = "2024"
 rust-version.workspace = true
 license = "MIT"
@@ -33,7 +33,7 @@ unexpected_cfgs = { level = "warn", check-cfg = [
 [dependencies]
 fst = { version = "0.4.7", features = ["levenshtein"] }
 strsim = "0.11.1"
-clove1db-derive = { path = "derive", version = "0.1.0", optional = true }
+clove1db-derive = { path = "derive", version = "0.1.7", optional = true }
 chrono = "0.4.45"
 itertools = "0.15.0"
 moka = { version = "0.12.16", features = ["sync"] }
@@ -320,7 +320,7 @@ exclude = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.7"
 rust-version = "1.89"
 
 # Tests only: the dependencies (Argon2, the ciphers, redb) are built optimised; the library itself stays unoptimised.

@@ -52,7 +52,13 @@ impl PreparedMigration {
     fn is_executable(&self) -> bool {
         self.report.errors.is_empty()
             && self.report.conflicts.is_empty()
-            && !self.staged.is_empty()
+            && (!self.staged.is_empty() || self.evolves_empty_table())
+    }
+
+    /// A change of a table's shape in place, where the table has no rows: there is nothing to move,
+    /// but the new shape must still be recorded, or the table stays refused under the new type.
+    fn evolves_empty_table(&self) -> bool {
+        self.plan.kind == MigrationKind::InPlaceEvolve && self.report.source_count == 0
     }
 }
 
@@ -357,7 +363,9 @@ where
             });
         }
 
-        if staged.is_empty() && report.would_skip == report.source_count {
+        // An empty table changed in place is a migration of no rows, not a failure (see `evolves_empty_table`).
+        let empty_in_place = plan.kind == MigrationKind::InPlaceEvolve && report.source_count == 0;
+        if staged.is_empty() && report.would_skip == report.source_count && !empty_in_place {
             report
                 .errors
                 .push("no records to migrate after conflict resolution".into());
@@ -380,7 +388,7 @@ where
     }
 
     fn commit_prepared(&self, mut prepared: PreparedMigration) -> Result<MigrationReport> {
-        if prepared.staged.is_empty() {
+        if prepared.staged.is_empty() && !prepared.evolves_empty_table() {
             prepared.report.dry_run = false;
             return Ok(prepared.report);
         }
@@ -475,11 +483,18 @@ where
             field_diff: None,
         };
 
-        let new_layout = prepared
-            .snapshot
-            .first()
-            .and_then(|(_, bytes)| FieldLayout::capture_from_sample_json(bytes).ok())
-            .or_else(|| FieldLayout::capture_from_sample_json(&[]).ok());
+        // A table changed in place takes the shape of its new type, the one a later open registers. The first moved row
+        // is no witness of it: a field left out while empty, or an optional one that holds a value, gives another hash.
+        // Rows brought in from elsewhere keep the old rule (the first row, as before).
+        let new_layout = if plan.kind == MigrationKind::InPlaceEvolve {
+            FieldLayout::capture_from_entity_json(&T::default()).ok()
+        } else {
+            prepared
+                .snapshot
+                .first()
+                .and_then(|(_, bytes)| FieldLayout::capture_from_sample_json(bytes).ok())
+                .or_else(|| FieldLayout::capture_from_sample_json(&[]).ok())
+        };
 
         target_db.append_migration(
             &plan.to.table,

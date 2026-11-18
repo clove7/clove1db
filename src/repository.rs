@@ -706,7 +706,7 @@ impl DatabaseManager {
         self.apply_changes(writes,deletes).map(|_|())
     }
 
-    pub(crate) fn journal_write<T>(&self,f:impl FnOnce(&redb::WriteTransaction,&mut Vec<crate::journal::ChangeKind>)->Result<T>)->Result<T> {crate::journal::write_with_sink(&self.db()?,self.journal_retention,&self.event_sink,f)}
+    pub(crate) fn journal_write<T>(&self,f:impl FnOnce(&redb::WriteTransaction,&mut Vec<crate::journal::ChangeKind>)->Result<T>)->Result<T> {let _nudge=crate::indexes::Nudge(self.indexes.clone());crate::journal::write_with_sink(&self.db()?,self.journal_retention,&self.event_sink,f)}
     pub(crate) fn primary_handle(&self) -> &Arc<DbHandle> { &self.db }
 
     /// Update cached bytes only after their transaction commits.
@@ -722,6 +722,7 @@ impl DatabaseManager {
         for table in writes.iter().map(|r|r.0.as_str()).chain(deletes.iter().map(|r|r.0.as_str())) {crate::journal::validate_table(table)?;}
         let db=self.db()?;
         self.ensure_writable()?;
+        let _nudge=crate::indexes::Nudge(self.indexes.clone());
         let removed=crate::journal::write_with_sink(&db,self.journal_retention,&self.event_sink,|tx,changes| {
             maybe_crash("before_commit");
             // The journal row holds its own copy of every value: reserve all of it before the first write.
@@ -755,6 +756,7 @@ impl DatabaseManager {
         self.ensure_writable()?;
         crate::journal::validate_table(table)?;
         let db=self.db()?;
+        let _nudge=crate::indexes::Nudge(self.indexes.clone());
         crate::journal::write_with_sink(&db,self.journal_retention,&self.event_sink,|tx,changes| {
             tx.delete_table(TableDefinition::<&str,&[u8]>::new(table))?;
             {let mut target=tx.open_table(TableDefinition::<&str,&[u8]>::new(table))?;for (k,v) in entries {target.insert(k.as_str(),v.as_slice())?;}}
@@ -785,6 +787,7 @@ impl DatabaseManager {
         let tables=writes.iter().map(|r|r.0.as_str()).chain(deletes.iter().map(|r|r.0.as_str())).collect::<std::collections::BTreeSet<_>>();
         for table in &tables {crate::journal::validate_table(table)?;}
         let db=self.db()?;
+        let _nudge=crate::indexes::Nudge(self.indexes.clone());
         crate::journal::write_with_sink(&db,self.journal_retention,&self.event_sink,|tx,changes| {
             for (table,key) in deletes {tx.open_table(TableDefinition::<&str,&[u8]>::new(table))?.remove(key.as_str())?;if self.is_blob_table(table){crate::journal_blob::remove(tx,table,key,changes)?;}}
             for (table,key,reference) in &prepared {crate::journal_blob::put(tx,table,key,reference,changes)?;}

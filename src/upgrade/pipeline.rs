@@ -615,8 +615,13 @@ impl OpenUpgradePipeline {
 
             if inspection.kind != FileKind::New {
                 if let Some(on_disk) = chain.read_layout(chain.current_version())? {
-                    if on_disk.layout_hash != reg.layout.layout_hash
-                        && chain.manifests.is_empty()
+                    // A table that was changed in place is checked like one that never was. Its stored shape may come from a
+                    // sample row (files written before the shape was taken from the type), so the shape its last migration was
+                    // declared to reach is accepted too. A table whose last migration brought rows in from elsewhere is left as before.
+                    let last = chain.manifests.last();
+                    let checked = last.is_none_or(|m| m.kind == crate::migration::types::MigrationKind::InPlaceEvolve);
+                    let declared = last.is_some_and(|m| m.to_layout_hash == reg.layout.layout_hash);
+                    if checked && on_disk.layout_hash != reg.layout.layout_hash && !declared
                     {
                         return Err(ClError::LayoutMismatch {
                             table: reg.name.clone(),

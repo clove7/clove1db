@@ -17,9 +17,17 @@ const BUILD_BATCH_BYTES:usize=2*1024*1024;
 const HELD_BYTES:usize=32*1024*1024;
 /// How long one turn may spend applying the changes it collected (see `Driver::tick`).
 pub const APPLY_TIME:Duration=Duration::from_millis(50);
+/// Ends the worker's pause early. A commit, an index request, a pause request and `stop` call `wake`, so the worker waits for work instead of asking for it.
+#[derive(Default)]
+pub(crate) struct Signal {flag:Mutex<bool>,cv:std::sync::Condvar}
+impl Signal {
+ pub(crate) fn wake(&self) {*self.flag.lock().unwrap_or_else(|e|e.into_inner())=true;self.cv.notify_all();}
+ /// Waits for a wake, at most `limit`. A wake that came while the worker was at work is kept, so none is lost.
+ fn wait(&self,limit:Duration) {let mut f=self.flag.lock().unwrap_or_else(|e|e.into_inner());if !*f {f=self.cv.wait_timeout(f,limit).unwrap_or_else(|e|e.into_inner()).0;}*f=false;}
+}
 /// Lets a caller ask the worker to let go of a database's files for a while (compaction needs the file with no read open on it).
 #[derive(Default)]
-pub(crate) struct Gate {wanted:Mutex<std::collections::HashMap<String,usize>>,parked:Mutex<std::collections::HashSet<String>>}
+pub(crate) struct Gate {wanted:Mutex<std::collections::HashMap<String,usize>>,parked:Mutex<std::collections::HashSet<String>>,signal:Arc<Signal>}
 impl Gate {
  fn held(&self,db:&str)->bool {self.wanted.lock().unwrap_or_else(|e|e.into_inner()).get(db).is_some_and(|n|*n>0)}
  fn park(&self,db:&str,on:bool) {let mut p=self.parked.lock().unwrap_or_else(|e|e.into_inner());if on {p.insert(db.to_string());}else{p.remove(db);}}
@@ -33,7 +41,7 @@ impl Worker {
  /// Waits until the worker has let go of `db` (it finishes a running build first). Gives up with an error after `wait`.
  pub fn pause(&self,db:&str,wait:Duration)->Result<Pause> {
   *self.gate.wanted.lock().unwrap_or_else(|e|e.into_inner()).entry(db.to_string()).or_insert(0)+=1;
-  let pause=Pause{gate:self.gate.clone(),db:db.to_string()};
+  let pause=Pause{gate:self.gate.clone(),db:db.to_string()};self.gate.signal.wake();
   let start=Instant::now();
   loop {
    // a stopped worker holds nothing
@@ -42,10 +50,14 @@ impl Worker {
    thread::sleep(Duration::from_millis(2));
   }
  }
- pub fn stop(&self) {self.stop.store(true,Ordering::Release);let t=self.thread.lock().unwrap_or_else(|e|e.into_inner()).take();if let Some(t)=t {let _=t.join();}}
+ pub fn stop(&self) {self.stop.store(true,Ordering::Release);self.gate.signal.wake();let t=self.thread.lock().unwrap_or_else(|e|e.into_inner()).take();if let Some(t)=t {let _=t.join();}}
 }
 impl Drop for Worker {fn drop(&mut self){self.stop();}}
 struct Driver {db:DatabaseManager,file:Arc<Database>,state:Arc<Shared>,token:Option<ConsumerToken>,meta:Metadata,defs:Vec<Manifest>,target:Option<Arc<ReadView>>,pending:Vec<Definition>,build:Option<Build>,samplers:BTreeMap<u64,Reservoir>,last_flush:Instant,repair_errors:u64,retired:Vec<Manifest>,reset_job:Option<ResetJob>,compact_job:Option<CompactJob>,last_compact_check:Instant,compact_checked_seq:Option<u64>,last_compact_bytes:u64,prepared:BTreeMap<u64,(u64,u64,Arc<crate::query::stats::FieldStats>)>,dictionary_job:Option<DictionaryJob>,budget_override:Option<Duration>,replay_since:Option<Instant>,budget_rebuilds:Vec<Instant>,hold:Option<(u64,Instant)>,
+ /// `meta.applied` as the last checkpoint wrote it: a quiet database (nothing applied since) is not written again.
+ flushed_applied:u64,
+ /// What the last write of the primary's index catalog held (see `catalog_image`); the catalog is written only when this changes.
+ catalog_written:Option<Vec<u8>>,
  /// The journal sequence acknowledged so far. Only a durable `.inx` checkpoint moves it (see `maintain`).
  acked:u64}
 enum DictionaryFinish {Batch(u64),Build(Build),Reset(ResetJob)}
@@ -118,7 +130,7 @@ impl Driver {
   prune_invalid_indexes(&path);
   state.clock.initialize(meta.uptime_ms);
   let acked_at_open=meta.applied;
-  let mut driver=Self{db,file,state,token,meta,defs,target:Some(view),pending:vec![],build:None,samplers,last_flush:Instant::now(),repair_errors:0,retired:vec![],reset_job:None,compact_job:None,last_compact_check:Instant::now(),compact_checked_seq:None,last_compact_bytes:0,prepared:BTreeMap::new(),dictionary_job:None,budget_override:budget_override(),replay_since:None,budget_rebuilds:vec![],hold:None,acked:acked_at_open};
+  let mut driver=Self{db,file,state,token,meta,defs,target:Some(view),pending:vec![],build:None,samplers,last_flush:Instant::now(),repair_errors:0,retired:vec![],reset_job:None,compact_job:None,last_compact_check:Instant::now(),compact_checked_seq:None,last_compact_bytes:0,prepared:BTreeMap::new(),dictionary_job:None,budget_override:budget_override(),replay_since:None,budget_rebuilds:vec![],hold:None,flushed_applied:acked_at_open,catalog_written:None,acked:acked_at_open};
   let (started,budget)=(Instant::now(),driver.replay_budget());
   while driver.target.as_ref().is_some_and(|v|driver.meta.applied<v.head) {
    driver.tick()?;
@@ -314,13 +326,21 @@ fn write_row_core(tx:&redb::WriteTransaction,d:&Manifest,row:&str,bytes:&[u8],se
  let mut counters=stats.clone();counters.values.clear();
  let reverse=encode_reverse(row,&Reverse{keys:keys.into_iter().collect(),terms,stats:Some(counters)})?;tx.open_table(TableDefinition::<&str,&[u8]>::new(&d.reverse()))?.insert(row,reverse.as_slice())?;Ok(RowDelta{old,new:stats})
 }
-/// How long the worker waits when it found nothing to do: 1 ms while changes were arriving a moment ago (`busy_until`), else 10 ms.
-fn idle_pause(now:Instant,busy_until:Instant)->Duration {if now<busy_until {Duration::from_millis(1)} else {Duration::from_millis(10)}}
+/// The longest the worker waits with nothing to do. A wake (see `Signal`) ends the wait at once, so this bounds only what has no wake: a clock deadline, a usage count, a schema change.
+const QUIET_PAUSE:Duration=Duration::from_millis(200);
+/// How long after the last work the worker still looks every 10 ms before it settles into `QUIET_PAUSE`.
+const SETTLE:Duration=Duration::from_secs(2);
+/// How often a database with nothing to write still saves its uptime clock (the index deadlines count open time).
+const UPTIME_FLUSH:Duration=Duration::from_secs(60);
+/// How long the worker waits when it found nothing to do: 1 ms while changes were arriving a moment ago (`busy_until`), 10 ms for `SETTLE` after that, then `QUIET_PAUSE`.
+fn idle_pause(now:Instant,busy_until:Instant)->Duration {if now<busy_until {Duration::from_millis(1)} else if now.duration_since(busy_until)<SETTLE {Duration::from_millis(10)} else {QUIET_PAUSE}}
 pub(super) fn boot(databases:&mut std::collections::HashMap<String,DatabaseManager>)->Result<Worker> {
  let mut drivers=vec![];for db in databases.values() {drivers.push(Driver::open(db.clone())?);}
  let stop=Arc::new(AtomicBool::new(false));let signal=stop.clone();let gate=Arc::new(Gate::default());let hold=gate.clone();
+ // One wake signal for the whole storage: every database's commits and index requests reach the one worker thread.
+ let wake=gate.signal.clone();for db in databases.values() {db.indexes.listen(wake.clone());}
  let t=thread::Builder::new().name("clove-indexer".into()).spawn(move|| {
-  // While changes keep arriving the worker looks again after 1 ms, so that the index is at most a moment behind the last write (a query is answered by the index only when it is at the head); once quiet for 250 ms it looks every 10 ms.
+  // While changes keep arriving the worker looks again after 1 ms, so that the index is at most a moment behind the last write (a query is answered by the index only when it is at the head); once quiet for 250 ms it looks every 10 ms, and after `SETTLE` it waits for a wake (see `idle_pause`).
   let mut busy_until=Instant::now();
   while !signal.load(Ordering::Acquire) {
    let mut work=false;
@@ -336,7 +356,7 @@ pub(super) fn boot(databases:&mut std::collections::HashMap<String,DatabaseManag
     if d.repair().is_ok(){work=true;}
    }}}
    if work {busy_until=Instant::now()+Duration::from_millis(250);}
-   if !work {thread::sleep(idle_pause(Instant::now(),busy_until));}
+   if !work {wake.wait(idle_pause(Instant::now(),busy_until));}
   }
   for d in &mut drivers {let _=d.maintain(true);d.state.clear();}
  }).map_err(|e|ClError::IoError(e.to_string()))?;
@@ -355,6 +375,29 @@ pub(super) fn boot(databases:&mut std::collections::HashMap<String,DatabaseManag
  /// contains-index build is only +2 % to +6 % (measured), so the larger limit is for the debug test build only.
  fn wait_limit()->Duration {if cfg!(clove_test_encrypt_all) {Duration::from_secs(25)} else {Duration::from_secs(5)}}
  fn wait(db:&DatabaseManager,head:u64)->Arc<Pair> {let start=Instant::now();loop {if let Some(pair)=db.indexes.pair(){if pair.primary.head==head&&definitions(&pair.index).unwrap().iter().any(|d|d.ready){return pair}}assert!(start.elapsed()<wait_limit());thread::sleep(Duration::from_millis(5));}}
+ /// The database files under `root` (`.cldb` and `.inx`) with their last write time and length.
+ fn stamps(root:&std::path::Path)->Vec<(String,std::time::SystemTime,u64)> {let mut out=vec![];let mut dirs=vec![root.to_path_buf()];while let Some(dir)=dirs.pop() {for e in std::fs::read_dir(dir).unwrap() {let e=e.unwrap();let m=e.metadata().unwrap();if m.is_dir(){dirs.push(e.path())}else if e.path().extension().is_some_and(|x|x=="cldb"||x=="inx"){out.push((e.file_name().to_string_lossy().into_owned(),m.modified().unwrap(),m.len()));}}}out.sort();out}
+ fn one(id:&str,n:i64)->Vec<(String,String,Vec<u8>)> {vec![("notes".into(),id.into(),serde_json::to_vec(&Note{id:id.into(),n}).unwrap())]}
+ #[test] fn a_quiet_database_is_not_written_and_a_write_is_indexed_at_once() {
+  let root=std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());let s=storage(&root);let db=s.db_manager("store");
+  db.commit_batch_atomic(&one("a",1),&[]).unwrap();
+  db.indexes.request(Definition{table:"notes".into(),paths:vec![Note::n.path()],kind:Kind::Value,directions:vec![]});
+  drop(wait(db,db.journal_head().unwrap()));
+  // The build ends with a checkpoint or two; after that nothing may touch the files of a database with no work.
+  thread::sleep(Duration::from_secs(4));let before=stamps(&root);assert!(before.len()>=2,"{before:?}");
+  thread::sleep(Duration::from_secs(3));assert_eq!(before,stamps(&root),"a database with no work was written");
+  // Quiet for longer than `SETTLE`: a commit wakes the worker, so the index is at the head long before a quiet pause would end.
+  let mut waits=vec![];
+  for i in 0..5i64 {
+   // Timed from the commit's return: the commit's own durable write is the disk's time, not the worker's.
+   thread::sleep(SETTLE+Duration::from_millis(300));db.commit_batch_atomic(&one(&format!("k{i}"),i),&[]).unwrap();let start=Instant::now();let head=db.journal_head().unwrap();
+   loop {if db.indexes.pair().is_some_and(|p|p.primary.head==head){break}assert!(start.elapsed()<wait_limit());thread::yield_now();}
+   waits.push(start.elapsed());
+  }
+  waits.sort();println!("index at the head after a quiet spell, from the commit's return: min {:?}, median {:?}, max {:?}",waits[0],waits[2],waits[4]);
+  assert!(waits[2]<QUIET_PAUSE/4,"the commit did not wake the worker: {waits:?}");
+  drop(s);let _=std::fs::remove_dir_all(root);
+ }
  #[test] fn streamed_build_replay_and_missing_file_recovery() {
   let root=std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());let s=storage(&root);let db=s.db_manager("store");
   let entries=(0..300).map(|i|("notes".into(),format!("{i:04}"),serde_json::to_vec(&Note{id:format!("{i:04}"),n:i%7}).unwrap())).collect::<Vec<_>>();db.commit_batch_atomic(&entries,&[]).unwrap();
@@ -536,7 +579,7 @@ pub(super) fn boot(databases:&mut std::collections::HashMap<String,DatabaseManag
   let now=Instant::now();
   assert_eq!(idle_pause(now,now+Duration::from_millis(250)),Duration::from_millis(1));
   assert_eq!(idle_pause(now,now),Duration::from_millis(10));
-  assert_eq!(idle_pause(now+Duration::from_secs(1),now+Duration::from_millis(250)),Duration::from_millis(10));
+  assert_eq!(idle_pause(now+Duration::from_secs(1),now+Duration::from_millis(250)),Duration::from_millis(10));assert_eq!(idle_pause(now+SETTLE+Duration::from_secs(1),now),QUIET_PAUSE);
  }
  /// Writes that keep outpacing the replay: three rebuilds, then the index is set aside (`Idle`, queries scan), nothing is rebuilt while the journal keeps growing, and once the
  /// writes stop the index comes back and answers like a scan. Decided by events, with the replay budget fixed at zero so that every backlog is over it.
@@ -700,6 +743,12 @@ impl Driver {
   let reports=self.defs.iter().chain(self.retired.iter()).map(|d|{let(idle,abandon)=super::report::deadlines(d);super::report::IndexReport{database:self.db.db_name.clone(),id:d.id,definition:super::report::definition(&d.definition),fingerprint:crate::query::optimizer::fingerprint(&d.canonical),canonical_bytes:d.canonical.len(),generation:d.generation,ready:d.ready,state:d.state,reason:d.reason.clone(),bytes:d.bytes,file_bytes,last_use_ms:d.last_use_ms,build_ms:d.build_ms,reads:d.reads,matched_rows:d.matched,estimated_ms:d.estimated_ms,actual_ms:d.actual_ms,lag:head.saturating_sub(self.meta.applied),wait_ms:0.,replacement:d.replacement,repair_errors:self.repair_errors,rows:self.samplers.get(&d.id).map(|s|s.rows).unwrap_or(0),correlation:self.samplers.get(&d.id).map(|s|s.correlation()).unwrap_or(0.),idle_after_ms:idle,abandon_after_ms:abandon}}).collect();
   *self.state.reports.lock().unwrap_or_else(|e|e.into_inner())=reports;Ok(())
  }
+ /// Everything the catalog write depends on: each definition as it would be stored, and the build whose entry must be left alone.
+ fn catalog_image(&self)->Result<Vec<u8>> {
+  let mut image=Vec::new();
+  for d in &self.defs {image.extend_from_slice(&d.id.to_be_bytes());let bytes=serde_json::to_vec(d)?;image.extend_from_slice(&(bytes.len() as u64).to_be_bytes());image.extend_from_slice(&bytes);}
+  image.extend_from_slice(&self.build.as_ref().map(|b|b.manifest.id).unwrap_or(u64::MAX).to_be_bytes());Ok(image)
+ }
  fn maintain(&mut self,force:bool)->Result<()> {
   let now=self.state.clock.now();let usages=std::mem::take(&mut *self.state.usages.lock().unwrap_or_else(|e|e.into_inner()));let mut dirty=!usages.is_empty();
   for usage in usages.values(){if let Some(d)=self.defs.iter_mut().find(|d|d.id==usage.id&&d.state==IndexState::Active){let gap=usage.at.saturating_sub(d.last_use_ms);if d.reads>0&&gap>0 {d.interval_ms=if d.interval_ms==0{gap}else{(d.interval_ms.saturating_mul(3)+gap)/4};}d.last_use_ms=usage.at;d.reads+=usage.count;d.matched+=usage.matched;d.estimated_ms+=usage.estimated_ms;d.actual_ms+=usage.actual_ms;}}
@@ -711,13 +760,21 @@ impl Driver {
    if self.defs.iter().all(|d|d.state!=IndexState::Active) {self.db.disable_index_consumer()?;self.token=None;}
    if let Some(pair)=self.state.pair(){self.target=Some(pair.primary.clone());self.publish()?;}
   }
-  if dirty||force||self.last_flush.elapsed()>=Duration::from_secs(1) {
+  // Something to persist: index use or a state change (`dirty`), a close (`force`), or batches applied since the last checkpoint (at most one checkpoint a second, as before).
+  // A database with none of these is not written, except for its uptime clock once a minute.
+  let since=self.last_flush.elapsed();let behind=self.meta.applied!=self.flushed_applied;
+  if dirty||force||(behind&&since>=Duration::from_secs(1))||since>=UPTIME_FLUSH {
    self.meta.uptime_ms=now;let tx=self.file.begin_write()?;for d in &self.defs{put_definition(&tx,d)?;}put_metadata(&tx,&self.meta)?;
    // The checkpoint: this durable commit persists every earlier non-durable `.inx` batch, and only then may the journal be acknowledged that far.
    crate::fsutil::maybe_crash("index_checkpoint_before_commit");tx.commit()?;crate::fsutil::maybe_crash("index_checkpoint_after_commit");
    if let Some(token)=&self.token {if self.meta.applied>self.acked{self.db.ack(token,self.meta.applied)?;self.acked=self.meta.applied;crate::fsutil::maybe_crash("index_checkpoint_after_ack");}}
-   self.db.journal_write(|tx,_| {let mut catalog=tx.open_table(CATALOG)?;let ids=catalog.iter()?.map(|r|r.map(|(k,_)|k.value())).collect::<std::result::Result<Vec<_>,_>>()?;for id in ids {if !self.defs.iter().any(|d|d.id==id)&&self.build.as_ref().is_none_or(|b|b.manifest.id!=id){catalog.remove(id)?;}}for d in &self.defs{catalog.insert(d.id,serde_json::to_vec(d)?.as_slice())?;}Ok(())})?;
-   self.last_flush=Instant::now();
+   // The catalog in the primary is a copy of the definitions: it is written when they changed, not on every checkpoint.
+   let image=self.catalog_image()?;
+   if self.catalog_written.as_ref()!=Some(&image) {
+    self.db.journal_write(|tx,_| {let mut catalog=tx.open_table(CATALOG)?;let ids=catalog.iter()?.map(|r|r.map(|(k,_)|k.value())).collect::<std::result::Result<Vec<_>,_>>()?;for id in ids {if !self.defs.iter().any(|d|d.id==id)&&self.build.as_ref().is_none_or(|b|b.manifest.id!=id){catalog.remove(id)?;}}for d in &self.defs{catalog.insert(d.id,serde_json::to_vec(d)?.as_slice())?;}Ok(())})?;
+    self.catalog_written=Some(image);
+   }
+   self.last_flush=Instant::now();self.flushed_applied=self.meta.applied;
    let view=Arc::new(self.db.read_view_at_head()?);if view.head==self.meta.applied&&self.reset_job.is_none(){self.target=Some(view);self.publish()?;}else{self.update_report()?;}
   }Ok(())
  }

@@ -9,6 +9,8 @@
 //! - a unique constraint, checked in the same transaction as the write;
 //! - **automatic indexes** in the `.inx` file: there is no `create_index`. The optimizer builds an
 //!   index when a query would pay for it, and `explain()` says which plan it chose and why;
+//! - the indexer waits for work: an open database with no work is not written, and a write wakes
+//!   it at once;
 //! - the `.inx` file is disposable: deleted, it is rebuilt before `build()` returns, with the same
 //!   answers.
 //!
@@ -168,6 +170,56 @@ fn wait_for_index(storage: &Storage, query: &clove1db::query::Query<Word>, kind:
     }
 }
 
+/// Every file under `root` with its last write time and its length.
+fn stamps(root: &Path) -> Res<Vec<(PathBuf, std::time::SystemTime, u64)>> {
+    let mut out = vec![];
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let meta = entry.metadata()?;
+            if meta.is_dir() {
+                dirs.push(entry.path());
+            } else {
+                out.push((entry.path(), meta.modified()?, meta.len()));
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+fn quiet_database(storage: &Storage, root: &Path) -> Res<()> {
+    println!("\nan open database with no work");
+    // The last write is checkpointed within about a second. After that there is nothing to do.
+    std::thread::sleep(Duration::from_secs(4));
+    let before = stamps(root)?;
+    std::thread::sleep(Duration::from_secs(3));
+    let after = stamps(root)?;
+    let written = before.iter().zip(&after).filter(|(a, b)| a != b).count();
+    println!("  {} files, {written} written in 3 s with no work", before.len());
+    check(before.len() == after.len() && written == 0, "no file of the database was written")?;
+
+    // The indexer waits for work instead of looking for it, and a write wakes it.
+    // `allow_stale()` reads the index as it is, so the page says how far the index has come.
+    let row = Word { id: "quiet".into(), name: "omega".into() };
+    let omega = storage.domain::<Word>().query().filter(Word::name.fuzzy("omega", 1)).allow_stale();
+    storage.db_manager("store").commit_batch_atomic(&[("words".into(), row.id.clone(), serde_json::to_vec(&row)?)], &[])?;
+    let committed = Instant::now();
+    let caught_up = loop {
+        let page = omega.page()?;
+        if page.index_sequence.is_some() && !page.stale {
+            check(page.items.len() == 1, "the index holds the row written after the quiet spell")?;
+            break committed.elapsed();
+        }
+        if committed.elapsed() > Duration::from_secs(5) {
+            return Err("the index did not reach the write within 5 s".into());
+        }
+    };
+    println!("  the index held it {:.1} ms after the write returned", caught_up.as_secs_f64() * 1e3);
+    Ok(())
+}
+
 fn indexes(storage: &Storage, root: &Path) -> Res<u64> {
     println!("\nautomatic indexes on 20,000 rows");
     let db = storage.db_manager("store");
@@ -201,6 +253,8 @@ fn indexes(storage: &Storage, root: &Path) -> Res<u64> {
     println!("  allow_stale: index sequence {:?}, stale {}", stale.index_sequence, stale.stale);
     check(fuzzy.count()? == matches + 1, "a normal query always sees the new row")?;
     println!("  index report: {} definitions", storage.index_report().len());
+
+    quiet_database(storage, root)?;
 
     let expected = fuzzy.count()?;
     storage.close();

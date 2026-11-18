@@ -3,7 +3,8 @@
 //! What happens to a database over its life, and after a crash.
 //!
 //! 1. **A schema change** (`storage.migrate::<ProductV1, ProductV2>()`): rows of one version of a
-//!    struct are rewritten as the next, in place, with a `MigrateTo` you write once.
+//!    struct are rewritten as the next, in place, with a `MigrateTo` you write once. An empty table
+//!    is changed too, and a shape with no migration to it is refused at open, before and after.
 //! 2. **A file from an old release** (here a `.cldb` made by 0.0.42, in `fixtures/`): `build()`
 //!    recognises it, adds the metadata it lacks and converts its history, before serving it.
 //! 3. **A foreign redb file**: rows of a plain redb table are imported with `from_external`, and a
@@ -84,6 +85,21 @@ impl MigrateTo<ProductV2> for ProductV1 {
     }
 }
 
+/// `ProductV2` with a field renamed, and no migration written for it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ProductV3 {
+    id: String,
+    title: String,
+    sku: String,
+    price_cents: u64,
+}
+
+impl Entity for ProductV3 {
+    fn entity_id(&self) -> &str {
+        &self.id
+    }
+}
+
 fn catalog(root: &Path, version: u32) -> Res<Storage> {
     let db = DatabaseConfig::new("catalog", "catalog").dir_path(root.to_path_buf()).has_cache(false);
     let builder = Storage::builder(StorageConfig::default());
@@ -100,7 +116,8 @@ fn schema_change(root: &Path) -> Res<()> {
     for (id, name) in [("kb", "Keyboard"), ("ms", "Mouse"), ("mn", "Monitor")] {
         v1.domain::<ProductV1>().repo().set(id, &ProductV1 { id: id.into(), name: name.into() })?;
     }
-    v1.migrate::<ProductV1, ProductV2>().from_db("catalog", "products").execute()?;
+    let moved = v1.migrate::<ProductV1, ProductV2>().from_db("catalog", "products").execute()?;
+    println!("  {} rows moved", moved.records_migrated);
     v1.close();
     drop(v1);
 
@@ -108,6 +125,24 @@ fn schema_change(root: &Path) -> Res<()> {
     let kb: ProductV2 = v2.domain::<ProductV2>().repo().get("kb")?;
     check(kb.name == "Keyboard" && kb.sku == "SKU-KB", "the row was rewritten by migrate_json")?;
     check(v2.domain::<ProductV2>().query().count()? == 3, "all three rows were migrated")?;
+    v2.close();
+    drop(v2);
+
+    // A table is checked against its type at every open, also after it was changed once.
+    let v3 = Storage::builder(StorageConfig::default())
+        .add_database(DatabaseConfig::new("catalog", "catalog").dir_path(dir.clone()).has_cache(false).register::<ProductV3>("products"))
+        .build();
+    check(matches!(v3, Err(ClError::LayoutMismatch { .. })), "a third shape with no migration to it is refused at open")?;
+
+    // A table with no rows is changed like any other: its new shape is recorded.
+    let dir = root.join("schema-empty");
+    let v1 = catalog(&dir, 1)?;
+    let moved = v1.migrate::<ProductV1, ProductV2>().from_db("catalog", "products").execute()?;
+    v1.close();
+    drop(v1);
+    let v2 = catalog(&dir, 2)?;
+    println!("  an empty table: {} rows moved, {} rows under ProductV2", moved.records_migrated, v2.domain::<ProductV2>().query().count()?);
+    check(moved.records_migrated == 0, "an empty table is changed too, and opens under the new type")?;
     v2.close();
     Ok(())
 }
